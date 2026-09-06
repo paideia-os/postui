@@ -1,0 +1,84 @@
+// src/lib.pdx -- postui.M1-001 (paideia-os/postui#1)
+//
+// Lib module: library-entry sentinel + version constants.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M1-001 scaffold entry point for postui. This module ships two
+// classes of symbols and nothing else:
+//
+//   * The library-identity constants (POSTUI_VERSION_*) every
+//     consumer can compare against at compile time before linking a
+//     widget kind that only appears in a later postui minor. Same
+//     shape libpdx-audit's audit_record.pdx uses for AUDIT_STATE_*
+//     ordinals (paideia-os monorepo, tools/user/libpdx-audit/src/
+//     audit_record.pdx) -- plain u64 named constants, no runtime
+//     lookup, no allocation.
+//
+//   * The wave-scoped error band anchor (POSTUI_ERR_BAND_BASE) that
+//     every postui error return uses as a high-nibble discriminator.
+//     Disjoint from the KIND_TUI_CANVAS kernel-side failure band
+//     (0xFFFFEC40..0xFFFFEC4F, docs/design.md §2.1 failure
+//     taxonomy) so a downstream consumer can tell at a glance
+//     whether a non-zero return came from postui (a widget layout
+//     rejection, a Frame::init probe refusing to bind KIND_TTY) or
+//     from the kernel's cap_handler_tui_canvas dispatch.
+//
+// =============================================================================
+// WHAT M1-001 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M1-001 does NOT ship widget bodies, buffer diffing, KIND_TUI_CANVAS
+// wrappers, or any I/O. Those land at M1-002 (rect/style/color),
+// M1-003 (cell/buffer), M1-004 (KIND_TUI_CANVAS client bindings),
+// M1-005 (Frame/Terminal driver loop), M1-006 (Block widget), and
+// M1-007 (WidgetKind dispatch), each in its own PR. This module is
+// the scaffold's identity anchor -- a symbol every future M1..M5
+// landing can reference without adding a new dependency.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Lib`), no directory prefix.
+//   - No `test` mnemonic (none needed at scaffold stage; introduced
+//     by M1-002+).
+//   - Every `cmp reg, imm` will be imm <= 0x7FFFFFFF when M1-002+
+//     ship comparison logic; scaffold ships plain constants only.
+//   - r11 is scratch (paideia-as conformance) throughout postui;
+//     this module has no callable bodies yet, so no r11 use.
+//   - No byte reads in this module; the `xor rax, rax; mov_b rax,
+//     [ptr]` pattern lands at M1-003 when Buffer scans cell bytes.
+
+module Lib = structure {
+
+  // ==========================================================================
+  // Library identity
+  // ==========================================================================
+
+  // Semantic version triple. Kept in three u64 slots (rather than a
+  // packed triple in one word) so a consumer's runtime version check
+  // stays a plain integer compare. Bumped at every postui release
+  // (M5 is the first tagged release; pre-M5 the triple stays at
+  // 0.1.0-pre-shaped 0.0.0 with the -pre discriminator captured in
+  // manifest.pdxproj's version field, which is the human-facing
+  // authority anyway).
+  pub let POSTUI_VERSION_MAJOR : u64 = 0
+  pub let POSTUI_VERSION_MINOR : u64 = 1
+  pub let POSTUI_VERSION_PATCH : u64 = 0
+
+  // ==========================================================================
+  // Error band
+  //
+  // High-nibble discriminator every postui error return uses. Disjoint
+  // from the kernel KIND_TUI_CANVAS band (0xFFFFEC40..0xFFFFEC4F,
+  // docs/design.md §2.1). A consumer can shift a return >> 8 and
+  // switch on the band to attribute a refusal to the right layer.
+  // ==========================================================================
+
+  pub let POSTUI_ERR_BAND_BASE : u64 = 0xFFFFEB00
+  pub let POSTUI_OK            : u64 = 0
+
+}

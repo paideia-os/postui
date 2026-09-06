@@ -1,0 +1,34 @@
+// src/buffer.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Buffer module: placeholder for the back/front region layout landing
+// at M1-003.
+//
+// docs/design.md §2.1 fixes the backing buffer as
+//
+//   [0, N)     back buffer  — client-writable scratch
+//   [N, 2N)    front buffer — kernel-owned "last emitted" snapshot
+//
+// with N = rows * cols * CELL_BYTES. A 240x67 terminal costs
+// N = 257,280 bytes; two such regions ~500 KiB per canvas.
+//
+// M1-003 will land the pointer-plus-stride helpers and the
+// buffer_write_cell / buffer_read_cell primitives. M1-001 only
+// captures the region-offset constants a downstream Frame / driver
+// path (M1-005) can key against without waiting for the M1-003 body.
+
+module Buffer = structure {
+
+  // Region ordinals inside the backing memory_slot. The mint gate
+  // (docs/design.md §2.1 KIND_TUI_CANVAS mint) validates the total
+  // slot byte-length is >= 2 * rows * cols * CELL_BYTES; the layout
+  // below is what the kernel diff path (TUI_OP_PRESENT) walks.
+  pub let BUFFER_REGION_BACK  : u64 = 0
+  pub let BUFFER_REGION_FRONT : u64 = 1
+
+  // Number of regions per canvas. Locked at 2 (back + front). Any
+  // future triple-buffer variant would revise the KIND_TUI_CANVAS
+  // wire and bump the postui version, not add a third region under
+  // the same cap kind.
+  pub let BUFFER_REGION_COUNT : u64 = 2
+
+}

@@ -1,0 +1,54 @@
+// src/widget_kind.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// WidgetKind module: placeholder for the WidgetKind closed enum +
+// widget_draw dispatch landing at M1-007.
+//
+// docs/design.md §1.2 fixes the central architectural resolution:
+// postui does NOT port Ratatui's trait-object Widget/StatefulWidget
+// architecture (there is no generics / trait / dyn machinery in
+// paideia-as). Every widget is instead a variant of a closed
+// WidgetKind enum and dispatch flows through one widget_draw
+// function that pattern-matches on the variant. Adding widget #31
+// means adding a variant here and a case to widget_draw's dispatch
+// -- the same shape KIND_TTY's cap_handler_tty already uses for
+// its six ops.
+//
+// M1-007 lands the WidgetKind enum + widget_draw body. At M1-001
+// the module ships the widget-ordinal ID constants downstream code
+// can key on for logging / stat counters / boot-smoke assertions.
+// The ordinals below match the docs/design.md §2.6 widget catalog
+// order (Block first, then the M2..M4 batches). Only Block has an
+// implementation at M1-006; the rest stub `unimplemented` in the
+// M1-007 dispatch until their M2..M4 widget-body PRs land.
+
+module WidgetKind = structure {
+
+  // Widget kind ordinals (docs/design.md §2.6 catalog order).
+  // Assigned to a fixed closed set at v1; adding a new widget at
+  // a future release requires bumping POSTUI_VERSION_MINOR and
+  // reserving a fresh ordinal past the current top -- an existing
+  // ordinal never changes semantic identity.
+  pub let WK_BLOCK       : u64 = 0
+  pub let WK_PARAGRAPH   : u64 = 1
+  pub let WK_LIST        : u64 = 2
+  pub let WK_TABLE       : u64 = 3
+  pub let WK_TABS        : u64 = 4
+  pub let WK_GAUGE       : u64 = 5
+  pub let WK_SPARKLINE   : u64 = 6
+  pub let WK_BARCHART    : u64 = 7
+  pub let WK_CHART       : u64 = 8
+  pub let WK_CANVAS      : u64 = 9
+  pub let WK_TREE        : u64 = 10
+  pub let WK_CALENDAR    : u64 = 11
+  pub let WK_SCROLLBAR   : u64 = 12
+  pub let WK_TEXTINPUT   : u64 = 13
+  pub let WK_CLEAR       : u64 = 14
+
+  // Cardinality of the widget catalog at v1. Locked at 15 to
+  // match docs/design.md §1.2 example (15 variants). A dispatch
+  // table's static-array reservation keys on this constant so a
+  // future WK_* addition is caught by a compile-time size check
+  // rather than silently over-indexing an out-of-date table.
+  pub let WK_COUNT : u64 = 15
+
+}

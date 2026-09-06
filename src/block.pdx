@@ -1,0 +1,38 @@
+// src/block.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Block module: placeholder for the Block widget landing at M1-006.
+//
+// docs/design.md §2.6 widget catalog: Block is "border + title +
+// padding container", the smallest widget in the catalog and the
+// first one M1-006 implements (every heavier widget composes a Block
+// inside its own render body, so Block landing first minimizes the
+// number of unimplemented dependencies at M1-008 boot smoke).
+//
+// M1-006 ships the BlockSpec struct plus the block_draw body that
+// writes borders, title, and inset padding into the buffer, and
+// emits the BlockView@0.1 semantic-pipe record docs/design.md §2.3
+// describes. M1-001 seeds only the border-kind ordinals so the
+// M1-007 WidgetKind enum wiring can reference them in its dispatch
+// scaffolding without waiting for the M1-006 struct body.
+
+module Block = structure {
+
+  // Border-kind ordinals (docs/design.md §5.1 M1-006 scope:
+  // "borders: plain/rounded/double/thick"). Kept in a fixed closed
+  // set at v1; a later "custom border-glyph tuple" surface would
+  // add a new variant here + a paired constant tuple in the M1-006
+  // body, and every downstream widget composing a Block would pick
+  // up the new option through the existing dispatch.
+  pub let BLOCK_BORDER_NONE    : u64 = 0
+  pub let BLOCK_BORDER_PLAIN   : u64 = 1
+  pub let BLOCK_BORDER_ROUNDED : u64 = 2
+  pub let BLOCK_BORDER_DOUBLE  : u64 = 3
+  pub let BLOCK_BORDER_THICK   : u64 = 4
+
+  // Padding maximum (per side). The Block struct at M1-006 will
+  // reject a padding request that would leave zero interior cells;
+  // this constant is the hard integer ceiling, not the smaller
+  // "must leave >= 1 interior cell" runtime check.
+  pub let BLOCK_PADDING_MAX : u64 = 128
+
+}

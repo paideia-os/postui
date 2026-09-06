@@ -1,0 +1,124 @@
+# postui — caps.decl
+#
+# Wave: postui v1 (Ratatui-parity TUI widget library)
+# Milestone: M1 (skeleton + cell buffer + minimal Block widget)
+# Doc: docs/design.md §2.1 (KIND_TUI_CANVAS cap model), §2.5 (input
+#      handling), §4 (cross-repo dependency chain).
+#
+# postui is the TUI widget library that lets ring-3 tools build rich
+# multi-pane interactive screens. Its cap footprint is deliberately
+# minimal: postui itself holds authority over the terminal-rendering
+# capabilities its callers already have; it never mints, brokers, or
+# owns caps on the caller's behalf beyond what a draw + present cycle
+# requires. Every entry below is what a consumer must confer on a
+# postui-linked binary at exec time (via the InitCap sidecar or an
+# equivalent seeding path); postui does not upgrade any authority
+# beyond the request set.
+#
+# Every KIND below is named symbolically because the wave-89
+# KIND_TUI_CANVAS kernel landing (paideia-os R89.M1-001..003, docs/
+# design.md §4) is a hard prerequisite of postui.M1-004 and later.
+# libpdx-cap's caps.decl parser is textual and accepts the symbolic
+# name until the numeric ordinal is pinned here at M1-004 landing time
+# (design.md §2.1 already commits the ordinal to 0x1A6).
+#
+# ---------------------------------------------------------------------
+# KIND_TUI_CANVAS — the render substrate (docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# The one KIND that is uniquely postui's. Every consumer that draws a
+# frame holds one canvas cap per rendering surface (typically one per
+# process for a fullscreen TUI; multiple for a compositor-style app
+# splitting into per-region sub-canvases at M4+).
+#
+# Rights layout (mirrors R_TTY_* discipline; see docs/design.md §2.1
+# "Rights" table):
+#
+#   R_TUI_PRESENT   0x002   diff + emit a frame (the write analogue)
+#   R_TUI_INVOKE    0x008   query ops (rows, cols, id, tty_id)
+#   R_TUI_RESIZE    0x010   TUI_OP_RESIZE / TUI_OP_CLEAR
+#   R_TUI_REVOKE    0x020   teardown the row
+#   R_TUI_MINT      0x200   derive a narrower child (reserved; no v1 caller)
+#   R_TUI_OBSERVE   0x400   debug printer
+#
+# postui M1's rendering path exercises PRESENT (per-frame) + INVOKE
+# (rows/cols query at Terminal::init) + RESIZE (on SIGWINCH-equivalent
+# TTY resize event) + REVOKE (Terminal::teardown). MINT is reserved
+# for a later multi-canvas compositor (out of v1 scope, §2.1 note).
+# OBSERVE is opt-in for debug-tap consumers only.
+#
+# ---------------------------------------------------------------------
+# KIND_TTY — the input + physical-sink substrate (docs/design.md §2.5)
+# ---------------------------------------------------------------------
+#
+# Two independent uses:
+#
+#   * write — a canvas is provably wired to a live KIND_TTY at mint
+#     time (docs/design.md §2.1: the row's tty_slot is validated via
+#     tty_tail_valid at cap_handler_tui_canvas mint). TUI_OP_PRESENT
+#     emits its ANSI byte stream through the tty_slot, so the write
+#     right is transitively required even though postui code never
+#     issues TTY_OP_WRITE itself -- the caller's exec-time InitCap
+#     seeding must carry it so the mint gate does not refuse.
+#
+#   * read — the primary input path (docs/design.md §2.5). Once
+#     paideia-os #1986 (R66v2.POS-001, KIND_TTY raw-mode +
+#     TTY_OP_READ) lands, postui M1-005's Terminal::init probes it
+#     via TTY_OP_SET_RAW; if the cap lacks R_TTY_READ or the op is
+#     refused, postui falls back to sys_read(0) against the VFS fd.
+#     The fallback is explicitly temporary (design.md §2.5, M4-007
+#     tracks its removal); the caps.decl declares read up front so
+#     downstream tooling sees the eventual runtime dependency at M1.
+#
+# ---------------------------------------------------------------------
+# KIND_MEMORY — the canvas backing store (docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# KIND_TUI_CANVAS derives over KIND_MEMORY (= KIND_PAGE, 4), following
+# the kind_gpu_bo / kind_display_plane precedent. The caller mints a
+# KIND_MEMORY region sized 2 * rows * cols * CELL_BYTES (§2.1 backing
+# buffer layout) and hands it to sys_cap_derive(KIND_TUI_CANVAS, ...)
+# at Terminal::init. The KIND_MEMORY authority is not held by postui
+# beyond the derive call -- the derived canvas cap is what postui
+# subsequently invokes for every PRESENT.
+requires:
+- KIND_TUI_CANVAS(present, invoke, resize, revoke)
+- KIND_TTY(write, read)
+- KIND_MEMORY(mint, revoke)
+
+# ---------------------------------------------------------------------
+# Declared output schemas
+# ---------------------------------------------------------------------
+#
+# postui is a library, not a service -- it does not itself bind an
+# app_pipe_fd. Every widget's draw() emits a per-widget
+# {WidgetName}View@0.1 schema (docs/design.md §2.3 semantic-pipe
+# integration; §2.6 widget catalog) THROUGH a KIND_IPC_ENDPOINT the
+# CONSUMER binds at startup. The schemas below are the surface
+# postui promises to emit once the widget bodies land (M1-006 Block,
+# M2-004..M2-008, M3-002..M3-006, M4-*); at M1-001 the emitter path
+# is scaffolding only. Consumers declare the endpoint (see e.g.
+# postui-top's own caps.decl at postui-top.M1); postui declares the
+# schema names it will produce, per the libpdx-semantic-pipe
+# 32-byte-BLAKE3 schema-hash contract.
+#
+# Every schema is frozen at @0.1 for postui v1; libpdx-semantic-pipe's
+# 4-rule version-tolerance matrix (v1.0.0, already shipped) governs
+# what a subsequent @0.2 may change without breaking an old
+# subscriber (design.md §2.3 explicitly reuses this rather than
+# reinvents versioning).
+declares_output_schemas:
+- BlockView@0.1
+- ParagraphView@0.1
+- ListView@0.1
+- TableView@0.1
+- TabsView@0.1
+- GaugeView@0.1
+- SparklineView@0.1
+- BarChartView@0.1
+- ChartView@0.1
+- CanvasView@0.1
+- TreeView@0.1
+- CalendarView@0.1
+- ScrollbarView@0.1
+- TextInputView@0.1

@@ -1,0 +1,48 @@
+// src/frame.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Frame module: placeholder for the Frame / Terminal driver loop
+// landing at M1-005.
+//
+// docs/design.md §2.2 defines the rendering pipeline:
+//
+//   Application state
+//         → Widget tree (a Vec<WidgetKind> built fresh each tick)
+//         → Frame::render(widget, area)  — user-side dispatch
+//         → Buffer  — back-region cell writes via mapped pointer
+//         → cap_invoke(canvas_cap, TUI_OP_PRESENT, 0)
+//         → kernel diff → ANSI → TTY_OP_WRITE → physical sink
+//
+// docs/design.md §2.7 defines the input dispatch (runtime loop):
+//
+//   Terminal::init()  → probe KIND_TTY raw-mode; else sys_read(0)
+//                        fallback (§2.5)
+//   loop:
+//     event = next_event()
+//     app.handle(event)
+//     frame = build_widget_tree(app.state)
+//     for (widget, area) in frame: widget_draw(widget, area, buf)
+//     cap_invoke(canvas_cap, TUI_OP_PRESENT, 0)
+//
+// M1-005 lands the Frame::render + Terminal::init + Terminal::next_event
+// bodies. M1-001 seeds the runtime-state ordinal constants downstream
+// modules can key against without waiting for the M1-005 body.
+
+module Frame = structure {
+
+  // Terminal-state ordinals. Terminal::init transitions
+  // UNINITIALIZED -> INITIALIZED; a fatal error path transitions
+  // to FAULTED and refuses every subsequent op. Ordinals are named
+  // rather than positional so a downstream trace / stat counter
+  // stays readable.
+  pub let FRAME_STATE_UNINITIALIZED : u64 = 0
+  pub let FRAME_STATE_INITIALIZED   : u64 = 1
+  pub let FRAME_STATE_FAULTED       : u64 = 2
+
+  // Input-path discriminator (docs/design.md §2.5). Terminal::init
+  // sets this to KIND_TTY once the raw-mode probe succeeds, or to
+  // SYS_READ_FALLBACK on refusal. M4-007 tracks removal of the
+  // fallback once paideia-os #1986 lands and stabilizes.
+  pub let FRAME_INPUT_KIND_TTY          : u64 = 1
+  pub let FRAME_INPUT_SYS_READ_FALLBACK : u64 = 2
+
+}

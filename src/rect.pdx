@@ -1,0 +1,29 @@
+// src/rect.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Rect module: placeholder for the Rect primitive landing at M1-002.
+//
+// This file exists at M1-001 so manifest.pdxproj can register every
+// M1 source without touching the manifest again as each M1-00x issue
+// lands its body. The Rect primitive itself -- a plain struct
+// carrying (x, y, rows, cols) integer geometry plus the split/inset
+// helpers docs/design.md §2.4 layout engine consumes -- lands with
+// postui.M1-002. Until then this module exposes only the size and
+// alignment invariants a downstream module can reference statically.
+
+module Rect = structure {
+
+  // Byte width of the Rect struct once M1-002 lands its fields.
+  // Locked at scaffold time so a downstream .bss reservation
+  // (Buffer, Frame) can size its Rect-carrying slots without waiting
+  // for the struct body. Four u16 fields packed = 8 bytes; kept at
+  // that ceiling in the scaffold as an aspirational constant the
+  // M1-002 struct definition must match.
+  pub let RECT_BYTES : u64 = 8
+
+  // Maximum rows/cols any Rect can encode. Same ceiling docs/design
+  // .md §2.1 sets on canvas dimensions (TUI_DIM_MAX = 4096); a Rect
+  // that layouts against a canvas cannot address beyond the canvas
+  // grid.
+  pub let RECT_DIM_MAX : u64 = 4096
+
+}

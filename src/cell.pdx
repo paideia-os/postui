@@ -1,0 +1,44 @@
+// src/cell.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Cell module: placeholder for the 16-byte Cell wire format landing
+// at M1-003.
+//
+// docs/design.md §2.1 freezes the Cell wire format at 16 bytes:
+//
+//   [+0]  symbol   [4]u8   up to 4 UTF-8 bytes (one grapheme, §1.5
+//                          width-table approximation for v1)
+//   [+4]  fg       [3]u8   24-bit truecolor
+//   [+7]  bg       [3]u8   24-bit truecolor
+//   [+10] mods     u8      bitflags (see Style::STYLE_MOD_*)
+//   [+11] reserved [5]u8   zero; future 9th modifier / hyperlink id
+//
+// At M1-001 this module ships the layout constants only. The Cell
+// struct itself and the byte-level write/compare helpers land at
+// M1-003 (Buffer's own body drives their signature).
+
+module Cell = structure {
+
+  // Total byte width of one Cell on the wire. Locked at 16 --
+  // memory_slot sizing (Buffer, docs/design.md §2.1) computes
+  // 2 * rows * cols * CELL_BYTES, so any drift here corrupts the
+  // whole back/front region layout.
+  pub let CELL_BYTES : u64 = 16
+
+  // Field offsets inside one Cell (docs/design.md §2.1). Named
+  // constants rather than hard-coded numerals so a downstream
+  // read/write path stays readable when a later revision uses the
+  // reserved[5] tail.
+  pub let CELL_OFF_SYMBOL   : u64 = 0
+  pub let CELL_OFF_FG       : u64 = 4
+  pub let CELL_OFF_BG       : u64 = 7
+  pub let CELL_OFF_MODS     : u64 = 10
+  pub let CELL_OFF_RESERVED : u64 = 11
+
+  // Byte widths of each field. Sum = 16 = CELL_BYTES by construction.
+  pub let CELL_LEN_SYMBOL   : u64 = 4
+  pub let CELL_LEN_FG       : u64 = 3
+  pub let CELL_LEN_BG       : u64 = 3
+  pub let CELL_LEN_MODS     : u64 = 1
+  pub let CELL_LEN_RESERVED : u64 = 5
+
+}

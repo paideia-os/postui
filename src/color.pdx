@@ -1,0 +1,24 @@
+// src/color.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Color module: placeholder for the 24-bit truecolor triplet landing
+// at M1-002.
+//
+// docs/design.md §2.1 freezes postui on 24-bit truecolor only -- no
+// 16-color or 256-palette tier is stored or emitted. This module
+// scaffolds the CHANNEL_* and BYTE-WIDTH constants that downstream
+// modules (Cell, Style) reference; the (r, g, b) tuple type itself
+// lands at M1-002 alongside the struct-carrying Style aggregate.
+
+module Color = structure {
+
+  // Number of channel bytes per color value. Locked at 3 (r, g, b);
+  // an alpha channel is out of scope for a terminal cell.
+  pub let COLOR_BYTES : u64 = 3
+
+  // Channel-value bounds. Every color component is a u8 (0..255).
+  // Recorded as u64 constants so a downstream range check can
+  // compare against them without a narrowing cast.
+  pub let COLOR_CHANNEL_MIN : u64 = 0
+  pub let COLOR_CHANNEL_MAX : u64 = 255
+
+}

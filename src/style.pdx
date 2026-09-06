@@ -1,0 +1,32 @@
+// src/style.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+//
+// Style module: placeholder for the Style aggregate landing at M1-002.
+//
+// A Style is the (fg Color, bg Color, mods u8) triple every Cell
+// carries (docs/design.md §2.1 Cell wire format). At M1-002 this
+// module ships the Style struct plus the modifier bitflag constants;
+// at M1-001 it exposes only the bitflag layout so a downstream Cell
+// scaffold (M1-003) can size its `mods` slot without waiting for the
+// struct body.
+
+module Style = structure {
+
+  // Modifier bitflag layout (docs/design.md §2.1 mods u8). Matches
+  // the Ratatui set minus HIDDEN (dropped from v1 per design.md
+  // §2.1 note; the 9th flag slot is reserved for a future revision
+  // in the Cell's reserved[5] tail without breaking the wire).
+  pub let STYLE_MOD_BOLD        : u64 = 0x01
+  pub let STYLE_MOD_ITALIC      : u64 = 0x02
+  pub let STYLE_MOD_UNDERLINE   : u64 = 0x04
+  pub let STYLE_MOD_DIM         : u64 = 0x08
+  pub let STYLE_MOD_CROSSED_OUT : u64 = 0x10
+  pub let STYLE_MOD_SLOW_BLINK  : u64 = 0x20
+  pub let STYLE_MOD_RAPID_BLINK : u64 = 0x40
+  pub let STYLE_MOD_REVERSED    : u64 = 0x80
+
+  // Aggregate byte width once M1-002 lands the Style struct: 3
+  // (fg) + 3 (bg) + 1 (mods) + 1 (pad) = 8 bytes on a natural
+  // 8-byte boundary.
+  pub let STYLE_BYTES : u64 = 8
+
+}

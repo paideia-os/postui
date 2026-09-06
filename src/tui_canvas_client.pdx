@@ -1,0 +1,73 @@
+// src/tui_canvas_client.pdx -- postui.M1-001 scaffold
+//                              (paideia-os/postui#1)
+//
+// TuiCanvasClient module: placeholder for the KIND_TUI_CANVAS client
+// bindings landing at M1-004.
+//
+// docs/design.md §2.1 defines the KIND_TUI_CANVAS cap kind and its
+// op set (TUI_OP_PRESENT, TUI_OP_QUERY_ROWS, TUI_OP_QUERY_COLS,
+// TUI_OP_QUERY_ID, TUI_OP_QUERY_TTY_ID, TUI_OP_RESIZE, TUI_OP_CLEAR,
+// TUI_OP_DEBUG_PRINT). This module wraps sys_cap_invoke against a
+// canvas cap slot so higher-level modules (Frame at M1-005) do not
+// re-encode the raw (rights, target_ptr, op_arg) triple every call.
+//
+// M1-004 lands the wrapper bodies (call site + errno translation).
+// M1-001 seeds the ordinal + rights constants downstream modules can
+// reference statically; the wire-format ordinal for KIND_TUI_CANVAS
+// itself (0x1A6 per docs/design.md §2.1) is pinned here so it is
+// authoritative in exactly one place inside the library. This is
+// the same discipline shell/src/shell.pdx applies for the SH_KIND_*
+// ordinal mirrors it exports.
+
+module TuiCanvasClient = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirror
+  //
+  // Mirror of the authoritative kernel value assigned at docs/
+  // design.md §2.1 Cap model. The paideia-os R89.M1-001 landing
+  // (kind_tui_canvas.pdx) will freeze this value; libpdx-cap's
+  // caps.decl parser accepts either the symbolic name or this
+  // numeric mirror at bind time.
+  // ==========================================================================
+
+  pub let TCC_KIND_TUI_CANVAS : u64 = 0x1A6
+
+  // ==========================================================================
+  // Op ordinals (docs/design.md §2.1 Ops table)
+  // ==========================================================================
+
+  pub let TCC_OP_PRESENT       : u64 = 0
+  pub let TCC_OP_QUERY_ROWS    : u64 = 1
+  pub let TCC_OP_QUERY_COLS    : u64 = 2
+  pub let TCC_OP_QUERY_ID      : u64 = 3
+  pub let TCC_OP_QUERY_TTY_ID  : u64 = 4
+  pub let TCC_OP_RESIZE        : u64 = 5
+  pub let TCC_OP_CLEAR         : u64 = 6
+  pub let TCC_OP_DEBUG_PRINT   : u64 = 7
+
+  // ==========================================================================
+  // Rights bits (docs/design.md §2.1 Rights table)
+  // ==========================================================================
+
+  pub let TCC_R_TUI_PRESENT : u64 = 0x002
+  pub let TCC_R_TUI_INVOKE  : u64 = 0x008
+  pub let TCC_R_TUI_RESIZE  : u64 = 0x010
+  pub let TCC_R_TUI_REVOKE  : u64 = 0x020
+  pub let TCC_R_TUI_MINT    : u64 = 0x200
+  pub let TCC_R_TUI_OBSERVE : u64 = 0x400
+  pub let TCC_R_TUI_ALL     : u64 = 0x63A
+
+  // ==========================================================================
+  // Kernel-side failure band (docs/design.md §2.1 Failure taxonomy)
+  //
+  // Disjoint from KIND_TTY's 0xFFFFEC30..0xFFFFEC3F band. postui's
+  // own userspace-side band (Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB00)
+  // is disjoint from both, so a return can be attributed to postui,
+  // KIND_TUI_CANVAS kernel, or KIND_TTY kernel by high-byte alone.
+  // ==========================================================================
+
+  pub let TCC_ERR_BAND_BASE : u64 = 0xFFFFEC40
+  pub let TCC_ERR_BAND_TOP  : u64 = 0xFFFFEC4F
+
+}

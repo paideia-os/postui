@@ -1,0 +1,88 @@
+# postui — paideia-as build manifest
+#
+# Wave: postui v1 (Ratatui-parity TUI widget library)
+# Milestone: M1 (skeleton + cell buffer + minimal Block widget)
+# Doc: docs/design.md §§1–5 (authoritative spec); §5.1 milestone plan.
+#
+# postui is a userspace LIBRARY (not a tool: no _start, no entry
+# frame). It is linked into ring-3 consumers such as postui-top,
+# postui-hex, postui-dmesg (docs/design.md §3), plus any future TUI
+# app the org ships. paideia-as v0.34+ is the required toolchain
+# floor. Individual source files are compiled by tools/build.sh into
+# loose ELF64 objects under build-out/; downstream packaging steps
+# assemble those into consumers' link lines. This manifest is
+# metadata: it enumerates the source set, dependencies, and compliance
+# discipline for humans and tooling that walk the repo, mirroring the
+# shape shell/manifest.pdxproj established in the paideia-os
+# monorepo satellites.
+
+name        = postui
+version     = 0.1.0-pre
+kind        = library
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). Every file
+# below is compiled into build-out/<basename>.o by tools/build.sh.
+# The M1-001 landing seeds every M1 file so subsequent M1-002..M1-007
+# issues only add symbol bodies — the module registry does not
+# churn once M1-001 is in.
+sources:
+  - src/lib.pdx                   # M1-001: library-entry sentinel + version constants
+  - src/rect.pdx                  # M1-002: Rect primitive (x/y/rows/cols geometry)
+  - src/style.pdx                 # M1-002: Style aggregate (fg/bg/modifier tuple)
+  - src/color.pdx                 # M1-002: Color 24-bit truecolor triplet
+  - src/cell.pdx                  # M1-003: 16-byte Cell wire-format constants
+  - src/buffer.pdx                # M1-003: Buffer back/front region layout
+  - src/tui_canvas_client.pdx     # M1-004: KIND_TUI_CANVAS mint/present/query wrappers
+  - src/frame.pdx                 # M1-005: Frame/Terminal driver loop
+  - src/block.pdx                 # M1-006: Block widget (borders, title, padding)
+  - src/widget_kind.pdx           # M1-007: WidgetKind closed enum + widget_draw dispatch
+
+# --- Library dependencies -----------------------------------------------
+# postui's rendering path does not need libpdx-cap or libpdx-argv at
+# M1 -- the cap-marshalling wrappers (M1-004) call sys_cap_invoke
+# directly through the syscall floor, and there is no argv parsing in
+# a library. libpdx-semantic-pipe is a M2/M5 dependency (docs/design.md
+# §2.3, §5.1 M2-009) and is intentionally NOT declared here to keep
+# M1 free of any transitive-schema-hash rebuild churn.
+deps:
+  # (empty at M1 by design; M2-009 introduces libpdx-semantic-pipe)
+
+# --- Test targets ------------------------------------------------------
+# Populated starting M1-008 (boot smoke: render one Block into a
+# canvas fixture and verify cell bytes). Every entry below becomes a
+# `paideia-as build --tests` target once the corresponding issue
+# lands. The list is intentionally empty at M1-001 -- test bodies land
+# with their producing feature, not with the scaffold.
+tests:
+  # (populated starting M1-008; see docs/design.md §5.1)
+
+# --- Documentation targets ---------------------------------------------
+# The authoritative postui spec lives at docs/design.md and is not a
+# .pdxdoc yet -- it is Markdown for the design phase. postui.M1-009
+# (docs/design.md §5.1) files a matching internal design/architecture.md
+# analogous to shell's own. `.pdxdoc` surfaces land at M5 packaging
+# time alongside the release manifest.
+docs:
+  # (populated starting M1-009; see docs/design.md §5.1)
+
+# --- Paideia-as compliance flags ---------------------------------------
+# Same invariant set the shell / libpdx-* satellites observe. A build
+# under a non-conforming paideia-as revision refuses fast in tools/
+# build.sh's version-floor check.
+compliance:
+  - module-basename-pascal        # module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy (deferred to M5) -----------------------------------
+# postui M5 (docs/design.md §5.1 M5) lands the release manifest
+# (dual-sign per paideia-os release-manifest.md), semantic-pipe
+# version matrix, and the pkgs.paideia-os hand-off. This section is
+# reserved so M5 only fills fields rather than adding structure.
+release:
+  # signer_author, signer_root, mldsa_level, mirror_target — TBD at M5
