@@ -1,33 +1,124 @@
-// src/widget_kind.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/widget_kind.pdx -- postui.M1-007 (paideia-os/postui#7)
 //
-// WidgetKind module: placeholder for the WidgetKind closed enum +
-// widget_draw dispatch landing at M1-007.
+// WidgetKind module: closed sum type over all 15 widget kinds +
+// widget_draw dispatch function.
 //
-// docs/design.md §1.2 fixes the central architectural resolution:
-// postui does NOT port Ratatui's trait-object Widget/StatefulWidget
-// architecture (there is no generics / trait / dyn machinery in
-// paideia-as). Every widget is instead a variant of a closed
-// WidgetKind enum and dispatch flows through one widget_draw
-// function that pattern-matches on the variant. Adding widget #31
-// means adding a variant here and a case to widget_draw's dispatch
-// -- the same shape KIND_TTY's cap_handler_tty already uses for
-// its six ops.
+// =============================================================================
+// SCOPE (docs/design.md §1.2, §2.6 widget catalog, §5.1 M1-007)
+// =============================================================================
 //
-// M1-007 lands the WidgetKind enum + widget_draw body. At M1-001
-// the module ships the widget-ordinal ID constants downstream code
-// can key on for logging / stat counters / boot-smoke assertions.
-// The ordinals below match the docs/design.md §2.6 widget catalog
-// order (Block first, then the M2..M4 batches). Only Block has an
-// implementation at M1-006; the rest stub `unimplemented` in the
-// M1-007 dispatch until their M2..M4 widget-body PRs land.
+// This module is the postui analogue of the kernel's cap-handler
+// dispatch pattern (cap_handler_tui_canvas.pdx / cap_handler_tty.pdx):
+// one entry function that takes an ordinal + argument tuple, cmp/je-
+// chains over the closed set of ordinals, and forwards each match to
+// the appropriate handler body. The design doc's §1.2 architectural
+// resolution ("closed WidgetKind enum + widget_draw dispatch, no trait
+// objects, no vtables") is realized verbatim by this file.
+//
+// The M1-001 scaffold seeded the widget-ordinal ID constants
+// (WK_BLOCK..WK_CLEAR, WK_COUNT) so downstream code could key against
+// them for logging / stat counters / boot-smoke assertions without
+// waiting for the M1-007 body. This landing preserves every WK_*
+// value verbatim (semantic identity of an ordinal never changes once
+// shipped -- adding widget #16 in a future release requires bumping
+// POSTUI_VERSION_MINOR and reserving a fresh ordinal past the current
+// top; the scaffold's own header pins this contract).
+//
+// =============================================================================
+// WHAT LANDS AT M1-007
+// =============================================================================
+//
+//   1. Two error sentinels in the postui error band (0xFFFFEB80+):
+//        WK_ERR_UNIMPLEMENTED (0xFFFFEB90): the kind ordinal is in
+//          [0, WK_COUNT) but no v1 widget body exists for it -- the
+//          14 non-Block kinds all fall here until their M2..M4 landings.
+//        WK_ERR_BAD_KIND (0xFFFFEB91): the kind ordinal is >= WK_COUNT.
+//          A well-formed caller never triggers this (WidgetKind is
+//          closed; the type-checker would reject a WK_* constant that
+//          did not exist), so this is a defensive gate against a
+//          hand-crafted numeric literal or memory-corrupted frame.
+//
+//   2. widget_draw(kind, spec, buf, rows, cols) -> u64: the one entry
+//      every Frame::draw call goes through. Compare-chain dispatch:
+//      bounds-check kind < WK_COUNT, then a single cmp/je for the one
+//      implemented ordinal (WK_BLOCK=0), else fall through to the
+//      unimplemented sentinel. Every M2..M4 widget-body landing adds
+//      exactly one cmp/je + one call target here -- the same edit-
+//      locality the kernel cap-dispatch tables have kept intact
+//      through eight+ cap kinds.
+//
+// =============================================================================
+// DISPATCH SHAPE: COMPARE-CHAIN vs FUNCTION-POINTER TABLE
+// =============================================================================
+//
+// The obvious alternative to a compare-chain is a `[u64; 15]` table of
+// function pointers indexed by `kind`, jumped through with an indirect
+// call. That posture has three concrete costs at M1-007's actual state:
+//
+//   (1) paideia-as's `pub let X : [u64; N] = { ... }` data-initializer
+//       does not accept function-symbol literals (see the paideia-as
+//       encoder pitfalls memory-note). Building the table thus needs a
+//       runtime widget_kind_init() call, adding a boot-order dependency
+//       between whoever calls widget_draw and the init sequencing --
+//       exactly the class of hidden state Frame::init tries to avoid.
+//   (2) The perf argument does not survive scrutiny at 15 branches.
+//       Modern branch predictors classify a compare-chain of <=16
+//       entries as first-touch predictable; an indirect call through a
+//       non-hot memory location adds one D$ miss the compare-chain
+//       does not have.
+//   (3) At v1 only 1 of 15 targets is implemented. A 15-slot table
+//       would be 14 slots pointing at the same stub function -- more
+//       LOC and more indirection than the two-line cmp/je body that
+//       dispatches the one real handler and falls through to the stub
+//       return.
+//
+// A table becomes attractive around ~5+ implemented kinds when the
+// cmp/je chain starts to bunch up in the icache. M2 lands Paragraph,
+// List, Table, Tabs, Scrollbar -- at that point the table+init pair
+// becomes the right shape and a rewrite here is a mechanical exercise
+// (introduce widget_kind_init, populate 15 slots, replace widget_draw
+// body with a bounds-check + indirect call). This landing does not
+// pre-invest in that infrastructure.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`WidgetKind`), matches file
+//     basename per manifest.pdxproj sources: entry.
+//   - No `test` mnemonic; the one bounds check is `cmp reg, imm32`
+//     (WK_COUNT = 15 fits imm32 trivially).
+//   - Error sentinels 0xFFFFEB90 and 0xFFFFEB91 both exceed
+//     0x7FFFFFFF, so `mov rax, <sentinel>` is emitted by paideia-as as
+//     movabs (10-byte imm64 form) -- legal for mov, matches the
+//     cap_handler_tui_canvas.pdx `mov rax, 0xFFFFEB1A` idiom
+//     verbatim (see kernel-side R89.M1-002).
+//   - No 2-op `imul reg, imm`; no imm64 in cmp/and; no r11 preserved
+//     across the nested call (r11 is scratch per paideia-as posture).
+//   - widget_draw is a non-leaf: it makes one nested call to
+//     block_draw for the WK_BLOCK arm. SysV alignment discipline
+//     applies: entry rsp%16==8; `sub rsp, 8` before the call rounds
+//     to 0; `add rsp, 8` after restores; `ret` pops the return
+//     address (unchanged). No callee-save register is written -- the
+//     four argument shuffles land in caller-save rdi/rsi/rdx/rcx, all
+//     of which are already dead across the return.
+//   - Effect/capability row `!{mem} @{}` -- widget_draw's transitive
+//     effect set is a superset of block_draw's (which is !{mem} @{}).
+//     No widget in the closed set introduces sysreg or cap effects at
+//     v1 (see docs/design.md §2.3 -- widget bodies write cells and
+//     pack semantic-pipe records, both mem-only; the actual pipe send
+//     is deferred to M2-009 and does not run inside widget_draw).
+//   - Labels prefixed `wk_` per docs/design.md fingerprint discipline.
 
 module WidgetKind = structure {
 
+  // ==========================================================================
   // Widget kind ordinals (docs/design.md §2.6 catalog order).
-  // Assigned to a fixed closed set at v1; adding a new widget at
-  // a future release requires bumping POSTUI_VERSION_MINOR and
-  // reserving a fresh ordinal past the current top -- an existing
-  // ordinal never changes semantic identity.
+  // Assigned to a fixed closed set at v1; adding a new widget at a
+  // future release requires bumping POSTUI_VERSION_MINOR and reserving
+  // a fresh ordinal past the current top -- an existing ordinal never
+  // changes semantic identity.
+  // ==========================================================================
   pub let WK_BLOCK       : u64 = 0
   pub let WK_PARAGRAPH   : u64 = 1
   pub let WK_LIST        : u64 = 2
@@ -44,11 +135,119 @@ module WidgetKind = structure {
   pub let WK_TEXTINPUT   : u64 = 13
   pub let WK_CLEAR       : u64 = 14
 
-  // Cardinality of the widget catalog at v1. Locked at 15 to
-  // match docs/design.md §1.2 example (15 variants). A dispatch
-  // table's static-array reservation keys on this constant so a
-  // future WK_* addition is caught by a compile-time size check
-  // rather than silently over-indexing an out-of-date table.
+  // Cardinality of the widget catalog at v1. Locked at 15 to match
+  // docs/design.md §1.2 example (15 variants). A dispatch table's
+  // static-array reservation keys on this constant so a future WK_*
+  // addition is caught by a compile-time size check rather than
+  // silently over-indexing an out-of-date table.
   pub let WK_COUNT : u64 = 15
+
+  // ==========================================================================
+  // Error sentinels (postui error band, 0xFFFFEB80+).
+  //
+  // WK_ERR_UNIMPLEMENTED: kind ordinal is in [0, WK_COUNT) but no
+  //   drawable body exists for it at v1. The 14 non-Block kinds
+  //   return this until their M2..M4 landings ship a real body.
+  //   Callers can key on this specific sentinel to render a
+  //   placeholder cell (e.g. an inverse-video "?" glyph) rather than
+  //   abort the whole frame.
+  //
+  // WK_ERR_BAD_KIND: kind ordinal is >= WK_COUNT. The type-checker
+  //   already prevents a well-formed WidgetKind reference from
+  //   landing here, so hitting it means a hand-crafted numeric
+  //   literal or a memory-corrupted frame. Distinct from
+  //   UNIMPLEMENTED so a downstream reader can tell "we know that
+  //   widget, just not yet" from "that's not a widget at all".
+  //
+  // Both sentinels sit in the postui error band (Lib::POSTUI_ERR_
+  // BAND_BASE = 0xFFFFEB80) so a downstream >> 8 discriminator
+  // attributes the return to postui vs. the kernel TCC band
+  // (0xFFFFEB10..1F) or the KIND_SIG_KEY band (0xFFFFEB00..0F).
+  // ==========================================================================
+  pub let WK_ERR_UNIMPLEMENTED : u64 = 0xFFFFEB90
+  pub let WK_ERR_BAD_KIND      : u64 = 0xFFFFEB91
+
+  // ==========================================================================
+  // widget_draw(kind, spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // The one entry every Frame::draw call routes through. Dispatches on
+  // `kind` to the appropriate per-widget draw body; returns the body's
+  // own return value (0 = OK for the Block v1 body, per block.pdx's
+  // documented contract). For unknown/unimplemented kinds returns one
+  // of the WK_ERR_* sentinels above.
+  //
+  // Signature matches every per-widget draw body one-for-one after the
+  // kind ordinal is stripped: (spec_ptr, buf_ptr, rows, cols) -> u64.
+  // The dispatch shifts the four widget-side args down one slot
+  // (rsi -> rdi, rdx -> rsi, rcx -> rdx, r8 -> rcx) before the nested
+  // call, exactly as SysV would do for a five-arg function calling a
+  // four-arg function. Each future widget body (paragraph_draw,
+  // list_draw, ...) plugs in with two lines of edit here: one
+  // cmp/je above the existing WK_BLOCK arm, one call target below
+  // -- the same edit-locality shape cap_handler_tui_canvas's tuih_op_*
+  // dispatch has maintained through eight ops.
+  //
+  // Register plan:
+  //   Args: rdi=kind, rsi=spec_ptr, rdx=buf_ptr, rcx=rows, r8=cols.
+  //   Bounds check: `cmp rdi, 15` (imm32-safe), `jae wk_wd_bad_kind`.
+  //   Dispatch: single `cmp rdi, 0` + `je wk_wd_block` for WK_BLOCK;
+  //     falls through to the unimplemented arm otherwise.
+  //   WK_BLOCK arm: shift args (rsi->rdi, rdx->rsi, rcx->rdx, r8->rcx)
+  //     via four mov reg,reg; `sub rsp, 8` to align rsp%16 from the
+  //     entry-time 8 to the call-safe 0; `call block_draw` returns its
+  //     u64 in rax verbatim; `add rsp, 8` restores; `ret`.
+  //   Unimplemented arm: `mov rax, 0xFFFFEB90` (paideia-as emits
+  //     10-byte movabs since imm > 0x7FFFFFFF); `ret`.
+  //   Bad-kind arm: `mov rax, 0xFFFFEB91`; `ret`.
+  //
+  // Non-leaf (one nested call). Alignment: entry rsp%16==8; `sub rsp,
+  // 8` -> 0 at every nested call site (only the WK_BLOCK arm has
+  // one). No callee-save register touched (the four arg shuffles land
+  // in caller-save rdi/rsi/rdx/rcx, all dead across the return).
+  //
+  // Effect/capability row: !{mem} @{}. widget_draw's transitive effect
+  // set is a superset of every arm's; block_draw is !{mem} @{}, and
+  // no future widget at v1 introduces sysreg or cap effects (the
+  // semantic-pipe send lands separately at M2-009, not inside
+  // widget_draw).
+  //
+  // Labels prefixed wk_ per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let widget_draw : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64) (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-007 (postui#7): widget_draw is the compare-chain dispatch entry every Frame::draw call routes through -- the postui analogue of the kernel's cap_handler_tui_canvas / cap_handler_tty op dispatch, one-for-one on shape. Bounds check first (cmp rdi, 15; jae wk_wd_bad_kind) covers a hand-crafted or memory-corrupted kind ordinal at v1's max (WK_COUNT=15, imm32-safe). Then a single cmp/je for the one implemented ordinal (WK_BLOCK=0) routes to the WK_BLOCK arm; every other ordinal in [1, 15) falls through to the unimplemented sentinel. WK_BLOCK arm shifts the four widget-side args down one SysV slot (rsi->rdi spec_ptr, rdx->rsi buf_ptr, rcx->rdx rows, r8->rcx cols) via four mov reg,reg; sub rsp,8 aligns rsp%16 from entry-time 8 to 0 for the nested call; call block_draw (cross-module, resolved by the linker against block.pdx's pub let block_draw symbol) returns its u64 in rax which we pass through verbatim; add rsp,8 restores; ret. Unimplemented arm: mov rax, 0xFFFFEB90 (paideia-as emits movabs since imm > 0x7FFFFFFF -- same idiom as cap_handler_tui_canvas.pdx's `mov rax, 0xFFFFEB1A` for TUI_BAD_SLOT); ret. Bad-kind arm: mov rax, 0xFFFFEB91; ret. No callee-save touched (the four caller-save arg regs are dead across the return); no r11 preserved (paideia-as scratch); no `test` mnemonic; every immediate that participates in cmp/and (0, 15) fits imm32; the two sentinel movs go through mov reg, imm64 (movabs), legal for mov, not for cmp/and. Effect/capability row {mem}/{} covers block_draw's transitive shape verbatim (block_draw is also !{mem} @{}). Labels prefixed wk_ per docs fingerprint discipline (wk_wd_ for widget_draw arms).",
+      block: {
+        // ---- Bounds check: reject kind >= WK_COUNT ------------------------
+        cmp rdi, 15;
+        jae wk_wd_bad_kind;
+
+        // ---- Dispatch: WK_BLOCK (0) -> block_draw -------------------------
+        cmp rdi, 0;
+        je  wk_wd_block;
+
+        // ---- Fall-through: kind is in [1, 15), no v1 body -----------------
+        mov rax, 0xFFFFEB90;
+        ret;
+
+      wk_wd_block:
+        // Shift args down one slot: (spec, buf, rows, cols) -> block_draw.
+        mov rdi, rsi;
+        mov rsi, rdx;
+        mov rdx, rcx;
+        mov rcx, r8;
+
+        // Align rsp for nested call (entry rsp%16==8 -> 0), call, restore.
+        sub rsp, 8;
+        call block_draw;
+        add rsp, 8;
+        ret;
+
+      wk_wd_bad_kind:
+        mov rax, 0xFFFFEB91;
+        ret;
+      }
+    }
 
 }
