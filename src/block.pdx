@@ -1,38 +1,977 @@
-// src/block.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/block.pdx -- postui.M1-006 (paideia-os/postui#6)
 //
-// Block module: placeholder for the Block widget landing at M1-006.
+// Block: border + title + padding container widget.
 //
-// docs/design.md §2.6 widget catalog: Block is "border + title +
-// padding container", the smallest widget in the catalog and the
-// first one M1-006 implements (every heavier widget composes a Block
-// inside its own render body, so Block landing first minimizes the
-// number of unimplemented dependencies at M1-008 boot smoke).
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M1-006)
+// =============================================================================
 //
-// M1-006 ships the BlockSpec struct plus the block_draw body that
-// writes borders, title, and inset padding into the buffer, and
-// emits the BlockView@0.1 semantic-pipe record docs/design.md §2.3
-// describes. M1-001 seeds only the border-kind ordinals so the
-// M1-007 WidgetKind enum wiring can reference them in its dispatch
-// scaffolding without waiting for the M1-006 struct body.
+// Block is the smallest widget in the catalog and the first one with a
+// draw body. Every heavier widget (Paragraph, List, Table, ...) composes
+// a Block inside its own render body, so Block landing first minimizes
+// the number of unimplemented dependencies at M1-008 boot smoke and at
+// M2..M4 widget-body PRs.
+//
+// This module lands:
+//   - The BlockSpec state record (48-byte struct laid out in memory).
+//   - The four border-glyph tables (PLAIN/ROUNDED/DOUBLE/THICK) as UTF-8
+//     literal bytes in .rodata; a fifth "NONE" variant simply skips the
+//     border draw entirely.
+//   - block_spec_init: pack a BlockSpec into caller-provided memory.
+//   - block_inner: return the packed inner-content Rect (block area
+//     shrunk by 1 cell per side for the border, then by padding).
+//   - block_draw: the widget_draw entry point (standard four-arg
+//     signature that postui.M1-007's WidgetKind dispatch keys against).
+//   - block_view_pack: pack a BlockView@0.1 semantic-pipe record into
+//     caller-provided memory. Actual semantic_pipe::send_record call
+//     lands at postui.M2-009 when libpdx-semantic-pipe becomes a
+//     declared dependency — M1's manifest.pdxproj has no libpdx-
+//     semantic-pipe entry, and adding it here would introduce transitive
+//     schema-hash rebuild churn on every M1 iteration. At M2-009 the
+//     wiring is one call using the packer landed here:
+//         semantic_pipe::send_record(app_pipe_fd, BLKV_SCHEMA_HASH,
+//                                     packed_bytes, block_view_pack(...))
+//     where BLKV_SCHEMA_HASH = BLAKE3("BlockView@0.1"), computed by the
+//     M2-009 registry glue (docs/design.md §2.3).
+//
+// =============================================================================
+// BLOCKSPEC WIRE (48 bytes, BLOCK_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)    rect          u64 packed (x, y, w, h) per Rect module wire
+//   [+8]        border_kind   u8  (0..4; BLOCK_BORDER_* constants)
+//   [+9]        pad_top       u8
+//   [+10]       pad_right     u8
+//   [+11]       pad_bottom    u8
+//   [+12]       pad_left      u8
+//   [+13..+16)  reserved      [3]u8 zero on the wire
+//   [+16..+24)  title_ptr     u64 (may be 0 with title_len = 0)
+//   [+24..+32)  title_len     u64 (UTF-8 bytes; ASCII-clean at M1 —
+//                                  see block_draw notes below)
+//   [+32..+48)  fill_cell     16-byte inline Cell (Cell wire, §2.1)
+//
+// 48 bytes is 3 x 16-byte pairs, keeps the fill_cell at a natural 16-byte
+// slot inside the struct, and matches the standard cache-line alignment
+// most widget structs will settle on once M2..M4 land. block_draw reads
+// fill_cell as two aligned 8-byte loads per interior cell copy, exactly
+// the Cell::cell_copy hot-path shape.
+//
+// =============================================================================
+// BORDER GLYPH TABLES
+// =============================================================================
+//
+// Each of the four non-NONE border kinds ships one 24-byte table holding
+// six 4-byte glyph slots in fixed order:
+//
+//   slot 0 (BLOCK_GLYPH_HORIZ)  U+2500 / U+2501 / U+2550         (─ ━ ═)
+//   slot 1 (BLOCK_GLYPH_VERT)   U+2502 / U+2503 / U+2551         (│ ┃ ║)
+//   slot 2 (BLOCK_GLYPH_TL)     U+250C / U+250F / U+256D / U+2554
+//   slot 3 (BLOCK_GLYPH_TR)     U+2510 / U+2513 / U+256E / U+2557
+//   slot 4 (BLOCK_GLYPH_BL)     U+2514 / U+2517 / U+2570 / U+255A
+//   slot 5 (BLOCK_GLYPH_BR)     U+2518 / U+251B / U+256F / U+255D
+//
+// Each codepoint encodes to 3 UTF-8 bytes; the 4th byte per slot is a
+// literal 0x00 pad. A cell's symbol slot is exactly 4 bytes (Cell wire,
+// bytes 0..4), so `mov_d [cell + 0], glyph_word` copies one glyph plus
+// its trailing zero in a single 4-byte store — the zero pad ensures
+// bytes 1..4 of the cell's symbol slot get cleared regardless of any
+// stale content left by an earlier fill_cell whose symbol was multi-byte.
+//
+// The 4-byte-per-glyph shape also means `mov_d rdx, [r15 + N*4]` picks
+// up ONE full glyph without spilling into the next slot even at the last
+// (BR) slot — no per-glyph tail-mask needed.
+//
+// =============================================================================
+// BLOCKVIEW@0.1 WIRE (semantic-pipe record)
+// =============================================================================
+//
+//   [+0..+4)   magic        u32 = 0x564B4C42 ("BLKV" LE)
+//   [+4..+8)   record_len   u32 total bytes including zero-pad
+//   [+8..+12)  border_kind  u32 (u8 spec field widened for 4-byte slot
+//                                alignment; ordinals 0..4 unchanged)
+//   [+12..+20) rect_pack    u64 verbatim from BlockSpec+0 (same wire as
+//                                a Rect: x/y/w/h each u16, low-to-high)
+//   [+20..+24) title_len    u32 (u64 spec field truncated to u32; a
+//                                title exceeding 4G bytes would already
+//                                have failed every upstream sanity check)
+//   [+24..+24+title_len)    UTF-8 title bytes verbatim
+//   [+..+record_len)        zero-pad to 8-byte boundary
+//
+// record_len = ((24 + title_len + 7) >> 3) << 3 -- the same rounding
+// rule ListView@0.1 uses (docs/design.md §2.3 Example), enforced with
+// shift-right/shift-left rather than an `and reg, ~7` that would need
+// an imm64 mask.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Block`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64).
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFF, 0x564B4C42,
+//     shift counts <= 56. The one imm64 (0x00FFFFFF00000020 for the
+//     default fill_cell word0) goes through `mov reg, imm64` (movabs);
+//     no `cmp reg, imm64` anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is
+//     2-op `imul reg, reg` — the 4-byte-per-cell address math folds a
+//     multiply into `shl reg, 4`.
+//   - Labels prefixed `bl_` per docs/design.md fingerprint discipline.
+//   - Effect row `!{mem}` on every function that reads/writes memory
+//     (all of them — Block is pointer-shaped throughout).
+//   - block_draw pushes 5 SysV callee-save regs (rbx, r12, r13, r14,
+//     r15) = 40 bytes; entry rsp%16==8, +40==48, rsp%16==0. Body makes
+//     NO nested calls (every cell address / fill copy / glyph load /
+//     title byte copy is inlined), so alignment is a discipline anchor
+//     rather than a hard requirement, matching the 5-push posture
+//     rect_intersect and color_lerp already established in this repo.
+//   - block_spec_init, block_inner, block_view_pack are pure leafs
+//     (no push/pop, no callee-save writes, no nested calls) — all state
+//     fits in the caller-save half of the register file.
 
 module Block = structure {
 
-  // Border-kind ordinals (docs/design.md §5.1 M1-006 scope:
-  // "borders: plain/rounded/double/thick"). Kept in a fixed closed
-  // set at v1; a later "custom border-glyph tuple" surface would
-  // add a new variant here + a paired constant tuple in the M1-006
-  // body, and every downstream widget composing a Block would pick
-  // up the new option through the existing dispatch.
+  // ==========================================================================
+  // Border-kind ordinals (kept from M1-001 scaffold; downstream code
+  // has already been keying against them, so re-exporting the values
+  // preserves the scaffold's API contract).
+  // ==========================================================================
   pub let BLOCK_BORDER_NONE    : u64 = 0
   pub let BLOCK_BORDER_PLAIN   : u64 = 1
   pub let BLOCK_BORDER_ROUNDED : u64 = 2
   pub let BLOCK_BORDER_DOUBLE  : u64 = 3
   pub let BLOCK_BORDER_THICK   : u64 = 4
 
-  // Padding maximum (per side). The Block struct at M1-006 will
-  // reject a padding request that would leave zero interior cells;
-  // this constant is the hard integer ceiling, not the smaller
-  // "must leave >= 1 interior cell" runtime check.
   pub let BLOCK_PADDING_MAX : u64 = 128
+
+  // ==========================================================================
+  // BlockSpec layout (48 bytes)
+  // ==========================================================================
+  pub let BLOCK_SPEC_BYTES        : u64 = 48
+
+  pub let BLOCK_OFF_RECT          : u64 = 0
+  pub let BLOCK_OFF_BORDER_KIND   : u64 = 8
+  pub let BLOCK_OFF_PAD_TOP       : u64 = 9
+  pub let BLOCK_OFF_PAD_RIGHT     : u64 = 10
+  pub let BLOCK_OFF_PAD_BOTTOM    : u64 = 11
+  pub let BLOCK_OFF_PAD_LEFT      : u64 = 12
+  pub let BLOCK_OFF_TITLE_PTR     : u64 = 16
+  pub let BLOCK_OFF_TITLE_LEN     : u64 = 24
+  pub let BLOCK_OFF_FILL_CELL     : u64 = 32
+
+  // ==========================================================================
+  // Glyph-slot ordinals within one 24-byte border-glyph table (4 bytes
+  // per slot: up to 3 UTF-8 bytes plus one 0x00 pad). Named so the
+  // block_draw body reads `[r15 + BLOCK_GLYPH_HORIZ*4]`-shaped
+  // addresses rather than magic 0/4/8/... literals — a later revision
+  // that swaps table layout (e.g. widens to 5-byte slots for future
+  // ZWJ-clusters) touches these constants once instead of every load
+  // site.
+  // ==========================================================================
+  pub let BLOCK_GLYPH_HORIZ  : u64 = 0
+  pub let BLOCK_GLYPH_VERT   : u64 = 1
+  pub let BLOCK_GLYPH_TL     : u64 = 2
+  pub let BLOCK_GLYPH_TR     : u64 = 3
+  pub let BLOCK_GLYPH_BL     : u64 = 4
+  pub let BLOCK_GLYPH_BR     : u64 = 5
+
+  pub let BLOCK_GLYPH_BYTES  : u64 = 4
+  pub let BLOCK_GLYPH_STRIDE : u64 = 24
+
+  // ==========================================================================
+  // Default fill_cell decomposition (space char, white fg, black bg,
+  // no modifier bits). Exported so a downstream reader can trace the
+  // block_spec_init body's imm64 literal back to a named-constant
+  // origin rather than a magic 0x00FFFFFF00000020.
+  //
+  // The packed word0 sits at bit slots (per Cell wire, §2.1):
+  //   [ 0..32)  sym  = 0x00000020  (' ')
+  //   [32..40)  fg.r = 0xFF
+  //   [40..48)  fg.g = 0xFF
+  //   [48..56)  fg.b = 0xFF
+  //   [56..64)  bg.r = 0x00
+  // combined = 0x00FFFFFF00000020.
+  // word1 = 0 (bg.g|bg.b|mods|reserved all zero).
+  // ==========================================================================
+  pub let BLOCK_FILL_DEFAULT_SYM  : u64 = 32
+  pub let BLOCK_FILL_DEFAULT_FG   : u64 = 16777215
+  pub let BLOCK_FILL_DEFAULT_BG   : u64 = 0
+  pub let BLOCK_FILL_DEFAULT_MODS : u64 = 0
+
+  // ==========================================================================
+  // BlockView@0.1 semantic-pipe wire (docs/design.md §2.3)
+  // ==========================================================================
+  pub let BLKV_MAGIC           : u64 = 1447187522
+  pub let BLKV_HEADER_BYTES    : u64 = 24
+  pub let BLKV_OFF_MAGIC       : u64 = 0
+  pub let BLKV_OFF_RECORD_LEN  : u64 = 4
+  pub let BLKV_OFF_BORDER_KIND : u64 = 8
+  pub let BLKV_OFF_RECT        : u64 = 12
+  pub let BLKV_OFF_TITLE_LEN   : u64 = 20
+  pub let BLKV_OFF_TITLE_TEXT  : u64 = 24
+
+  // Schema name ("BlockView@0.1", NUL-terminated -- the string a M2-009
+  // BLAKE3-based schema-hash constant would be computed against, kept
+  // here as the authoritative source so the M2-009 hash landing has
+  // exactly one string to hash and there is no risk of a byte-for-byte
+  // drift between the packer and the hash computation).
+  pub let BLKV_SCHEMA_NAME : [u8; 14] = "BlockView@0.1\0"
+  pub let BLKV_SCHEMA_NAME_LEN : u64 = 13
+
+  // ==========================================================================
+  // Border-glyph tables (24 bytes each: 6 slots x 4 bytes; every slot
+  // is up to 3 UTF-8 bytes plus one 0x00 pad so a single mov_d loads
+  // the full grapheme + trailing zero, guaranteeing bytes 1..4 of the
+  // destination cell's symbol slot land as zero even when a stale fill
+  // put a multi-byte glyph there).
+  //
+  // Slot order: HORIZ, VERT, TL, TR, BL, BR.
+  //
+  // PLAIN:   ─ (U+2500)  │ (U+2502)  ┌ (U+250C)  ┐ (U+2510)  └ (U+2514)  ┘ (U+2518)
+  // ROUNDED: ─ (U+2500)  │ (U+2502)  ╭ (U+256D)  ╮ (U+256E)  ╰ (U+2570)  ╯ (U+256F)
+  // DOUBLE:  ═ (U+2550)  ║ (U+2551)  ╔ (U+2554)  ╗ (U+2557)  ╚ (U+255A)  ╝ (U+255D)
+  // THICK:   ━ (U+2501)  ┃ (U+2503)  ┏ (U+250F)  ┓ (U+2513)  ┗ (U+2517)  ┛ (U+251B)
+  //
+  // Each byte literal below is exactly one UTF-8 byte; `\x00` supplies
+  // the per-slot pad. String literal length is 24 for every table.
+  // ==========================================================================
+  pub let block_glyph_plain : [u8; 24] = "\xE2\x94\x80\x00\xE2\x94\x82\x00\xE2\x94\x8C\x00\xE2\x94\x90\x00\xE2\x94\x94\x00\xE2\x94\x98\x00"
+  pub let block_glyph_rounded : [u8; 24] = "\xE2\x94\x80\x00\xE2\x94\x82\x00\xE2\x95\xAD\x00\xE2\x95\xAE\x00\xE2\x95\xB0\x00\xE2\x95\xAF\x00"
+  pub let block_glyph_double : [u8; 24] = "\xE2\x95\x90\x00\xE2\x95\x91\x00\xE2\x95\x94\x00\xE2\x95\x97\x00\xE2\x95\x9A\x00\xE2\x95\x9D\x00"
+  pub let block_glyph_thick : [u8; 24] = "\xE2\x94\x81\x00\xE2\x94\x83\x00\xE2\x94\x8F\x00\xE2\x94\x93\x00\xE2\x94\x97\x00\xE2\x94\x9B\x00"
+
+  // ==========================================================================
+  // block_spec_init(dst, rect, kind_and_pad, title_ptr, title_len) -> ()
+  //
+  // Pack a BlockSpec into 48 bytes at [dst..dst+48). Fills every named
+  // field; leaves reserved bytes (dst+13..dst+16) explicitly zeroed.
+  // fill_cell is set to (' ', white fg, black bg, no mods) — the caller
+  // may overwrite via Cell::cell_write(dst + BLOCK_OFF_FILL_CELL, ...)
+  // after init if a non-default fill is needed.
+  //
+  // Argument packing:
+  //   kind_and_pad bits:
+  //     [ 0.. 8)  border_kind   (BLOCK_BORDER_* ordinal)
+  //     [ 8..16)  pad_top
+  //     [16..24)  pad_right
+  //     [24..32)  pad_bottom
+  //     [32..40)  pad_left
+  //     [40..64)  reserved (should be zero; not enforced -- the byte
+  //                          stores only read the low 40 bits so a
+  //                          caller with junk in bits [40..64) does not
+  //                          bleed into the wire).
+  //
+  // Register plan: rdi=dst, rsi=rect, rdx=kind_and_pad, rcx=title_ptr,
+  // r8=title_len, rax=extract scratch. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call. Effect `!{mem}` (multiple
+  // stores through rdi).
+  // ==========================================================================
+  pub let block_spec_init : (u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (rect: u64) (kind_and_pad: u64) (title_ptr: u64) (title_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-006 (#6): block_spec_init writes 48 bytes of BlockSpec into [rdi..rdi+48). Phase 1 stores the packed Rect word verbatim at [rdi+0]. Phase 2 extracts 5 padding/border bytes from rdx via `mov rax, rdx; shr rax, N; and rax, 0xFF; mov_b [rdi+off], rax` -- shift counts 0/8/16/24/32 all fit imm8, mask 0xFF fits imm32. Phase 3 stores three explicit zero bytes at reserved slots [rdi+13..rdi+16) so a caller's re-init over dirty memory does not leave stale bytes in the reserved span. Phase 4 stores title_ptr (rcx) and title_len (r8) at their 8-byte-aligned slots. Phase 5 lays a default fill_cell: `mov rax, 0x00FFFFFF00000020` (10-byte movabs -- imm > 0x7FFFFFFF so paideia-as emits the imm64 form, legal for mov even though NOT legal for cmp/and); `mov [rdi+32], rax` stamps word0 = (' ' | white_fg<<32 | 0 bg.r<<56); `xor rax, rax; mov [rdi+40], rax` zeros word1 (bg.g/bg.b/mods/reserved all default zero). Every extract chain uses `mov rax, rdx` -> `shr` -> `and` -> `mov_b` (byte store; unaffected by paideia-as #1248 which is load-side only). No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (9 byte-stores + 3 qword-stores + 1 dword-alignment store).",
+      block: {
+        // ---- [rdi + 0] = rect ----------------------------------------------
+        mov [rdi + 0], rsi;
+
+        // ---- [rdi + 8] = border_kind ---------------------------------------
+        mov rax, rdx;
+        and rax, 0xFF;
+        mov_b [rdi + 8], rax;
+
+        // ---- [rdi + 9] = pad_top -------------------------------------------
+        mov rax, rdx;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov_b [rdi + 9], rax;
+
+        // ---- [rdi + 10] = pad_right ----------------------------------------
+        mov rax, rdx;
+        shr rax, 16;
+        and rax, 0xFF;
+        mov_b [rdi + 10], rax;
+
+        // ---- [rdi + 11] = pad_bottom ---------------------------------------
+        mov rax, rdx;
+        shr rax, 24;
+        and rax, 0xFF;
+        mov_b [rdi + 11], rax;
+
+        // ---- [rdi + 12] = pad_left -----------------------------------------
+        mov rax, rdx;
+        shr rax, 32;
+        and rax, 0xFF;
+        mov_b [rdi + 12], rax;
+
+        // ---- [rdi + 13..16) reserved zero ----------------------------------
+        xor rax, rax;
+        mov_b [rdi + 13], rax;
+        mov_b [rdi + 14], rax;
+        mov_b [rdi + 15], rax;
+
+        // ---- [rdi + 16] = title_ptr ---------------------------------------
+        mov [rdi + 16], rcx;
+
+        // ---- [rdi + 24] = title_len ---------------------------------------
+        mov [rdi + 24], r8;
+
+        // ---- [rdi + 32..48) = default fill cell ---------------------------
+        mov rax, 0x00FFFFFF00000020;
+        mov [rdi + 32], rax;
+        xor rax, rax;
+        mov [rdi + 40], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // block_inner(spec_ptr) -> u64 (packed Rect)
+  //
+  // Return the content-area Rect: the block area shrunk by 1 cell per
+  // side for the border (if border_kind is a valid non-NONE ordinal in
+  // [1..4]) and then shrunk further by the four padding sides. If any
+  // shrink would produce a negative width or height, the return is the
+  // zero-Rect (0, 0, 0, 0) — a widget composing a Block that gets a
+  // zero-sized inner Rect is expected to draw nothing rather than
+  // reject the frame.
+  //
+  // Distinguishability: a legitimate (0, 0, 0, 0) inner Rect (e.g. a
+  // 2x2 block with border and no room for content) and an underflow-
+  // triggered zero return are indistinguishable at the wire; callers
+  // that need "did it fit?" should test `rect_w != 0 || rect_h != 0`
+  // rather than comparing to the packed zero-word.
+  //
+  // Register plan: rdi=spec_ptr (read-only; freed once every byte and
+  // qword is loaded), rax=border scratch (0 or 1), rcx=pad_top,
+  // rdx=pad_right, rsi=pad_bottom, r9=pad_left, r8=packed rect then
+  // bh, r10=inner_x, r11=inner_y, rdi=inner_w (after spec_ptr free).
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (6 byte-loads + 1 qword-load).
+  // Labels prefixed bl_in_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let block_inner : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-006 (#6): block_inner returns the packed inner-content Rect. Load-order matters: read every byte off spec_ptr BEFORE clobbering rdi so the function stays a pure leaf. Load packed rect into r8; load border_kind byte into rcx (xor-then-mov_b idiom); classify as border = 1 if rcx in [1..4] else 0, storing into rax via cmp/cmp/jump/mov 1 chain. Then load pad_top/right/bottom/left into rcx/rdx/rsi/r9 respectively (each xor-then-mov_b) -- after this, rdi (spec_ptr) is not needed. Extract bx from r8 into r11 (mov+and 0xFFFF), by into rdi (mov+shr+and), bw into scratch (mov+shr+and), bh into r8 (in-place shr 48). Compose inner_x = r11 + rax + r9, inner_y = rdi + rax + rcx. Compute inner_w = bw - 2*rax - r9 - rdx via chained subs; underflow test `cmp rcx, 0xFFFF; ja bl_in_zero` catches u16-range wraparound (bw was masked to 0xFFFF so a legitimate result must also fit 0xFFFF; a subtract-past-zero wraps to a 64-bit value > 0xFFFF and is caught). Same shape for inner_h. On success, pack into rax via the same mask/shl 16/32/48 + OR chain rect_new uses. On underflow, `xor rax, rax; ret` returns the zero-Rect. Every immediate (0xFFFF, 0xFF, 1, 4, shift counts 16/32/48) fits imm32. No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (6 byte-loads + 1 qword-load from [rdi]). Labels prefixed bl_in_ per docs fingerprint discipline.",
+      block: {
+        // Load packed rect
+        mov r8, [rdi + 0];
+
+        // Load border_kind and classify
+        xor rcx, rcx;
+        mov_b rcx, [rdi + 8];
+        xor rax, rax;
+        cmp rcx, 0;
+        je bl_in_bd_done;
+        cmp rcx, 4;
+        ja bl_in_bd_done;
+        mov rax, 1;
+      bl_in_bd_done:
+        // rax = border (0 or 1)
+
+        // Load padding bytes (rdi still live for one more use)
+        xor rcx, rcx;
+        mov_b rcx, [rdi + 9];
+        xor rdx, rdx;
+        mov_b rdx, [rdi + 10];
+        xor rsi, rsi;
+        mov_b rsi, [rdi + 11];
+        xor r9, r9;
+        mov_b r9, [rdi + 12];
+        // rdi is now free to repurpose
+
+        // Extract bx (r11), by (rdi), bw (r10), bh (r8)
+        mov r11, r8;
+        and r11, 0xFFFF;
+
+        mov rdi, r8;
+        shr rdi, 16;
+        and rdi, 0xFFFF;
+
+        mov r10, r8;
+        shr r10, 32;
+        and r10, 0xFFFF;
+
+        shr r8, 48;
+
+        // inner_x = bx + border + pad_left
+        add r11, rax;
+        add r11, r9;
+
+        // inner_y = by + border + pad_top
+        add rdi, rax;
+        add rdi, rcx;
+
+        // inner_w = bw - 2*border - pad_left - pad_right
+        sub r10, rax;
+        sub r10, rax;
+        sub r10, r9;
+        sub r10, rdx;
+        cmp r10, 0xFFFF;
+        ja bl_in_zero;
+
+        // inner_h = bh - 2*border - pad_top - pad_bottom
+        sub r8, rax;
+        sub r8, rax;
+        sub r8, rcx;
+        sub r8, rsi;
+        cmp r8, 0xFFFF;
+        ja bl_in_zero;
+
+        // Pack (inner_x, inner_y, inner_w, inner_h) into rax
+        and r11, 0xFFFF;
+        and rdi, 0xFFFF;
+        and r10, 0xFFFF;
+        and r8, 0xFFFF;
+
+        shl rdi, 16;
+        shl r10, 32;
+        shl r8, 48;
+
+        mov rax, r11;
+        or  rax, rdi;
+        or  rax, r10;
+        or  rax, r8;
+        ret;
+
+      bl_in_zero:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // block_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature -- postui.M1-007's WidgetKind
+  // dispatch keys against exactly this shape when routing WK_BLOCK to
+  // this function. `rows` is not read by this body (the back region
+  // starts at buf_ptr+0 so no rows-based offset is needed), kept for
+  // signature uniformity with every other widget_draw variant.
+  //
+  // Draw sequence:
+  //   1. Fill the entire block area (rect.x .. rect.x+rect.w) x
+  //      (rect.y .. rect.y+rect.h) with fill_cell (16 bytes / cell).
+  //      This is the "background" pass every widget layer above will
+  //      overwrite. Skipped iff rect.w == 0 or rect.h == 0.
+  //   2. If border_kind is a valid non-NONE ordinal AND rect.w >= 2
+  //      AND rect.h >= 2: overlay border glyphs on the outer ring --
+  //      horiz on the top and bottom rows (columns bx+1 .. xe-1),
+  //      vert on the left and right columns (rows by+1 .. ye-1),
+  //      corners at the four corner cells. Only the 4-byte symbol
+  //      slot of each border cell is overwritten; the fill_cell's
+  //      fg/bg/mods bytes are preserved so a caller styling the fill
+  //      also styles the border.
+  //   3. If title_len > 0: overlay title bytes on the top row starting
+  //      at bx+1 if a border is present, else bx. At most min(title_len,
+  //      effective_title_width) cells are written; each title byte
+  //      lands in the low byte of the target cell's symbol slot with
+  //      the other 3 bytes cleared (via `mov_d [cell + 0], byte_reg`).
+  //
+  // Title glyph fidelity: at M1, each title BYTE occupies one cell.
+  // Multi-byte UTF-8 sequences render as separate garbled cells. Full
+  // grapheme handling lands with the Width module at postui.M2-003
+  // (docs/design.md §1.5); the M1 shape is ASCII-clean and matches
+  // Ratatui's own default when no width-table is bound. Callers with
+  // titles beyond ASCII should defer to M2-003 rather than pre-encode.
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect (Frame::draw at M1-005, WidgetKind dispatch at M1-007)
+  // is expected to have already clamped against the canvas's stamped
+  // rows/cols; adding a gate here would double-charge every cell write
+  // for no marginal safety (same posture Buffer::buffer_at takes in
+  // its own docs).
+  //
+  // Return: always 0 (OK) at v1. A future revision may return a
+  // POSTUI_ERR_BAND_BASE-anchored error for e.g. an unknown border_kind
+  // or a rect that overflows the canvas; the u64 return is reserved
+  // now so that later widening does not change the widget_draw ABI.
+  //
+  // Register plan (5 SysV callee-save pushes = 40 bytes; entry
+  // rsp%16==8, +40==48, rsp%16==0; body makes NO nested calls, so
+  // alignment is a discipline anchor rather than a hard requirement
+  // -- matches the 5-push posture rect_intersect/color_lerp already
+  // established):
+  //   rbx = buf_ptr        r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect    r15 = glyph_table_ptr (0 if no border)
+  //
+  // Caller-save allocation shifts per phase:
+  //   Phase 1 (fill): r8=bx, r9=by (start), r10=bw scratch, r11=bh
+  //                   scratch, rsi=xe, rdi=ye, rdx=y counter, rcx=x
+  //                   counter, rax=dst + fill_cell transit.
+  //   Phase 2 (border): re-extract from r14 into r8/r9/r10/r11;
+  //                     rsi=xe_m1, rdi=ye_m1, rcx=x-or-y counter,
+  //                     rdx=glyph transit, rax=dst.
+  //   Phase 3 (title): r9=bx, r10=by, r11=bw, r8=title_len (from
+  //                    spec+24), rsi=title_x_offset (0 or 1), rdx=
+  //                    title_start_x, rdi=title_max_width, rcx=i,
+  //                    rax=dst.
+  //
+  // Labels prefixed bl_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let block_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-006 (#6): block_draw is the widget_draw entry for WK_BLOCK. Push rbx/r12/r13/r14/r15 (5 pushes, 40 bytes, rsp aligned per SysV -- matches rect_intersect/color_lerp discipline, and lets a future revision that adds a nested call keep the alignment invariant); stash buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (loaded once from [r13+0]). Decode border_kind byte at [r13+8]: cmp/je chain routes ordinals 1..4 to LEA their respective glyph tables into r15 (block_glyph_plain / _rounded / _double / _thick); ordinal 0 (or any unknown value) falls through to xor r15, r15 which the phase-2 gate reads as no-border. Phase 1 (fill): extract bx (r8), by (r9), bw (r10), bh (r11) from r14; skip if bw==0 or bh==0; precompute xe=bx+bw into rsi, ye=by+bh into rdi. Outer y loop rdx from by to ye-1, inner x loop rcx from bx to xe-1; each iteration computes dst = buf_ptr + (y*cols + x)*16 into rax via mov+imul (2-op reg,reg, paideia-as-safe)+add+shl 4+add, then two 8-byte load/store pairs copy [r13+32] and [r13+40] into [rax+0] and [rax+8]. r11 (was bh) is clobbered by the fill_cell word load — safe because ye already sits in rdi. Phase 2 (border): gate on r15!=0, then re-extract bx/by/bw/bh (r8/r9/r10/r11) from r14 (cheap); skip if bw<2 or bh<2 (jb bl_after_border). Precompute xe_m1=bx+bw-1 into rsi and ye_m1=by+bh-1 into rdi. Four one-dimensional loops draw top/bottom/left/right edges: each cell write is dst-compute + glyph load (xor rdx, rdx; mov_d rdx, [r15+slot*4]) + mov_d [rax+0], rdx (overwrites cells's 4-byte symbol slot only, preserving fg/bg/mods bytes 4..15 that fill already stamped). Four scalar writes cap the corners at (bx,by), (xe_m1,by), (bx,ye_m1), (xe_m1,ye_m1) with glyph slots 2/3/4/5. Phase 3 (title): load title_len from [r13+24] into r8; skip if 0. Re-extract bx (r9), by (r10), bw (r11) from r14. Title_x_offset (rsi) = 1 if r15!=0 else 0; title_start_x (rdx) = bx + rsi; title_max_width (rdi) = bw - 2*rsi with underflow test `cmp rdi, 0xFFFF; ja bl_after_title`. Clamp title_len (r8) to title_max_width via cmp/jbe/mov. Load title_ptr into r11 (overwrites bw, now free), defensive `cmp r11, 0; je` skips a null title. Loop rcx from 0 to title_len-1: dst = buf_ptr + (by*cols + title_start_x + rcx)*16 into rax; xor r9, r9; mov_b r9, [r11 + rcx + 0] loads one ASCII byte; mov_d [rax+0], r9 writes low byte into cell symbol slot with the other three bytes cleared. Epilogue: xor rax, rax (return 0=OK); pop r15/r14/r13/r12/rbx (reverse order); ret. Every immediate (0xFFFF, 0xFF, 0, 1, 2, 4, shift counts 4/16/32/48) fits imm32; 2-op imul is only ever `imul reg, reg`; every mov_b load is preceded by xor of the destination; no `test` mnemonic anywhere. Every effect touches memory (fill, border, title cells), so `!{mem}` applies to the whole body. Labels prefixed bl_ per docs fingerprint discipline (bl_gt_ for glyph-table decode, bl_fill_/bl_after_fill for phase 1, bl_bt_/bl_bb_/bl_bl_/bl_br_/bl_after_border for phase 2 edge/corner loops, bl_title_/bl_after_title for phase 3, bl_ret for epilogue).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Prologue: cache invariants in callee-save --------------------
+        mov rbx, rsi;                         // rbx = buf_ptr
+        mov r12, rcx;                         // r12 = cols
+        mov r13, rdi;                         // r13 = spec_ptr
+        mov r14, [r13 + 0];                   // r14 = packed rect
+
+        // ---- Decode border_kind -> glyph_table_ptr (r15) ------------------
+        xor rax, rax;
+        mov_b rax, [r13 + 8];
+
+        cmp rax, 1;
+        je bl_gt_plain;
+        cmp rax, 2;
+        je bl_gt_rounded;
+        cmp rax, 3;
+        je bl_gt_double;
+        cmp rax, 4;
+        je bl_gt_thick;
+        // NONE or unknown -> no border
+        xor r15, r15;
+        jmp bl_gt_done;
+      bl_gt_plain:
+        lea r15, [rip + block_glyph_plain];
+        jmp bl_gt_done;
+      bl_gt_rounded:
+        lea r15, [rip + block_glyph_rounded];
+        jmp bl_gt_done;
+      bl_gt_double:
+        lea r15, [rip + block_glyph_double];
+        jmp bl_gt_done;
+      bl_gt_thick:
+        lea r15, [rip + block_glyph_thick];
+      bl_gt_done:
+
+        // =====================================================================
+        // Phase 1: fill entire block area with fill_cell
+        // =====================================================================
+
+        // Extract bx (r8), by (r9), bw (r10), bh (r11)
+        mov r8, r14;
+        and r8, 0xFFFF;
+
+        mov r9, r14;
+        shr r9, 16;
+        and r9, 0xFFFF;
+
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFFFF;
+
+        mov r11, r14;
+        shr r11, 48;
+
+        // Skip if bw == 0 or bh == 0
+        cmp r10, 0;
+        je bl_after_fill;
+        cmp r11, 0;
+        je bl_after_fill;
+
+        // xe = bx + bw -> rsi
+        mov rsi, r8;
+        add rsi, r10;
+        // ye = by + bh -> rdi
+        mov rdi, r9;
+        add rdi, r11;
+
+        // y counter: rdx = by
+        mov rdx, r9;
+
+      bl_fill_yloop:
+        cmp rdx, rdi;
+        jae bl_after_fill;
+
+        // x counter: rcx = bx
+        mov rcx, r8;
+
+      bl_fill_xloop:
+        cmp rcx, rsi;
+        jae bl_fill_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Copy 16-byte fill_cell from [r13 + 32] to [rax]
+        mov r11, [r13 + 32];
+        mov [rax + 0], r11;
+        mov r11, [r13 + 40];
+        mov [rax + 8], r11;
+
+        add rcx, 1;
+        jmp bl_fill_xloop;
+
+      bl_fill_ynext:
+        add rdx, 1;
+        jmp bl_fill_yloop;
+
+      bl_after_fill:
+
+        // =====================================================================
+        // Phase 2: overlay border ring (only if r15 != 0 and bw>=2 and bh>=2)
+        // =====================================================================
+
+        cmp r15, 0;
+        je bl_after_border;
+
+        // Re-extract bx (r8), by (r9), bw (r10), bh (r11) from r14
+        mov r8, r14;
+        and r8, 0xFFFF;
+
+        mov r9, r14;
+        shr r9, 16;
+        and r9, 0xFFFF;
+
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFFFF;
+
+        mov r11, r14;
+        shr r11, 48;
+
+        cmp r10, 2;
+        jb bl_after_border;
+        cmp r11, 2;
+        jb bl_after_border;
+
+        // xe_m1 = bx + bw - 1 -> rsi
+        mov rsi, r8;
+        add rsi, r10;
+        sub rsi, 1;
+        // ye_m1 = by + bh - 1 -> rdi
+        mov rdi, r9;
+        add rdi, r11;
+        sub rdi, 1;
+
+        // ---- Top edge: for x in [bx+1, xe_m1), y = by, glyph HORIZ (slot 0)
+        mov rcx, r8;
+        add rcx, 1;
+      bl_bt_loop:
+        cmp rcx, rsi;
+        jae bl_bt_done;
+
+        mov rax, r9;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 0];
+        mov_d [rax + 0], rdx;
+
+        add rcx, 1;
+        jmp bl_bt_loop;
+      bl_bt_done:
+
+        // ---- Bottom edge: for x in [bx+1, xe_m1), y = ye_m1, glyph HORIZ
+        mov rcx, r8;
+        add rcx, 1;
+      bl_bb_loop:
+        cmp rcx, rsi;
+        jae bl_bb_done;
+
+        mov rax, rdi;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 0];
+        mov_d [rax + 0], rdx;
+
+        add rcx, 1;
+        jmp bl_bb_loop;
+      bl_bb_done:
+
+        // ---- Left edge: for y in [by+1, ye_m1), x = bx, glyph VERT (slot 1, byte offset 4)
+        mov rcx, r9;
+        add rcx, 1;
+      bl_bl_loop:
+        cmp rcx, rdi;
+        jae bl_bl_done;
+
+        mov rax, rcx;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 4];
+        mov_d [rax + 0], rdx;
+
+        add rcx, 1;
+        jmp bl_bl_loop;
+      bl_bl_done:
+
+        // ---- Right edge: for y in [by+1, ye_m1), x = xe_m1, glyph VERT
+        mov rcx, r9;
+        add rcx, 1;
+      bl_br_loop:
+        cmp rcx, rdi;
+        jae bl_br_done;
+
+        mov rax, rcx;
+        imul rax, r12;
+        add rax, rsi;
+        shl rax, 4;
+        add rax, rbx;
+
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 4];
+        mov_d [rax + 0], rdx;
+
+        add rcx, 1;
+        jmp bl_br_loop;
+      bl_br_done:
+
+        // ---- Corner TL at (bx, by), glyph slot 2 (byte offset 8)
+        mov rax, r9;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 8];
+        mov_d [rax + 0], rdx;
+
+        // ---- Corner TR at (xe_m1, by), glyph slot 3 (byte offset 12)
+        mov rax, r9;
+        imul rax, r12;
+        add rax, rsi;
+        shl rax, 4;
+        add rax, rbx;
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 12];
+        mov_d [rax + 0], rdx;
+
+        // ---- Corner BL at (bx, ye_m1), glyph slot 4 (byte offset 16)
+        mov rax, rdi;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 16];
+        mov_d [rax + 0], rdx;
+
+        // ---- Corner BR at (xe_m1, ye_m1), glyph slot 5 (byte offset 20)
+        mov rax, rdi;
+        imul rax, r12;
+        add rax, rsi;
+        shl rax, 4;
+        add rax, rbx;
+        xor rdx, rdx;
+        mov_d rdx, [r15 + 20];
+        mov_d [rax + 0], rdx;
+
+      bl_after_border:
+
+        // =====================================================================
+        // Phase 3: overlay title on top row
+        // =====================================================================
+
+        mov r8, [r13 + 24];                   // title_len
+        cmp r8, 0;
+        je bl_after_title;
+
+        // Re-extract bx (r9), by (r10), bw (r11) from r14
+        mov r9, r14;
+        and r9, 0xFFFF;
+
+        mov r10, r14;
+        shr r10, 16;
+        and r10, 0xFFFF;
+
+        mov r11, r14;
+        shr r11, 32;
+        and r11, 0xFFFF;
+
+        // title_x_offset: 1 if border present, else 0
+        xor rsi, rsi;
+        cmp r15, 0;
+        je bl_title_no_off;
+        mov rsi, 1;
+      bl_title_no_off:
+
+        // title_start_x = bx + rsi -> rdx
+        mov rdx, r9;
+        add rdx, rsi;
+
+        // title_max_width = bw - 2*rsi -> rdi
+        mov rdi, r11;
+        sub rdi, rsi;
+        sub rdi, rsi;
+
+        // Underflow guard: if title_max_width wraps past 0xFFFF, skip
+        cmp rdi, 0xFFFF;
+        ja bl_after_title;
+        cmp rdi, 0;
+        je bl_after_title;
+
+        // Clamp title_len (r8) to title_max_width (rdi)
+        cmp r8, rdi;
+        jbe bl_title_len_ok;
+        mov r8, rdi;
+      bl_title_len_ok:
+
+        // Load title_ptr into r11 (bw no longer needed)
+        mov r11, [r13 + 16];
+
+        // Defensive: title_ptr == 0 -> skip
+        cmp r11, 0;
+        je bl_after_title;
+
+        // Loop i in [0, r8): write title[i] at (title_start_x + i, by)
+        xor rcx, rcx;
+      bl_title_loop:
+        cmp rcx, r8;
+        jae bl_after_title;
+
+        // dst = buf_ptr + (by*cols + title_start_x + i)*16
+        mov rax, r10;
+        imul rax, r12;
+        add rax, rdx;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Load ASCII byte
+        xor r9, r9;
+        mov_b r9, [r11 + rcx + 0];
+
+        // Write 4-byte symbol slot (low byte = ASCII char, upper 3 = 0)
+        mov_d [rax + 0], r9;
+
+        add rcx, 1;
+        jmp bl_title_loop;
+
+      bl_after_title:
+
+        // ---- Epilogue -----------------------------------------------------
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // block_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a BlockView@0.1 semantic-pipe record into [dst..dst+record_len).
+  // record_len = ((24 + title_len + 7) >> 3) << 3 -- header + title
+  // bytes rounded up to an 8-byte boundary, matching ListView@0.1's
+  // frame shape (docs/design.md §2.3 example).
+  //
+  // The actual `semantic_pipe::send_record` call is deferred to
+  // postui.M2-009 (see module header). This packer is the wire-format
+  // authority so M2-009's registry glue only has to know:
+  //   - the schema name string BLKV_SCHEMA_NAME (for BLAKE3 hashing)
+  //   - block_view_pack (for the byte payload)
+  // and does not have to re-derive the offset table.
+  //
+  // The caller is responsible for ensuring [dst..dst+record_len) is
+  // writable and appropriately sized. Callers can compute the required
+  // size ahead of the call as (24 + title_len + 7) & ~7 or size a
+  // conservative upper bound (e.g. 24 + BLOCK_TITLE_MAX + 7).
+  //
+  // Register plan: rdi=spec_ptr (read-only), rsi=dst (write-only until
+  // return), rax=scratch/return, rcx=record_len, rdx=title_len then
+  // pad walker, r8=title_ptr, r9=byte-copy index. Pure leaf: no callee-
+  // save touched, no push/pop, no nested call. Effect `!{mem}` (reads
+  // through rdi, writes through rsi).
+  // Labels prefixed bl_bv_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let block_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-006 (#6): block_view_pack lays a BlockView@0.1 record at [rsi..rsi+record_len). Header phase writes the four scalar fields in one straight-line sequence: `mov rax, 0x564B4C42` then mov_d [rsi+0], rax stamps the 'BLKV' magic (0x564B4C42 = 1_447_187_522 fits imm32 so paideia-as emits the compact 5-byte mov r32, imm32 form, not the 10-byte movabs). Border_kind widens u8 -> u32 via xor+mov_b+mov_d. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+12] in one qword store -- BlockSpec's rect and BlockView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, so no per-field marshalling. Title_len (rdx) is loaded from [rdi+24] and its low 32 bits stored at [rsi+20] (a title longer than 4G would already have failed upstream). record_len = ((rdx + 24 + 7) >> 3) << 3 uses shr/shl 3 rather than `and reg, ~7` because ~7 = 0xFFFFFFFFFFFFFFF8 does not fit imm32. Title copy: if rdx > 0 AND title_ptr (r8, from [rdi+16]) is non-null, byte loop `xor rax, rax; mov_b rax, [r8+r9]; mov_b [rsi+r9+24], rax` walks r9 from 0..rdx. Pad loop: convert rdx to absolute pad start (add rdx, 24), then byte-store zeros until rdx >= rcx. Two guards -- title_len==0 and title_ptr==0 -- both jump straight to pad so the record header is always valid even for a hand-crafted spec with a null title. Every immediate (24, 7, 3, 4, 8, 12, 20, 0xFF, 0) fits imm32. No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- reads through rdi, writes through rsi. Labels prefixed bl_bv_ per docs fingerprint discipline.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 1447187522;
+        mov_d [rsi + 0], rax;
+
+        // ---- border_kind (u32) at [rsi + 8] --------------------------------
+        xor rax, rax;
+        mov_b rax, [rdi + 8];
+        mov_d [rsi + 8], rax;
+
+        // ---- packed rect (8 bytes) at [rsi + 12] ---------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 12], rax;
+
+        // ---- title_len (u32 on wire) at [rsi + 20] -------------------------
+        mov rdx, [rdi + 24];
+        mov_d [rsi + 20], rdx;
+
+        // ---- record_len = ((24 + title_len + 7) >> 3) << 3 -----------------
+        mov rcx, rdx;
+        add rcx, 24;
+        add rcx, 7;
+        shr rcx, 3;
+        shl rcx, 3;
+        mov_d [rsi + 4], rcx;
+
+        // ---- Title-byte copy (skip if empty or null) -----------------------
+        cmp rdx, 0;
+        je bl_bv_pad;
+
+        mov r8, [rdi + 16];
+        cmp r8, 0;
+        je bl_bv_pad;
+
+        xor r9, r9;
+      bl_bv_copy_loop:
+        cmp r9, rdx;
+        jae bl_bv_pad;
+        xor rax, rax;
+        mov_b rax, [r8 + r9 + 0];
+        mov_b [rsi + r9 + 24], rax;
+        add r9, 1;
+        jmp bl_bv_copy_loop;
+
+      bl_bv_pad:
+        // Pad zero bytes from (24 + title_len) to record_len.
+        add rdx, 24;
+      bl_bv_pad_loop:
+        cmp rdx, rcx;
+        jae bl_bv_done;
+        xor rax, rax;
+        mov_b [rsi + rdx + 0], rax;
+        add rdx, 1;
+        jmp bl_bv_pad_loop;
+
+      bl_bv_done:
+        mov rax, rcx;
+        ret;
+      }
+    }
 
 }
