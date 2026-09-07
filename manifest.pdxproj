@@ -81,11 +81,19 @@ deps:
 # test source landing is picked up without any build.sh change.
 #
 # Fail-code family bands per design/architecture.md §7:
-#   test_boot_smoke              0xFFFFEDA0..0xFFFFEDAF   (M1-008)
-#   test_boot_list_table_smoke   0xFFFFEDB0..0xFFFFEDBF   (M2-010)
+#   test_boot_smoke                    0xFFFFEDA0..0xFFFFEDAF   (M1-008)
+#   test_boot_list_table_smoke         0xFFFFEDB0..0xFFFFEDBF   (M2-010)
+#   test_boot_chart_canvas_smoke       0xFFFFEDC0..0xFFFFEDCF   (M3-007)
+#   test_boot_widget_catalog_smoke     0xFFFFEDD0..0xFFFFEDDF   (M4-008)
+#   test_semantic_version_conformance  0xFFFFEDE0..0xFFFFEDEF   (M5-001)
+#   test_widget_catalog_matrix         0xFFFFEDF0..0xFFFFEDFF   (M5-005)
 tests:
-  - tests/boot_block_smoke.pdx        # M1-008: render one Block, verify cell bytes
-  - tests/boot_list_table_smoke.pdx   # M2-010: List+Table render + semantic-pipe round-trip
+  - tests/boot_block_smoke.pdx              # M1-008: render one Block, verify cell bytes
+  - tests/boot_list_table_smoke.pdx         # M2-010: List+Table render + semantic-pipe round-trip
+  - tests/boot_chart_canvas_smoke.pdx       # M3-007: Chart+Canvas deterministic render witness
+  - tests/boot_widget_catalog_smoke.pdx     # M4-008: 15-widget render regression corpus
+  - tests/semantic_version_conformance.pdx  # M5-001: 4-rule schema-version-tolerance matrix
+  - tests/widget_catalog_matrix.pdx         # M5-005: 30-variant full widget-catalog smoke matrix
 
 # --- Documentation targets ---------------------------------------------
 # The authoritative postui spec lives at docs/design.md and is not a
@@ -94,7 +102,7 @@ tests:
 # analogous to shell's own. `.pdxdoc` surfaces land at M5 packaging
 # time alongside the release manifest.
 docs:
-  # (populated starting M1-009; see docs/design.md §5.1)
+  - doc/postui.pdxdoc                       # M5-004: .pdxdoc source for the doc viewer
 
 # --- Paideia-as compliance flags ---------------------------------------
 # Same invariant set the shell / libpdx-* satellites observe. A build
@@ -108,10 +116,27 @@ compliance:
   - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
 
-# --- Release policy (deferred to M5) -----------------------------------
-# postui M5 (docs/design.md §5.1 M5) lands the release manifest
-# (dual-sign per paideia-os release-manifest.md), semantic-pipe
-# version matrix, and the pkgs.paideia-os hand-off. This section is
-# reserved so M5 only fills fields rather than adding structure.
+# --- Release policy (M5-003) -------------------------------------------
+# postui M5-003 (docs/design.md §5.1 M5) populates the release manifest
+# entries below. Every field mirrors shell.M5-001's release-manifest
+# shape (tools/user/shell/design/release-manifest.md §§2-3) and is
+# further described in this repo's design/release-manifest.md. The
+# `pkg install postui` decoder reads these fields verbatim; a drift
+# here is a drift the pkg-side codec observes at install time and the
+# release lint refuses fast.
+#
+# Dual-sign policy: ML-DSA-65 is the primary post-quantum signer;
+# Ed25519 rides as a secondary classical signer so clients that pre-
+# date the paideia-as v0.33-crypto-kdf toolchain (or that consume the
+# tarball out-of-band via a partner mirror) still have a verification
+# path. `pkg install postui` requires BOTH signatures to verify; a
+# non-Paideia mirror that accepts only classical crypto still gets a
+# valid Ed25519 signature to pin. See design/release-manifest.md §3.
 release:
-  # signer_author, signer_root, mldsa_level, mirror_target — TBD at M5
+  signer_author: snunez+postui-author@paideia-os.dev
+  signer_root:   paideia-os-release-root@paideia-os.dev
+  mldsa_level:   65
+  ed25519:       required
+  mirror_target: pkgs.paideia-os
+  tarball:       postui-v1.0.0.tar.gz
+  manifest_kind: satellite-library

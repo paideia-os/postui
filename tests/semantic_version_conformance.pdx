@@ -1,0 +1,1038 @@
+// tests/semantic_version_conformance.pdx -- postui.M5-001 (paideia-os/postui#35)
+//
+// SemanticVersionConformance: witness that every widget's @0.1 semantic-
+// pipe view record conforms to libpdx-semantic-pipe's 4-rule version-
+// tolerance matrix.
+//
+// =============================================================================
+// SCOPE (docs/design.md sec.2.3, design/architecture.md sec.7)
+// =============================================================================
+//
+// The postui @0.1 schema family ships 15 widget-view records (one per
+// widget in the catalog: BLKV, PGVW, LSVW, TBVW, TABV, SBVW, GGVW, SPVW,
+// BCVW, CHVW, CVVW, TIVW, TRVW, CLVW, CRVW). libpdx-semantic-pipe imposes
+// a 4-rule version-tolerance matrix that every stream-shipped record type
+// must obey:
+//
+//   1. Magic uniqueness       -- every schema magic is a distinct u32
+//                                (cross-checked in a nested loop).
+//   2. Fixed record_len >= 24 -- first 4 bytes magic, next 4 record_len,
+//                                plus at least one rect qword.
+//   3. Future-tolerant read   -- a reader receiving an unknown magic
+//                                skips/drops gracefully (satisfied at
+//                                consumer side by rule 4's field-shape
+//                                monotonicity: given (magic, record_len)
+//                                at fixed offsets, a subscriber can hop
+//                                past any unknown record by record_len).
+//   4. Field-shape monotonicity -- magic + record_len come first, and
+//                                the record itself is 8B-aligned (the
+//                                subscriber's byte-hop by record_len
+//                                preserves alignment iff record_len is a
+//                                multiple of 8).
+//
+// This test lands 15 per-widget conformance drills plus one cross-widget
+// magic-uniqueness sweep. Each drill:
+//
+//   * Sets up a minimal spec for the widget (the smallest that lets its
+//     view_pack succeed -- most widgets need only rect + a couple of
+//     scalar fields; table and text_input also need a small aux slab).
+//   * Calls the widget's `*_view_pack(spec_ptr, dst_ptr)` into a shared
+//     128-byte scratch buffer.
+//   * Reads the first 8 bytes: magic (u32 at +0), record_len (u32 at +4).
+//   * Verifies magic == expected schema constant (rule 1's per-widget
+//     leg; the cross-widget leg comes at the end).
+//   * Verifies record_len >= 24 (rule 2).
+//   * Verifies record_len is 8B-aligned (rule 4's implication).
+//   * Records the observed magic in a 15-slot table for the cross-check.
+//
+// After all 15 drills pass, a nested loop compares every pair of observed
+// magics (C(15,2) = 105 comparisons); a hit fires the collision sentinel.
+//
+// A dedicated postui-smoke consumer (M5-scope) can invoke
+// semantic_version_conformance() alongside the four existing boot-smoke
+// entries. postui is a userspace library (see design/architecture.md
+// sec.2), no _start and no boot log; this test is library-shaped like
+// its M1-008 / M2-010 / M3-007 / M4-008 predecessors.
+//
+// =============================================================================
+// FAIL SENTINELS (band 0xFFFFEDE0..0xFFFFEDEF)
+// =============================================================================
+//
+// Anchored per architecture.md sec.7 (Fail-code family table). The
+// last-in-table band 0xFFFFEDD0..0xFFFFEDDF belongs to M4-008
+// (test_boot_widget_catalog_smoke); this landing takes the next 16-slot
+// band 0xFFFFEDE0..0xFFFFEDEF for M5-001 (test_semantic_version_
+// conformance).
+//
+// The band packs one sentinel per rule slot; the fault site's source
+// location attributes which widget triggered it (rather than a
+// per-widget-per-rule 15x3 sentinel matrix that would burn the entire
+// 16-slot band on one test).
+//
+//   0xFFFFEDE0  SVC_ERR_MAGIC_MISMATCH        observed magic != expected
+//   0xFFFFEDE1  SVC_ERR_RECORD_LEN_TOO_SHORT  record_len < 24
+//   0xFFFFEDE2  SVC_ERR_RECORD_LEN_MISALIGNED record_len not 8B-aligned
+//   0xFFFFEDE3  SVC_ERR_MAGIC_COLLISION       two schemas share a magic
+//
+// Slots 0xFFFFEDE4..0xFFFFEDEF are RESERVED for future extension (a
+// packer-return-mismatch check, per-widget attribution refinements, or
+// additional rules libpdx-semantic-pipe adds in a later revision). The
+// band is deliberately not fully allocated so a future rule addition is
+// a wire-preserving extension rather than a band shuffle.
+//
+// =============================================================================
+// FIXTURE (128-byte scratch + 15-slot magic table + 15 spec slabs)
+// =============================================================================
+//
+// Scratch buffer: 128 bytes (16 u64 slots) @align(8). Every packer's
+// record fits (largest = TABV at 56 bytes; smallest = CRVW at 24 bytes).
+// Each drill overwrites the [0..record_len) prefix fully, so no
+// pre-zeroing between iterations is needed -- the observed magic at
+// [scratch+0..4) always reflects the current packer's stamp, not stale
+// bytes from a prior drill.
+//
+// Magic table: 15 u64 slots @align(8), holding the observed magic value
+// from each drill (loaded from [scratch+0..4) via xor+mov_d, zero-
+// extended into the qword slot). The cross-check reads pairs from this
+// table; storing observed rather than expected magics keeps the cross-
+// check a runtime witness (a packer that miswrites its magic will land
+// its bad value here, and the per-widget rule-1 check will already have
+// caught it -- the table exists specifically for the pair-collision
+// case, which even correct-in-isolation packers can trip if two schemas
+// accidentally collapsed to the same u32 during a refactor).
+//
+// Widget spec slabs: sized per widget (48..80 bytes each). Only the
+// fields the view_pack actually reads are populated; the rest stay
+// zero-initialized (via a Phase 0 zero-clear that covers every slab
+// wholesale). No draw path runs; no shared aux Span/Line/Text is
+// needed for view_pack (only draw paths dereference them).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SemanticVersionConformance`),
+//     matches file basename `semantic_version_conformance.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` and every
+//     small-value compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF.
+//   - Every schema-magic constant (0x564B4C42 max = 0x57565643 max
+//     = 1_465_274_435 < 0x7FFFFFFF) fits imm32 signed positive; a load
+//     site emits the compact 5-byte `mov r32, imm32` form. Cmp sites
+//     use the imm32 form directly (`cmp rax, 0x57565643`).
+//   - The packed rect literal 0x0009000800000000 sits > 0x7FFFFFFF ->
+//     movabs (10-byte mov reg, imm64), legal for mov, NEVER for cmp.
+//   - Each fail sentinel (0xFFFFEDEx) is likewise a movabs literal in
+//     the fail arm's `mov rax, sentinel` -- legal for mov.
+//   - No 2-op `imul reg, imm`; no imul used at all in this module. The
+//     cross-check inner loop uses `mov + shl 3` (i*8) instead of imul
+//     for magic-table indexing.
+//   - No `and reg, imm64`; the only `and` is `and rcx, 7` (imm8, fits
+//     imm32) for the record_len 8B-alignment check.
+//   - No `cmp reg, [mem]`; every compare goes through a register (memory
+//     is loaded into rax/rcx first, then cmp reg,reg or cmp reg,imm).
+//   - Every mov_d dword-load is preceded by `xor rax, rax` (defensive
+//     zero-extension; the M1-003 cell.pdx convention).
+//   - Single-line `pub let` for every constant declaration (the multi-
+//     line pub let form is a documented paideia-as pitfall).
+//   - Reserved-label prefix `svc_*` per docs fingerprint discipline.
+//     Cross-check inner arms use `svc_cross_*`; per-widget fail arms
+//     use `svc_fail_*`.
+//   - SysV alignment: single `push rbx` (8 B) rounds SysV entry
+//     rsp%16==8 to 0, aligned for every nested call -- matches the M4-008
+//     boot_widget_catalog_smoke posture. rbx caches the current spec/
+//     scratch/magic-table base; every callee (each `*_view_pack`) is
+//     SysV-conformant and preserves rbx end-to-end. r8..r11 and rax..rdx
+//     are caller-save scratch; r12..r15 are NOT touched anywhere in this
+//     module (so the single-push posture is safe -- no callee-save
+//     modification other than rbx).
+//   - Cross-module bare calls (each `*_view_pack`) resolve via
+//     paideia-as's flat ELF symbol namespace -- same pattern the M4-008
+//     smoke uses for its 15 `*_draw` calls.
+//   - Effect row `!{mem} @{}` on semantic_version_conformance: writes to
+//     every spec slab, the scratch, and the magic table (transitively
+//     via every invoked view_pack). No sysreg, no cap.
+
+module SemanticVersionConformance = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDE0..0xFFFFEDEF per architecture.md sec.7)
+  // ==========================================================================
+  pub let SVC_ERR_MAGIC_MISMATCH        : u64 = 0xFFFFEDE0
+  pub let SVC_ERR_RECORD_LEN_TOO_SHORT  : u64 = 0xFFFFEDE1
+  pub let SVC_ERR_RECORD_LEN_MISALIGNED : u64 = 0xFFFFEDE2
+  pub let SVC_ERR_MAGIC_COLLISION       : u64 = 0xFFFFEDE3
+
+  // ==========================================================================
+  // Expected schema magic constants (docs/design.md sec.2.3, cross-
+  // referenced against each widget's *_MAGIC pub let):
+  //   BLKV -> src/block.pdx BLKV_MAGIC L205
+  //   PGVW -> src/widgets/paragraph.pdx PGVW_MAGIC L354
+  //   LSVW -> src/widgets/list.pdx LSVW_MAGIC L273
+  //   TBVW -> src/widgets/table.pdx TBVW_MAGIC L264
+  //   TABV -> src/widgets/tabs.pdx TABV_MAGIC L312
+  //   SBVW -> src/widgets/scrollbar.pdx (inline literal 0x57564253)
+  //   GGVW -> src/widgets/gauge.pdx GGVW_MAGIC L235
+  //   SPVW -> src/widgets/sparkline.pdx SPVW_MAGIC L298
+  //   BCVW -> src/widgets/barchart.pdx BCVW_MAGIC L235
+  //   CHVW -> src/widgets/chart.pdx CHVW_MAGIC L303
+  //   CVVW -> src/widgets/canvas.pdx CVVW_MAGIC L327
+  //   TIVW -> src/widgets/text_input.pdx TIVW_MAGIC L421
+  //   TRVW -> src/widgets/tree.pdx TRVW_MAGIC L415
+  //   CLVW -> src/widgets/calendar.pdx CLVW_MAGIC L272
+  //   CRVW -> src/widgets/clear.pdx CRVW_MAGIC L142
+  // ==========================================================================
+  pub let SVC_EXPECT_BLKV : u64 = 0x564B4C42
+  pub let SVC_EXPECT_PGVW : u64 = 0x57564750
+  pub let SVC_EXPECT_LSVW : u64 = 0x5756534C
+  pub let SVC_EXPECT_TBVW : u64 = 0x57564254
+  pub let SVC_EXPECT_TABV : u64 = 0x56424154
+  pub let SVC_EXPECT_SBVW : u64 = 0x57564253
+  pub let SVC_EXPECT_GGVW : u64 = 0x57564747
+  pub let SVC_EXPECT_SPVW : u64 = 0x57565053
+  pub let SVC_EXPECT_BCVW : u64 = 0x57564342
+  pub let SVC_EXPECT_CHVW : u64 = 0x57564843
+  pub let SVC_EXPECT_CVVW : u64 = 0x57565643
+  pub let SVC_EXPECT_TIVW : u64 = 0x57564954
+  pub let SVC_EXPECT_TRVW : u64 = 0x57565254
+  pub let SVC_EXPECT_CLVW : u64 = 0x57564C43
+  pub let SVC_EXPECT_CRVW : u64 = 0x57565243
+
+  // Rule 2 lower bound: record_len must be >= 24 (magic 4B + record_len
+  // 4B + at least one rect qword).
+  pub let SVC_RECORD_LEN_MIN : u64 = 24
+
+  // Widget count -- 15 view schemas at postui @0.1.
+  pub let SVC_WIDGET_COUNT : u64 = 15
+
+  // ==========================================================================
+  // Shared scratch buffer -- 128 bytes @align(8). Every packer's record
+  // fits (max = TABV at 56 bytes). Reused across all 15 drills; each
+  // packer overwrites the [0..record_len) prefix fully.
+  // ==========================================================================
+  pub let mut _svc_scratch : [u64; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // Observed-magic table -- one u64 slot per widget catalog index (0..14).
+  // Populated after each drill's magic load; consumed by the cross-check
+  // nested loop.
+  // ==========================================================================
+  pub let mut _svc_magics : [u64; 15] = uninit @align(8)
+
+  // ==========================================================================
+  // Per-widget spec slabs -- sized per architecture.md wire tables. Every
+  // slab is @align(8) (sufficient for u64 field access; the 16-byte
+  // alignment BlockSpec has in boot_widget_catalog_smoke is a fill-cell
+  // hot-path concern that view_pack does not exercise).
+  // ==========================================================================
+  pub let mut _svc_block_spec  : [u64; 6]  = uninit @align(8)  // BlockSpec 48B
+  pub let mut _svc_para_spec   : [u64; 6]  = uninit @align(8)  // ParagraphSpec 48B
+  pub let mut _svc_list_spec   : [u64; 8]  = uninit @align(8)  // ListSpec 64B
+  pub let mut _svc_table_spec  : [u64; 10] = uninit @align(8)  // TableSpec 80B
+  pub let mut _svc_table_state : [u64; 3]  = uninit @align(8)  // TableState 24B
+  pub let mut _svc_tabs_spec   : [u64; 7]  = uninit @align(8)  // TabsSpec 56B
+  pub let mut _svc_scroll_spec : [u64; 7]  = uninit @align(8)  // ScrollbarSpec 56B
+  pub let mut _svc_gauge_spec  : [u64; 6]  = uninit @align(8)  // GaugeSpec 48B
+  pub let mut _svc_spark_spec  : [u64; 5]  = uninit @align(8)  // SparklineSpec 40B
+  pub let mut _svc_bar_spec    : [u64; 8]  = uninit @align(8)  // BarChartSpec 64B
+  pub let mut _svc_chart_spec  : [u64; 9]  = uninit @align(8)  // ChartSpec 72B
+  pub let mut _svc_canvas_spec : [u64; 8]  = uninit @align(8)  // CanvasSpec 64B
+  pub let mut _svc_ti_spec     : [u64; 9]  = uninit @align(8)  // TextInputSpec 72B
+  pub let mut _svc_tree_spec   : [u64; 8]  = uninit @align(8)  // TreeSpec 64B
+  pub let mut _svc_cal_spec    : [u64; 6]  = uninit @align(8)  // CalendarSpec 48B
+  pub let mut _svc_clear_spec  : [u64; 2]  = uninit @align(8)  // ClearSpec 16B
+
+  // ==========================================================================
+  // semantic_version_conformance() -> u64
+  //
+  // Runs the 15 per-widget conformance drills followed by the cross-
+  // widget magic-uniqueness sweep. Returns 0 on all passes; first
+  // failure short-circuits with a rule-specific sentinel (source
+  // location attributes which widget triggered the fault).
+  //
+  // Register plan: nullary entry. 1-push (rbx) = 8 B rounds SysV entry
+  // rsp%16==8 to 0, aligned for every nested `*_view_pack` call. rbx
+  // caches the current spec/scratch/magic-table base; caller-save regs
+  // (rax, rcx, rdx, rsi, rdi, r8-r11) are the scratch pool. r12..r15
+  // are never touched, so the single-push posture is safe.
+  //
+  // Labels prefixed `svc_` per docs fingerprint discipline.
+  // ==========================================================================
+  pub let semantic_version_conformance : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M5-001 (postui#35): semantic_version_conformance drives all 15 widget *_view_pack entries against a shared 128-byte scratch, checking libpdx-semantic-pipe's 4-rule version-tolerance matrix. Structure follows M1-008 / M2-010 / M3-007 / M4-008 templates: 1-push (rbx) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for every nested call. Phase 0 zeros the scratch (16 qwords), the magics table (15 qwords), and every spec slab (variable qword count per widget) via straight qword-store loops; a Phase 0 zero-init makes every spec-slab reserved-slot idempotent (view_pack ignores those slots, but a caller re-running the test after a dirty .bss image reads the same well-defined starting state). Phases 1..15 run one per widget: build the spec via direct-store of the fields view_pack reads (rect at +0 for every widget; per-widget fields per architecture.md wire tables), call the widget's *_view_pack (rdi=spec_ptr, rsi=scratch, returned record_len in rax which we discard -- rule 2 checks the in-buffer record_len, not the returned one, because the returned value is the packer's own claim while the in-buffer stamp is what a downstream reader would observe), then verify: (a) magic at [scratch+0..+4) via xor rax,rax; mov_d rax, [scratch+0] loaded into rax (auto zero-extends to u64), then stored into _svc_magics[i] via mov [rbx+i*8], rax; (b) cmp rax, EXPECTED_MAGIC (imm32-safe -- all 15 magics fit imm32 signed positive) with jne to svc_fail_magic; (c) record_len at [scratch+4..+8) via xor rax, rax; mov_d rax, [scratch+4], then cmp rax, 24 with jb to svc_fail_len_short (rule 2); (d) mov rcx, rax; and rcx, 7 (imm8, fits imm32) with cmp rcx, 0 and jne to svc_fail_len_align (rule 4). Phase 16 cross-check: nested loop with outer index i in [0, 14) and inner index j in [i+1, 15); each iteration loads magics[i] and magics[j] via mov reg, [base+idx*8] (idx computed via mov+shl 3, NOT via 2-op imul reg,imm which is a paideia-as pitfall) and cmp with je to svc_fail_collision. Loop cursors are r8/r9/r10/r11 (caller-save; no calls happen in this phase so no push/pop needed for callee-save preservation). Success: xor rax, rax; pop rbx; ret. Each fail arm loads its sentinel via mov rax, 0xFFFFEDEx (movabs, > 0x7FFFFFFF, legal for mov; NOT for cmp), pops rbx, and rets. Every immediate that reaches cmp fits imm32 (0, 1, 7, 8, 14, 15, 24, and every schema magic value 0x564B4C42..0x57565643); every packed rect literal (0x0009000800000000) and every fail sentinel (0xFFFFEDEx) is loaded via movabs, only into mov targets, never into cmp. No test mnemonic anywhere; no 2-op imul reg,imm; no and reg,imm64; no cmp reg,[mem]; every mov_d dword load is preceded by xor rax, rax (M1-003 cell.pdx idiom, defense-in-depth against a paideia-as encoder revision that ever elects a sign-extending form). Labels prefixed svc_ per docs fingerprint discipline. Effect !{mem} covers every spec-slab store, every scratch stamp (transitively via view_pack), every magics-table store, and the readback loads.",
+      block: {
+        push rbx;
+
+        // ==================================================================
+        // Phase 0a: zero the shared scratch (16 qwords = 128 B).
+        // ==================================================================
+        xor rax, rax;
+        lea rbx, [rip + _svc_scratch];
+        mov rcx, 16;
+      svc_zscratch_loop:
+        cmp rcx, 0;
+        je  svc_zscratch_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zscratch_loop;
+      svc_zscratch_done:
+
+        // ==================================================================
+        // Phase 0b: zero the magics table (15 qwords = 120 B).
+        // ==================================================================
+        xor rax, rax;
+        lea rbx, [rip + _svc_magics];
+        mov rcx, 15;
+      svc_zmagics_loop:
+        cmp rcx, 0;
+        je  svc_zmagics_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zmagics_loop;
+      svc_zmagics_done:
+
+        // ==================================================================
+        // Phase 0c: zero every widget spec slab. Uninit .bss may hold
+        // stale bytes; per-slab zero-init makes the reserved-slot
+        // invariants well-defined so a re-run over dirty memory reads
+        // the same starting state.
+        // ==================================================================
+
+        // block spec (6 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_block_spec];
+        mov rcx, 6;
+      svc_zblock_loop:
+        cmp rcx, 0;
+        je  svc_zblock_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zblock_loop;
+      svc_zblock_done:
+
+        // paragraph spec (6 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_para_spec];
+        mov rcx, 6;
+      svc_zpara_loop:
+        cmp rcx, 0;
+        je  svc_zpara_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zpara_loop;
+      svc_zpara_done:
+
+        // list spec (8 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_list_spec];
+        mov rcx, 8;
+      svc_zlist_loop:
+        cmp rcx, 0;
+        je  svc_zlist_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zlist_loop;
+      svc_zlist_done:
+
+        // table spec (10 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_table_spec];
+        mov rcx, 10;
+      svc_ztable_loop:
+        cmp rcx, 0;
+        je  svc_ztable_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_ztable_loop;
+      svc_ztable_done:
+
+        // table state (3 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_table_state];
+        mov rcx, 3;
+      svc_ztstate_loop:
+        cmp rcx, 0;
+        je  svc_ztstate_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_ztstate_loop;
+      svc_ztstate_done:
+
+        // tabs spec (7 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_tabs_spec];
+        mov rcx, 7;
+      svc_ztabs_loop:
+        cmp rcx, 0;
+        je  svc_ztabs_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_ztabs_loop;
+      svc_ztabs_done:
+
+        // scrollbar spec (7 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_scroll_spec];
+        mov rcx, 7;
+      svc_zscroll_loop:
+        cmp rcx, 0;
+        je  svc_zscroll_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zscroll_loop;
+      svc_zscroll_done:
+
+        // gauge spec (6 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_gauge_spec];
+        mov rcx, 6;
+      svc_zgauge_loop:
+        cmp rcx, 0;
+        je  svc_zgauge_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zgauge_loop;
+      svc_zgauge_done:
+
+        // sparkline spec (5 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_spark_spec];
+        mov rcx, 5;
+      svc_zspark_loop:
+        cmp rcx, 0;
+        je  svc_zspark_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zspark_loop;
+      svc_zspark_done:
+
+        // barchart spec (8 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_bar_spec];
+        mov rcx, 8;
+      svc_zbar_loop:
+        cmp rcx, 0;
+        je  svc_zbar_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zbar_loop;
+      svc_zbar_done:
+
+        // chart spec (9 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_chart_spec];
+        mov rcx, 9;
+      svc_zchart_loop:
+        cmp rcx, 0;
+        je  svc_zchart_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zchart_loop;
+      svc_zchart_done:
+
+        // canvas spec (8 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_canvas_spec];
+        mov rcx, 8;
+      svc_zcanvas_loop:
+        cmp rcx, 0;
+        je  svc_zcanvas_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zcanvas_loop;
+      svc_zcanvas_done:
+
+        // text_input spec (9 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_ti_spec];
+        mov rcx, 9;
+      svc_zti_loop:
+        cmp rcx, 0;
+        je  svc_zti_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zti_loop;
+      svc_zti_done:
+
+        // tree spec (8 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_tree_spec];
+        mov rcx, 8;
+      svc_ztree_loop:
+        cmp rcx, 0;
+        je  svc_ztree_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_ztree_loop;
+      svc_ztree_done:
+
+        // calendar spec (6 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_cal_spec];
+        mov rcx, 6;
+      svc_zcal_loop:
+        cmp rcx, 0;
+        je  svc_zcal_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zcal_loop;
+      svc_zcal_done:
+
+        // clear spec (2 qwords)
+        xor rax, rax;
+        lea rbx, [rip + _svc_clear_spec];
+        mov rcx, 2;
+      svc_zclear_loop:
+        cmp rcx, 0;
+        je  svc_zclear_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp svc_zclear_loop;
+      svc_zclear_done:
+
+        // ==================================================================
+        // Phase 1: BLOCK drill (widget index 0).
+        // BlockSpec: rect at +0, border_kind byte at +8, title_ptr at +16,
+        // title_len at +24. Title is null (title_ptr=0, title_len=0) so
+        // record_len = 24. The block record_len is variable; the min case
+        // (empty title) exercises rule-2's lower bound exactly.
+        // ==================================================================
+        lea rbx, [rip + _svc_block_spec];
+        mov rax, 0x0009000800000000;
+        mov [rbx + 0], rax;                 // rect
+        // border_kind stays 0 (NONE) from Phase 0c zero-init.
+        // title_ptr and title_len stay 0 from Phase 0c zero-init.
+
+        lea rdi, [rip + _svc_block_spec];
+        lea rsi, [rip + _svc_scratch];
+        call block_view_pack;
+
+        // Load and store observed magic from [scratch+0..+4).
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 0], rax;
+        // Rule 1: magic == expected.
+        cmp rax, 0x564B4C42;
+        jne svc_fail_magic;
+        // Load record_len from [scratch+4..+8).
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        // Rule 2: record_len >= 24.
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        // Rule 4: record_len is 8B-aligned.
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 2: PARAGRAPH drill (widget index 1).
+        // ParagraphSpec: rect at +0, text_ptr at +8 (nullable -> pg_pv_no_text
+        // fallback zeros line_count). Rest stays zero.
+        // ==================================================================
+        lea rbx, [rip + _svc_para_spec];
+        mov rax, 0x0009000800000008;
+        mov [rbx + 0], rax;                 // rect
+        // text_ptr stays 0 (Phase 0c) -> paragraph_view_pack takes the
+        // pg_pv_no_text branch and writes line_count = 0.
+
+        lea rdi, [rip + _svc_para_spec];
+        lea rsi, [rip + _svc_scratch];
+        call paragraph_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 8], rax;
+        cmp rax, 0x57564750;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 3: LIST drill (widget index 2).
+        // ListSpec: rect at +0. state_ptr at +32 stays 0 (list_view_pack
+        // composes LIST_SELECTED_NONE as fallback). item_count at +24
+        // stays 0 (a zero-item list is a valid semantic-pipe view).
+        // ==================================================================
+        lea rbx, [rip + _svc_list_spec];
+        mov rax, 0x0009000800000010;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_list_spec];
+        lea rsi, [rip + _svc_scratch];
+        call list_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 16], rax;
+        cmp rax, 0x5756534C;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 4: TABLE drill (widget index 3).
+        // TableSpec: rect at +0, state_ptr at +48 (NON-NULL -- table_view_
+        // pack dereferences it unconditionally; provide the zero-init'd
+        // _svc_table_state). Other fields stay zero.
+        // ==================================================================
+        lea rbx, [rip + _svc_table_spec];
+        mov rax, 0x0009000800000018;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _svc_table_state];
+        mov [rbx + 48], rax;                // state_ptr (non-null)
+
+        lea rdi, [rip + _svc_table_spec];
+        lea rsi, [rip + _svc_scratch];
+        call table_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 24], rax;
+        cmp rax, 0x57564254;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 5: TABS drill (widget index 4).
+        // TabsSpec: rect at +0. Direct verbatim copies of the other u64
+        // fields; all zero is a valid tabs semantic-pipe view.
+        // ==================================================================
+        lea rbx, [rip + _svc_tabs_spec];
+        mov rax, 0x0009000800000020;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_tabs_spec];
+        lea rsi, [rip + _svc_scratch];
+        call tabs_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 32], rax;
+        cmp rax, 0x56424154;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 6: SCROLLBAR drill (widget index 5).
+        // ScrollbarSpec: rect at +0. All-zero body is a valid scrollbar
+        // semantic-pipe view (V orientation, empty content).
+        // ==================================================================
+        lea rbx, [rip + _svc_scroll_spec];
+        mov rax, 0x00090008000A0000;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_scroll_spec];
+        lea rsi, [rip + _svc_scratch];
+        call scrollbar_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 40], rax;
+        cmp rax, 0x57564253;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 7: GAUGE drill (widget index 6).
+        // GaugeSpec: rect at +0. Other fields (value, max, kind, styles)
+        // are copied verbatim; zero is a valid gauge state.
+        // ==================================================================
+        lea rbx, [rip + _svc_gauge_spec];
+        mov rax, 0x00090008000A0008;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_gauge_spec];
+        lea rsi, [rip + _svc_scratch];
+        call gauge_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 48], rax;
+        cmp rax, 0x57564747;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 8: SPARKLINE drill (widget index 7).
+        // SparklineSpec: rect at +0. value_count/max_override zero is a
+        // valid semantic-pipe view (empty sparkline).
+        // ==================================================================
+        lea rbx, [rip + _svc_spark_spec];
+        mov rax, 0x00090008000A0010;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_spark_spec];
+        lea rsi, [rip + _svc_scratch];
+        call sparkline_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 56], rax;
+        cmp rax, 0x57565053;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 9: BARCHART drill (widget index 8).
+        // BarChartSpec: rect at +0. bar_count zero is valid (empty chart).
+        // ==================================================================
+        lea rbx, [rip + _svc_bar_spec];
+        mov rax, 0x00090008000A0018;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_bar_spec];
+        lea rsi, [rip + _svc_scratch];
+        call barchart_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 64], rax;
+        cmp rax, 0x57564342;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 10: CHART drill (widget index 9).
+        // ChartSpec: rect at +0. dataset_count zero and axis min/max zero
+        // are valid (empty chart view).
+        // ==================================================================
+        lea rbx, [rip + _svc_chart_spec];
+        mov rax, 0x00090008000A0020;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_chart_spec];
+        lea rsi, [rip + _svc_scratch];
+        call chart_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 72], rax;
+        cmp rax, 0x57564843;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 11: CANVAS drill (widget index 10).
+        // CanvasSpec: rect at +0. canvas_view_pack does NOT traverse the
+        // bitmap; bitmap_ptr can stay zero. Axis min/max zero are valid.
+        // ==================================================================
+        lea rbx, [rip + _svc_canvas_spec];
+        mov rax, 0x0009000800140000;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_canvas_spec];
+        lea rsi, [rip + _svc_scratch];
+        call canvas_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 80], rax;
+        cmp rax, 0x57565643;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 12: TEXT_INPUT drill (widget index 11).
+        // TextInputSpec: rect at +0. text_input_view_pack does verbatim
+        // u64 copies of cursor_byte (+32), buffer_len (+24), mode (+48);
+        // all zero is a valid empty-buffer semantic-pipe view.
+        // ==================================================================
+        lea rbx, [rip + _svc_ti_spec];
+        mov rax, 0x0009000800140008;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_ti_spec];
+        lea rsi, [rip + _svc_scratch];
+        call text_input_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 88], rax;
+        cmp rax, 0x57564954;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 13: TREE drill (widget index 12).
+        // TreeSpec: rect at +0. state_ptr at +24 stays 0 (tree_view_pack
+        // takes tr_vp_no_state branch, writes offset = 0).
+        // ==================================================================
+        lea rbx, [rip + _svc_tree_spec];
+        mov rax, 0x0009000800140010;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_tree_spec];
+        lea rsi, [rip + _svc_scratch];
+        call tree_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 96], rax;
+        cmp rax, 0x57565254;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 14: CALENDAR drill (widget index 13).
+        // CalendarSpec: rect at +0. year/month/selected_day all zero
+        // (calendar_view_pack does not validate these here; validation
+        // is a draw-path concern).
+        // ==================================================================
+        lea rbx, [rip + _svc_cal_spec];
+        mov rax, 0x0009000800140018;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_cal_spec];
+        lea rsi, [rip + _svc_scratch];
+        call calendar_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 104], rax;
+        cmp rax, 0x57564C43;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 15: CLEAR drill (widget index 14).
+        // ClearSpec: rect at +0, style at +8. All-zero body is a valid
+        // clear view.
+        // ==================================================================
+        lea rbx, [rip + _svc_clear_spec];
+        mov rax, 0x0009000800140020;
+        mov [rbx + 0], rax;                 // rect
+
+        lea rdi, [rip + _svc_clear_spec];
+        lea rsi, [rip + _svc_scratch];
+        call clear_view_pack;
+
+        lea rbx, [rip + _svc_scratch];
+        xor rax, rax;
+        mov_d rax, [rbx + 0];
+        lea rcx, [rip + _svc_magics];
+        mov [rcx + 112], rax;
+        cmp rax, 0x57565243;
+        jne svc_fail_magic;
+        xor rax, rax;
+        mov_d rax, [rbx + 4];
+        cmp rax, 24;
+        jb  svc_fail_len_short;
+        mov rcx, rax;
+        and rcx, 7;
+        cmp rcx, 0;
+        jne svc_fail_len_align;
+
+        // ==================================================================
+        // Phase 16: cross-widget magic-uniqueness sweep (rule 1's cross-
+        // check leg). Nested loop: for i in [0, 14), for j in [i+1, 15),
+        // compare _svc_magics[i] to _svc_magics[j]; a hit fires the
+        // collision sentinel. C(15,2) = 105 comparisons.
+        //
+        // Register plan: rbx = &_svc_magics base (loaded once). r8 = i,
+        // r9 = j. rax / rcx / rdx = load transit. No nested calls in
+        // this phase -- caller-save regs alone are safe (r12..r15 stay
+        // untouched, honoring the single-push rbx posture).
+        // ==================================================================
+        lea rbx, [rip + _svc_magics];
+        xor r8, r8;                         // i = 0
+      svc_cross_outer:
+        cmp r8, 14;
+        jae svc_cross_done;
+
+        // magics[i]: idx = i*8 (mov+shl 3, NOT 2-op imul reg,imm which
+        // is a paideia-as pitfall).
+        mov rax, r8;
+        shl rax, 3;
+        add rax, rbx;
+        mov rcx, [rax + 0];                 // magics[i] into rcx
+
+        mov r9, r8;
+        add r9, 1;                          // j = i + 1
+      svc_cross_inner:
+        cmp r9, 15;
+        jae svc_cross_inner_done;
+
+        mov rax, r9;
+        shl rax, 3;
+        add rax, rbx;
+        mov rdx, [rax + 0];                 // magics[j] into rdx
+
+        cmp rcx, rdx;
+        je  svc_fail_collision;
+
+        add r9, 1;
+        jmp svc_cross_inner;
+      svc_cross_inner_done:
+        add r8, 1;
+        jmp svc_cross_outer;
+      svc_cross_done:
+
+        // ==================================================================
+        // All 4 rules passed for all 15 widgets. Return 0 (OK).
+        // ==================================================================
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      svc_fail_magic:
+        mov rax, 0xFFFFEDE0;
+        pop rbx;
+        ret;
+
+      svc_fail_len_short:
+        mov rax, 0xFFFFEDE1;
+        pop rbx;
+        ret;
+
+      svc_fail_len_align:
+        mov rax, 0xFFFFEDE2;
+        pop rbx;
+        ret;
+
+      svc_fail_collision:
+        mov rax, 0xFFFFEDE3;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
