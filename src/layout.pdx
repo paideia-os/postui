@@ -1,0 +1,895 @@
+// src/layout.pdx -- postui.M2-001 (paideia-os/postui#10)
+//
+// Layout module: integer constraint distribution engine.
+//
+// =============================================================================
+// SCOPE (docs/design.md §1.3 layout model, §2.4 constraint semantics)
+// =============================================================================
+//
+// postui M2-001 replaces Ratatui's cassowary-rs Simplex-family LP solver
+// with an all-integer, single-pass distribution engine. The design doc's
+// §1.3 audit already argued why: paideia-as has no scalar-float codegen
+// (verified across every crate under tools/paideia-as/crates/*/src, zero
+// hits for movss/movsd/addsd/mulsd/divsd/cvtsi2sd/cvttsd2si; see
+// docs/design.md §1.1 feature table), and a terminal layout problem never
+// needs general LP -- it needs "split N cells among a handful of ordered
+// constraints deterministically". The chosen algorithm is HAMILTON'S
+// METHOD OF LARGEST-REMAINDER APPORTIONMENT (also known as Hare-quota),
+// the same rounding rule used for legislative seat apportionment, which
+// guarantees the weighted allocations sum to exactly the remainder with
+// no 1-cell drift. Reference: Balinski, M.L. and Young, H.P. (1982).
+// "Fair Representation: Meeting the Ideal of One Man, One Vote". Yale
+// University Press. Ratatui's own pre-v0.19 layout algorithm used the
+// same family (integer proportional distribution) before the switch to
+// Cassowary in v0.19; postui deliberately does not follow that switch
+// for the reasons above.
+//
+// =============================================================================
+// CONSTRAINT ENCODING (packed u64)
+// =============================================================================
+//
+// A Constraint is a plain u64 with a tag in the top 8 bits and a payload
+// in the low 56 bits. The tag discriminates the 6 constraint kinds; the
+// payload carries at most two u24 fields depending on the kind.
+//
+//   bits [56..64)  tag    LAYOUT_TAG_* ordinal (1..6)
+//   bits [48..56)  pad    reserved zero
+//   bits [24..48)  aux    Ratio.den only; zero for every other kind
+//   bits [ 0..24)  main   the primary payload (Length.n, Percentage.p,
+//                          Min.n, Max.n, Fill.weight, or Ratio.num)
+//
+// Kind-specific payload interpretation:
+//
+//   Length(n)     : main = n,           aux = 0    (n is cell count)
+//   Percentage(p) : main = p,           aux = 0    (p is 0..=100)
+//   Ratio(num,den): main = num,         aux = den  (num/den fraction)
+//   Min(n)        : main = n,           aux = 0    (n is cell count)
+//   Max(n)        : main = n,           aux = 0    (n is cell count)
+//   Fill(w)       : main = w,           aux = 0    (w is relative weight)
+//
+// EVERY FIELD IS A u24 (0..16_777_215). This is well above every
+// terminal-sized value a real caller passes (TUI_DIM_MAX = 4096 per
+// docs/design.md §2.1; Percentage is 0..100 by contract; Ratio numerator
+// / denominator and Fill weight are all in the low hundreds for any
+// realistic layout). The u24 ceiling was chosen for one paideia-as
+// encoder reason: the extraction mask (0xFFFFFF = 16_777_215) fits imm32
+// as a positive value, so `and reg, 0xFFFFFF` uses the safe imm-encoding
+// path. A u32 payload (0..2^32-1) would require the 0xFFFFFFFF mask,
+// which sign-extends to 0xFFFFFFFFFFFFFFFF as imm32 and is a no-op --
+// the same trap style_with_fg dodges via the shr/shl pair (see style.pdx
+// justification for style_with_fg). We simply set the ceiling low enough
+// that the natural imm32 mask works.
+//
+// Tag ordinals are 1..6 (not 0..5) so a zero-initialized u64 slot
+// (accidental caller-side default) decodes as an invalid tag and gets
+// rejected with LAYOUT_ERR_BAD_TAG rather than silently interpreted as
+// Length(0).
+//
+// =============================================================================
+// DIRECTION ENUM
+// =============================================================================
+//
+// A Direction is a plain u64: 0 for horizontal (columns split, rows
+// preserved) and 1 for vertical (rows split, columns preserved). Values
+// >= 2 return LAYOUT_ERR_BAD_DIRECTION. The u64-tag shape lets the caller
+// pass through a stored ordinal without an extra decode step, matching
+// the two-value discriminators FRAME_INPUT_KIND_TTY / FRAME_INPUT_SYS_
+// READ_FALLBACK in frame.pdx.
+//
+// =============================================================================
+// ALGORITHM (single pass, all-integer, deterministic, terminating)
+// =============================================================================
+//
+// Let total = parent's axis dimension (parent.w for horizontal,
+//              parent.h for vertical).
+// Let count = number of constraints (1 <= count <= LAYOUT_MAX_CONSTRAINTS).
+//
+// Phase 1: BASE ALLOCATION. For each constraint i in [0, count), compute
+// a base allocation base_i and store it in the scratch array:
+//
+//   Length(n)     -> base_i = n
+//   Percentage(p) -> base_i = floor(total * p / 100)
+//   Ratio(num,den)-> base_i = floor(total * num / den)   [den == 0 -> err]
+//   Min(n)        -> base_i = n
+//   Max(n)        -> base_i = n
+//   Fill(w)       -> base_i = 0
+//
+// Accumulate sum_base = sum(base_i).
+//
+// Phase 2: RESIDUAL. Compute residual = max(0, total - sum_base). If
+// sum_base > total the caller has over-constrained the parent; we
+// saturate residual to 0 and produce sub-rects whose extents sum to more
+// than the parent (documented caller responsibility -- Ratatui's own
+// pre-v0.19 algorithm behaved identically for over-constrained inputs).
+//
+// Phase 3: LARGEST-REMAINDER APPORTIONMENT of the residual across the
+// Fill constraints only. Let W = sum of all Fill weights. If W == 0
+// (either no Fill or every Fill is Fill(0)), the residual is discarded
+// per the issue text ("Fill(0) with no other Fill -> 0 cells"). If
+// W > 0, for each Fill(w) constraint i:
+//
+//   floor_i     = floor(residual * w / W)
+//   remainder_i = (residual * w) mod W
+//   alloc_i    += floor_i                 [accumulates onto the 0 base]
+//
+// Let sum_floors = sum(floor_i). Let leftover = residual - sum_floors.
+// Distribute the leftover ONE CELL AT A TIME to Fill constraints in
+// order of largest remainder_i first; ties are broken by LOWEST INDEX
+// (a stable, deterministic rule: the scan visits constraints in order
+// and only updates the current maximum on a STRICT greater, so the
+// first-seen tied candidate wins). After a Fill wins a bonus cell, its
+// remainder_i is zeroed so the next scan does not re-pick it before
+// other tied candidates have their turn.
+//
+// leftover is bounded by (count_of_Fills - 1) because sum_floors
+// >= residual - (W - 1) * count_of_Fills / W, and each remainder_i is
+// in [0, W). At most 64 Fill items -> at most 63 leftover iterations.
+//
+// Phase 4: PACK OUTPUT RECTS. Extract parent's (x, y, w, h). Walk the
+// constraint array a final time, maintaining a running offset along the
+// split axis; each output rect gets:
+//
+//   Horizontal: rect_i = (parent.x + offset, parent.y, alloc_i, parent.h)
+//   Vertical:   rect_i = (parent.x, parent.y + offset, parent.w, alloc_i)
+//
+// then offset += alloc_i. The output rect is packed via the same
+// (x | y<<16 | w<<32 | h<<48) layout Rect uses (see rect.pdx rect_new).
+//
+// =============================================================================
+// MIN / MAX SEMANTICS (v1 conservative interpretation, documented gap)
+// =============================================================================
+//
+// Ratatui's Constraint::Min(n) means "at least n cells, expand if room"
+// and Constraint::Max(n) means "at most n cells, shrink to fit". A full
+// flex-with-bounds semantic requires the clamp-and-redistribute iteration
+// docs/design.md §2.4 step 4 describes: apply Min/Max caps to allocations,
+// re-apportion any cells freed by clamping to the remaining unclamped
+// Fill/Percentage/Ratio constraints, iterate to fixpoint (bounded by
+// count).
+//
+// At M2-001 the engine adopts a CONSERVATIVE interpretation: Min(n) and
+// Max(n) both consume EXACTLY n cells (equivalent to Length(n)), and
+// only Fill absorbs the residual. This satisfies the issue's literal
+// order-of-operations ("1. Sum Length + Percentage + Ratio; 2. Clamp
+// with Min/Max; 3. Distribute remainder to Fill by weight") for the
+// common case where Min/Max are used to pin dimensions and Fill
+// expresses the flex; the clamp-and-redistribute iteration is a
+// documented follow-up when M2-006 Table hits a real over-constrained
+// system in practice (Table column layouts are the archetypal
+// caller for the full flex semantic, per docs/design.md §2.6 Table
+// entry). A caller needing "at most n, but grow up to n from a
+// Fill share" can express it today as either Fill(w) + a post-clamp,
+// or by splitting the region into two nested layouts.
+//
+// =============================================================================
+// ERROR BAND (0xFFFFEBA0..0xFFFFEBAF, disjoint from every other postui
+// band -- see design/architecture.md §5.1)
+// =============================================================================
+//
+// Anchored at Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB80. Layout owns the
+// third slice above the base (Frame at 0xFFFFEB90..9F, Layout at
+// 0xFFFFEBA0..AF -- the M1-006 Block widget's aspirational reservation
+// at design/architecture.md §5.1 for 0xFFFFEBA0..AF was never used --
+// Block's body at src/block.pdx returns 0 or 1 only; the band is
+// available). WidgetKind at 0xFFFFEBB0..BF (verified against
+// widget_kind.pdx WK_ERR_UNIMPLEMENTED / WK_ERR_BAD_KIND) is disjoint.
+//
+// Every sentinel value is above 0x7FFFFFFF, forcing paideia-as to emit
+// the 10-byte movabs form for `mov reg, imm` -- legal for mov, NOT for
+// cmp/and (see frame.pdx block-header justification). All cmp/and
+// immediates in this module fit imm32 as positive values.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Layout`), matches file basename.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0` or
+//     the loop-bound cmp reg, reg.
+//   - Every `cmp reg, imm` / `and reg, imm` uses imm <= 0x7FFFFFFF. The
+//     widest immediate is 0xFFFFFF (16_777_215, u24 payload mask) which
+//     fits imm32 as a positive value. The tag-shift constant (56, 48,
+//     28, 24) is imm8. The stack-frame offsets (up to 1056) fit imm32
+//     trivially.
+//   - Every error sentinel (0xFFFFEBA0..0xFFFFEBA4) is loaded via
+//     `mov reg, imm` (paideia-as emits movabs for imm > 0x7FFFFFFF --
+//     the same idiom cap_handler_tui_canvas.pdx uses for TUI_BAD_SLOT).
+//   - Constraint tag ordinals (1..6) and direction ordinals (0..1)
+//     are literal u64 constants; no packed multi-byte encoding.
+//   - 2-op `imul reg, reg` only. Never 2-op `imul reg, imm` (paideia-
+//     as pitfall) and never 1-op `mul` (unused; every product fits u64
+//     with u24 inputs). Division uses standard `xor rdx, rdx; div reg`
+//     to keep the dividend in rax with a clean high half.
+//   - r11 is used as a scratch data register in the layout_split body
+//     between memory operations; paideia-as reserves r11 for its own
+//     LEA emission, so r11 MUST NOT hold state across a `lea`. The one
+//     `lea` in the body sits in the prologue before r11 is ever touched
+//     for data. SysV marks r11 caller-save, so the layout_split body's
+//     freedom to clobber it is standard.
+//   - `pub let X = value` is single-line for every constant.
+//   - SysV push/pop parity: layout_split pushes 5 callee-save regs
+//     (rbx, r12, r13, r14, r15 = 40 bytes) then `sub rsp, 1056` (66 *
+//     16 bytes = aligned). Entry rsp%16 == 8; after 40 + 1056 = 1096
+//     bytes, rsp%16 == 0 -- ready for any nested call the body might
+//     grow. layout_split makes NO nested call today (self-contained
+//     integer arithmetic), so the alignment is defense-in-depth.
+//   - Labels prefixed `ls_` for layout_split (main entry), `lt_` /
+//     `lp_` / etc. for the smaller constructors, per docs/design.md
+//     fingerprint discipline. `loop:` and `if:` (paideia-as reserved
+//     keywords) are never used bare.
+//
+// =============================================================================
+// CONSTRUCTOR SURFACE (leaf functions, one per constraint kind)
+// =============================================================================
+//
+//   layout_length(n)          -> u64    Length(n) packed constraint
+//   layout_percentage(p)      -> u64    Percentage(p) packed constraint
+//   layout_ratio(num, den)    -> u64    Ratio(num, den) packed constraint
+//   layout_min(n)             -> u64    Min(n) packed constraint
+//   layout_max(n)             -> u64    Max(n) packed constraint
+//   layout_fill(w)            -> u64    Fill(w) packed constraint
+//
+//   layout_ctag(c)            -> u64    Extract the tag (1..6)
+//   layout_cmain(c)           -> u64    Extract the primary u24 payload
+//   layout_cratio_den(c)      -> u64    Extract Ratio's denominator
+//
+// =============================================================================
+// MAIN ENTRY
+// =============================================================================
+//
+//   layout_split(parent, direction, constraints_ptr, count, out_rects_ptr)
+//     -> u64   -- returns 0 on success, a LAYOUT_ERR_* sentinel otherwise.
+
+module Layout = structure {
+
+  // ==========================================================================
+  // Tag ordinals. 1..6 (not 0..5) so a zero-initialized slot decodes as
+  // an invalid tag rather than silently as Length(0).
+  // ==========================================================================
+  pub let LAYOUT_TAG_LENGTH     : u64 = 1
+  pub let LAYOUT_TAG_PERCENTAGE : u64 = 2
+  pub let LAYOUT_TAG_RATIO      : u64 = 3
+  pub let LAYOUT_TAG_MIN        : u64 = 4
+  pub let LAYOUT_TAG_MAX        : u64 = 5
+  pub let LAYOUT_TAG_FILL       : u64 = 6
+
+  // ==========================================================================
+  // Direction ordinals. Values >= 2 return LAYOUT_ERR_BAD_DIRECTION.
+  // ==========================================================================
+  pub let LAYOUT_HORIZONTAL : u64 = 0
+  pub let LAYOUT_VERTICAL   : u64 = 1
+
+  // ==========================================================================
+  // Maximum constraints per split call. Bounded so the scratch frame
+  // (64 * 16 = 1024 bytes for two u64 arrays of size 64) has a fixed
+  // upper size that fits comfortably in the caller's SysV stack red-
+  // zone-plus-headroom. Real callers hit this ceiling never -- a
+  // single Layout::split rarely has more than a handful of children;
+  // 64 covers deeply nested Tabs / Table column layouts with margin.
+  // ==========================================================================
+  pub let LAYOUT_MAX_CONSTRAINTS : u64 = 64
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x20 offset = 0xFFFFEBA0, per design/architecture.md §5.1
+  // (Layout owns 0xFFFFEBA0..0xFFFFEBAF). Every sentinel > 0x7FFFFFFF,
+  // so `mov reg, imm` emits movabs; NEVER used in cmp/and.
+  // ==========================================================================
+  pub let LAYOUT_ERR_ZERO_COUNT     : u64 = 0xFFFFEBA0
+  pub let LAYOUT_ERR_TOO_MANY       : u64 = 0xFFFFEBA1
+  pub let LAYOUT_ERR_BAD_TAG        : u64 = 0xFFFFEBA2
+  pub let LAYOUT_ERR_BAD_RATIO      : u64 = 0xFFFFEBA3
+  pub let LAYOUT_ERR_BAD_DIRECTION  : u64 = 0xFFFFEBA4
+
+  // ==========================================================================
+  // layout_length(n) -> u64
+  //
+  // Pack Length(n) as (LAYOUT_TAG_LENGTH << 56) | (n & 0xFFFFFF).
+  // n is masked to u24 before OR-in so an out-of-bound argument
+  // truncates deterministically rather than corrupting the tag slot.
+  //
+  // Pure leaf. Register plan: rdi = n (caller-save, freely modified);
+  // rax = accumulator/return. Immediate 0xFFFFFF fits imm32; tag
+  // constant 0x0100000000000000 requires movabs (legal for mov reg,
+  // imm; matches the frame.pdx FRAME_ERR_* pattern).
+  // ==========================================================================
+  pub let layout_length : (u64) -> u64 !{} @{} =
+    fn (n: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_length packs Length(n) as (1<<56) | (n & 0xFFFFFF). Mask n to u24 (imm32-safe: 0xFFFFFF = 16_777_215 < 0x7FFFFFFF). Load tag-word 0x0100000000000000 via mov rax, imm64 (paideia-as emits movabs for imm > 0x7FFFFFFF -- legal for mov, matches cap_handler_tui_canvas.pdx `mov rax, 0xFFFFEB1A` idiom). OR the masked n into rax; return. Pure leaf: no memory, no push/pop, no callee-save touched.",
+      block: {
+        and rdi, 0xFFFFFF;
+        mov rax, 0x0100000000000000;
+        or  rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_percentage(p) -> u64
+  //
+  // Pack Percentage(p) as (LAYOUT_TAG_PERCENTAGE << 56) | (p & 0xFFFFFF).
+  // No range check on p (a caller passing p > 100 gets a proportional
+  // allocation greater than total; documented caller responsibility).
+  // ==========================================================================
+  pub let layout_percentage : (u64) -> u64 !{} @{} =
+    fn (p: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_percentage packs Percentage(p) as (2<<56) | (p & 0xFFFFFF). Same shape as layout_length; tag word is 0x0200000000000000. No range check on p by design (docs above).",
+      block: {
+        and rdi, 0xFFFFFF;
+        mov rax, 0x0200000000000000;
+        or  rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_ratio(num, den) -> u64
+  //
+  // Pack Ratio(num, den) as (LAYOUT_TAG_RATIO << 56) |
+  // ((den & 0xFFFFFF) << 24) | (num & 0xFFFFFF). Both num and den are
+  // u24s; den == 0 is NOT rejected here (constructors are pure and
+  // total per module convention), it is trapped by layout_split at the
+  // dispatch site and returned as LAYOUT_ERR_BAD_RATIO.
+  //
+  // Register plan: rdi = num, rsi = den (caller-save, freely modified);
+  // rax = accumulator/return. Shift count 24 fits imm8. Tag word
+  // 0x0300000000000000 movabs-encoded.
+  // ==========================================================================
+  pub let layout_ratio : (u64, u64) -> u64 !{} @{} =
+    fn (num: u64) (den: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_ratio packs Ratio(num,den) as (3<<56) | ((den & 0xFFFFFF) << 24) | (num & 0xFFFFFF). Two u24 payloads fit at bits [0..24) and [24..48) with bits [48..56) reserved zero. Mask each to 0xFFFFFF (imm32-safe); shift den left by 24 (imm8); load tag word 0x0300000000000000 via movabs; three ORs to compose. den == 0 is NOT trapped here -- constructors are total; layout_split traps it at first dispatch (LAYOUT_ERR_BAD_RATIO). Pure leaf.",
+      block: {
+        and rdi, 0xFFFFFF;
+        and rsi, 0xFFFFFF;
+        shl rsi, 24;
+        mov rax, 0x0300000000000000;
+        or  rax, rdi;
+        or  rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_min(n) -> u64
+  //
+  // Pack Min(n) as (LAYOUT_TAG_MIN << 56) | (n & 0xFFFFFF).
+  // ==========================================================================
+  pub let layout_min : (u64) -> u64 !{} @{} =
+    fn (n: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_min packs Min(n) as (4<<56) | (n & 0xFFFFFF). Same shape as layout_length.",
+      block: {
+        and rdi, 0xFFFFFF;
+        mov rax, 0x0400000000000000;
+        or  rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_max(n) -> u64
+  //
+  // Pack Max(n) as (LAYOUT_TAG_MAX << 56) | (n & 0xFFFFFF).
+  // ==========================================================================
+  pub let layout_max : (u64) -> u64 !{} @{} =
+    fn (n: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_max packs Max(n) as (5<<56) | (n & 0xFFFFFF). Same shape as layout_length.",
+      block: {
+        and rdi, 0xFFFFFF;
+        mov rax, 0x0500000000000000;
+        or  rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_fill(w) -> u64
+  //
+  // Pack Fill(w) as (LAYOUT_TAG_FILL << 56) | (w & 0xFFFFFF). w is a
+  // relative weight; a Fill(0) with no other Fill is a documented
+  // corner case (no cells assigned to any Fill).
+  // ==========================================================================
+  pub let layout_fill : (u64) -> u64 !{} @{} =
+    fn (w: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_fill packs Fill(w) as (6<<56) | (w & 0xFFFFFF). Same shape as layout_length; tag word 0x0600000000000000.",
+      block: {
+        and rdi, 0xFFFFFF;
+        mov rax, 0x0600000000000000;
+        or  rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_ctag(c) -> u64
+  //
+  // Extract the tag from a packed Constraint. Returns 1..6 for a
+  // valid constraint or 0/7..255 for garbage (which layout_split
+  // will reject as LAYOUT_ERR_BAD_TAG).
+  // ==========================================================================
+  pub let layout_ctag : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_ctag extracts bits [56..64) via shr rax, 56 (imm8 shift; result naturally zero-extended in low byte). Pure leaf.",
+      block: {
+        mov rax, rdi;
+        shr rax, 56;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_cmain(c) -> u64
+  //
+  // Extract the primary u24 payload. For Length/Percentage/Min/Max/
+  // Fill this is the whole payload; for Ratio this is the numerator.
+  // ==========================================================================
+  pub let layout_cmain : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_cmain masks bits [0..24) via `and rax, 0xFFFFFF` (imm32-safe). Pure leaf.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFF;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_cratio_den(c) -> u64
+  //
+  // Extract Ratio's denominator (bits [24..48)). Meaningless for any
+  // other tag; a caller that reads this from a non-Ratio constraint
+  // gets zero (all non-Ratio constraints pack zero into bits
+  // [24..48)).
+  // ==========================================================================
+  pub let layout_cratio_den : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_cratio_den extracts bits [24..48) via shr rax, 24 then and rax, 0xFFFFFF (imm32-safe). Pure leaf.",
+      block: {
+        mov rax, rdi;
+        shr rax, 24;
+        and rax, 0xFFFFFF;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // layout_split(parent, direction, constraints_ptr, count, out_rects_ptr)
+  //   -> u64
+  //
+  // Distributes parent's axis cells across `count` sub-rects according
+  // to the packed Constraint array and writes the results as packed
+  // Rects into the caller-provided out_rects_ptr buffer (u64[count]).
+  //
+  // Returns 0 on success, or one of:
+  //   LAYOUT_ERR_ZERO_COUNT       count == 0
+  //   LAYOUT_ERR_TOO_MANY         count > LAYOUT_MAX_CONSTRAINTS
+  //   LAYOUT_ERR_BAD_TAG          any constraint's tag not in 1..6
+  //   LAYOUT_ERR_BAD_RATIO        any Ratio with den == 0
+  //   LAYOUT_ERR_BAD_DIRECTION    direction >= 2
+  //
+  // Contract: constraints_ptr must point to `count` valid u64 words;
+  // out_rects_ptr must have room for `count` u64 words. Neither
+  // pointer is null-checked; a null pointer traps at first
+  // dereference (kernel page fault); this matches the same
+  // "callers-check-pointers" convention buffer.pdx's buffer_set /
+  // buffer_at family follows.
+  //
+  // Register plan across the whole body (5 callee-save regs + 1056-byte
+  // stack scratch):
+  //   rbx  = constraints_ptr (survives every phase)
+  //   r12  = allocs scratch base (rsp+0)
+  //   r13  = residuals scratch base (rsp+512)
+  //   r14  = count (survives every phase)
+  //   r15  = total_axis (phase 1), residual (phase 2 onward)
+  //
+  //   [rsp+  0..512)   allocs[64]     (u64 each; per-constraint allocation)
+  //   [rsp+512..1024)  residuals[64]  (u64 each; per-Fill fractional rem)
+  //   [rsp+1024..1032) parent         (packed rect, saved from rdi)
+  //   [rsp+1032..1040) direction      (saved from rsi)
+  //   [rsp+1040..1048) out_rects_ptr  (saved from r8)
+  //   [rsp+1048..1056) pad
+  //
+  // The 5-push + 1056 stack layout: entry rsp % 16 == 8; +40 (pushes) ->
+  // 48 == 0 mod 16; +1056 -> aligned (1056 = 66 * 16). Ready for any
+  // nested call the body might grow -- today there are none.
+  //
+  // Loop registers (per-phase, freely reused): rcx = byte offset (steps
+  // by 8 to walk u64 arrays), rax/rdx = multiply/divide targets, r8/r9/
+  // r10/rdi/rsi/r11 = per-phase scratch. r11 is safe here because the
+  // body emits `lea` only in the prologue (before r11 is ever loaded
+  // with data); paideia-as's LEA scratch discipline only bites when
+  // r11 must survive across a `lea` emit.
+  // ==========================================================================
+  pub let layout_split : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (parent: u64) (direction: u64) (constraints_ptr: u64) (count: u64) (out_rects_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-001 (postui#10): layout_split is the Hamilton-method integer apportionment engine. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes) + sub rsp, 1056 (66 x 16 = aligned); entry rsp%16 == 8, +1096 keeps rsp%16 == 0 -- ready for any nested call the body might grow (none today). Stack layout: [rsp+0..512) allocs[64], [rsp+512..1024) residuals[64], [rsp+1024..1032) saved parent, [rsp+1032..1040) saved direction, [rsp+1040..1048) saved out_rects_ptr, [rsp+1048..1056) pad. Register plan: rbx = constraints_ptr, r12 = allocs base, r13 = residuals base, r14 = count, r15 = total_axis then residual. Phase 0 (validation): reject count==0 (LAYOUT_ERR_ZERO_COUNT), count>64 (LAYOUT_ERR_TOO_MANY), direction>1 (LAYOUT_ERR_BAD_DIRECTION); each `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 64, 1); each `mov rax, imm` for the error sentinel emits movabs (imm > 0x7FFFFFFF, legal for mov). Phase 1 (base allocation, single pass): rcx walks byte offset 0..count*8 step 8; each iteration loads c = [rbx+rcx+0], extracts tag = c >> 56 (imm8 shift), dispatches via cmp/je chain on tags 1..6 (imm32-safe), computes base per kind (Length/Min/Max: base = c & 0xFFFFFF; Percentage: base = (r15*p)/100 via 2-op imul + xor rdx/div; Ratio: base = (r15*num)/den, trap den==0 as LAYOUT_ERR_BAD_RATIO; Fill: base = 0), stores base to [r12+rcx+0], accumulates sum_base in r10. Unknown tag falls through to LAYOUT_ERR_BAD_TAG. Phase 2: residual = max(0, total_axis - sum_base); stash in r15 (repurposed after total_axis is no longer needed). Phase 3 (largest-remainder apportionment): first pass sums Fill weights into r10 (sum_w); if r10 == 0 or r15 == 0 skip; second pass computes floor_i and remainder_i for each Fill (numerator = residual * w via 2-op imul rax,rdi; div via `xor rdx, rdx; div r10`; the result rax = floor and rdx = remainder ONLY if `mul` were used -- here 2-op imul truncates to 64 bits so we must clear rdx via xor before div. Actually 2-op imul does NOT touch rdx, so `mul rdi` would be needed to get the high half. Since our products fit u64 (u24 * u24 = u48), 2-op imul + xor rdx, rdx + div is safe: after 2-op imul the low 64 of the product is in rax; xor rdx clears the high half; div r10 gives quot=floor in rax and rem in rdx.). Store floor into allocs[i] (load-add-store: mov rdi, [r12+rcx+0]; add rdi, rax; mov [r12+rcx+0], rdi); store rem into residuals[i]; accumulate sum_floors in r8. Non-Fill constraints get residuals[i] = 0. Third pass (leftover distribution): leftover = residual - sum_floors; each iteration scans all Fill items to find the one with largest residual (tie-break lowest index via strict-greater compare + first-seen-wins), adds 1 to its alloc, zeros its residual, decrements leftover. Phase 4 (pack output rects): rsi walks running offset (adds alloc_i per iteration); r15 reloaded with parent, r10 reloaded with out_rects_ptr; each iteration extracts (x, y, w, h) per direction (horizontal: x = parent_x + offset, y = parent_y, w = alloc, h = parent_h; vertical: x = parent_x, y = parent_y + offset, w = parent_w, h = alloc), then packs into rax via and/shl/or (each mask 0xFFFF imm32-safe; each shift by 16/32/48 imm8-safe), stores rax to [r10+rcx+0]. Success: xor rax, rax; add rsp, 1056; 5-pop; ret. Every error path: mov rax, 0xFFFFEBAx (movabs); add rsp, 1056; 5-pop; ret via a shared epilogue. No `test` mnemonic. No 2-op `imul reg, imm` (all imul is 2-op reg,reg). No `and reg, imm64` (widest is 0xFFFFFF at 24 bits, imm32-safe). No cross-module or intra-module call. Labels prefixed ls_ per docs fingerprint discipline (ls_p1_/ls_p2_/ls_p3_/ls_p4_ per phase; ls_err_ for error arms; ls_epilogue for the shared return).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 1056;
+
+        // Save args to callee-save regs + stack slots.
+        mov [rsp + 1024], rdi;      // save parent
+        mov [rsp + 1032], rsi;      // save direction
+        mov [rsp + 1040], r8;       // save out_rects_ptr
+        mov rbx, rdx;               // rbx = constraints_ptr
+        mov r14, rcx;               // r14 = count
+        lea r12, [rsp + 0];         // r12 = allocs base
+        lea r13, [rsp + 512];       // r13 = residuals base
+
+        // Phase 0: validation.
+        cmp r14, 0;
+        je  ls_err_zero_count;
+        cmp r14, 64;
+        ja  ls_err_too_many;
+        cmp rsi, 1;
+        ja  ls_err_bad_direction;
+
+        // Extract total_axis (parent_w if horizontal, parent_h if vertical)
+        // into r15.
+        mov rax, rdi;               // rax = parent
+        cmp rsi, 0;
+        jne ls_axis_vertical;
+        // horizontal: total = (parent >> 32) & 0xFFFF
+        shr rax, 32;
+        and rax, 0xFFFF;
+        jmp ls_axis_done;
+      ls_axis_vertical:
+        // vertical: total = parent >> 48 (top 16 bits already zero-fill)
+        shr rax, 48;
+      ls_axis_done:
+        mov r15, rax;               // r15 = total_axis
+
+        // =====================================================================
+        // Phase 1: base allocation + sum.
+        // rcx = byte offset (0..count*8 step 8)
+        // r9  = end byte offset (count*8)
+        // r10 = sum_base
+        // =====================================================================
+        xor rcx, rcx;
+        xor r10, r10;
+        mov r9, r14;
+        shl r9, 3;                  // r9 = count * 8
+
+      ls_p1_top:
+        cmp rcx, r9;
+        jae ls_p1_done;
+
+        mov rax, [rbx + rcx + 0];
+        mov rdi, rax;
+        shr rdi, 56;                // rdi = tag
+
+        cmp rdi, 1;
+        je  ls_p1_scalar;           // Length
+        cmp rdi, 2;
+        je  ls_p1_percentage;
+        cmp rdi, 3;
+        je  ls_p1_ratio;
+        cmp rdi, 4;
+        je  ls_p1_scalar;           // Min (v1: acts as Length)
+        cmp rdi, 5;
+        je  ls_p1_scalar;           // Max (v1: acts as Length)
+        cmp rdi, 6;
+        je  ls_p1_fill;
+        jmp ls_err_bad_tag;
+
+      ls_p1_scalar:
+        // base = c & 0xFFFFFF
+        and rax, 0xFFFFFF;
+        mov [r12 + rcx + 0], rax;
+        add r10, rax;
+        jmp ls_p1_next;
+
+      ls_p1_percentage:
+        // base = floor(total_axis * p / 100)
+        and rax, 0xFFFFFF;          // rax = p
+        imul rax, r15;              // rax = p * total (u24 * u16 fits u40)
+        xor  rdx, rdx;              // clear high dividend
+        mov  rdi, 100;
+        div  rdi;                   // rax = quotient
+        mov  [r12 + rcx + 0], rax;
+        add  r10, rax;
+        jmp  ls_p1_next;
+
+      ls_p1_ratio:
+        // num = c & 0xFFFFFF; den = (c >> 24) & 0xFFFFFF
+        mov  rdi, rax;
+        and  rdi, 0xFFFFFF;         // rdi = num
+        mov  r8, rax;
+        shr  r8, 24;
+        and  r8, 0xFFFFFF;          // r8 = den
+        cmp  r8, 0;
+        je   ls_err_bad_ratio;
+        mov  rax, rdi;              // rax = num
+        imul rax, r15;              // rax = num * total
+        xor  rdx, rdx;
+        div  r8;                    // rax = quotient
+        mov  [r12 + rcx + 0], rax;
+        add  r10, rax;
+        jmp  ls_p1_next;
+
+      ls_p1_fill:
+        // base = 0; do not add to sum_base
+        xor rax, rax;
+        mov [r12 + rcx + 0], rax;
+        jmp ls_p1_next;
+
+      ls_p1_next:
+        add rcx, 8;
+        jmp ls_p1_top;
+
+      ls_p1_done:
+
+        // =====================================================================
+        // Phase 2: residual = max(0, total_axis - sum_base)
+        // Stash residual in r15 (repurposed; total_axis no longer needed).
+        // =====================================================================
+        cmp r15, r10;
+        jae ls_p2_pos;
+        xor r15, r15;               // over-constrained -> residual = 0
+        jmp ls_p2_done;
+      ls_p2_pos:
+        sub r15, r10;               // r15 = residual
+      ls_p2_done:
+
+        // =====================================================================
+        // Phase 3: distribute residual to Fill via largest-remainder.
+        // Skip if residual == 0.
+        // =====================================================================
+        cmp r15, 0;
+        je  ls_p3_done;
+
+        // Phase 3a: sum Fill weights into r10.
+        xor rcx, rcx;
+        xor r10, r10;               // r10 = sum_w
+
+      ls_p3_sumw_top:
+        cmp rcx, r9;
+        jae ls_p3_sumw_done;
+        mov rax, [rbx + rcx + 0];
+        mov rdi, rax;
+        shr rdi, 56;
+        cmp rdi, 6;
+        jne ls_p3_sumw_next;
+        and rax, 0xFFFFFF;
+        add r10, rax;
+      ls_p3_sumw_next:
+        add rcx, 8;
+        jmp ls_p3_sumw_top;
+      ls_p3_sumw_done:
+
+        // sum_w == 0 -> discard residual per contract (Fill(0) with no
+        // other Fill -> 0 cells).
+        cmp r10, 0;
+        je  ls_p3_done;
+
+        // Phase 3b: floor + remainder per Fill; non-Fill items get
+        // residuals[i] = 0 to keep the scan in Phase 3c well-formed.
+        // r8 accumulates sum_floors.
+        xor rcx, rcx;
+        xor r8, r8;
+
+      ls_p3_floor_top:
+        cmp rcx, r9;
+        jae ls_p3_floor_done;
+        mov rax, [rbx + rcx + 0];
+        mov rdi, rax;
+        shr rdi, 56;
+        cmp rdi, 6;
+        je  ls_p3_floor_fill;
+        // Non-Fill: zero the residual slot.
+        xor rdi, rdi;
+        mov [r13 + rcx + 0], rdi;
+        jmp ls_p3_floor_next;
+
+      ls_p3_floor_fill:
+        // rax has full constraint word; extract w into rax.
+        and rax, 0xFFFFFF;          // rax = w
+        imul rax, r15;              // rax = w * residual (u24 * u16 fits u40)
+        xor rdx, rdx;
+        div r10;                    // rax = floor, rdx = remainder
+        // allocs[i] += floor (load-add-store)
+        mov rdi, [r12 + rcx + 0];
+        add rdi, rax;
+        mov [r12 + rcx + 0], rdi;
+        // residuals[i] = remainder
+        mov [r13 + rcx + 0], rdx;
+        // sum_floors += floor
+        add r8, rax;
+
+      ls_p3_floor_next:
+        add rcx, 8;
+        jmp ls_p3_floor_top;
+      ls_p3_floor_done:
+
+        // Phase 3c: leftover = residual - sum_floors; distribute one
+        // cell at a time to Fill with largest remainder.
+        // rdi = leftover (loop var).
+        mov rdi, r15;
+        sub rdi, r8;
+
+      ls_p3_lr_top:
+        cmp rdi, 0;
+        je  ls_p3_done;
+
+        // Scan Fills for max residual. Tie-break: lowest index wins
+        // (first-seen kept unless strict-greater seen later).
+        // rcx = scan byte offset
+        // r8  = current max_rem
+        // rax = current max byte offset
+        // rdx = found flag (0/1)
+        xor rcx, rcx;
+        xor r8,  r8;
+        xor rax, rax;
+        xor rdx, rdx;
+
+      ls_p3_scan_top:
+        cmp rcx, r9;
+        jae ls_p3_scan_done;
+        mov rsi, [rbx + rcx + 0];
+        shr rsi, 56;
+        cmp rsi, 6;
+        jne ls_p3_scan_next;
+        // Fill: consult residuals[i]
+        mov rsi, [r13 + rcx + 0];
+        cmp rdx, 0;
+        je  ls_p3_scan_take;        // first Fill seen: take it
+        cmp rsi, r8;
+        jbe ls_p3_scan_next;        // not strict-greater: keep current
+      ls_p3_scan_take:
+        mov r8,  rsi;               // max_rem = residuals[i]
+        mov rax, rcx;               // max byte offset = current
+        mov rdx, 1;                 // found = 1
+      ls_p3_scan_next:
+        add rcx, 8;
+        jmp ls_p3_scan_top;
+
+      ls_p3_scan_done:
+        cmp rdx, 0;
+        je  ls_p3_done;             // defensive: no Fill found
+
+        // allocs[max] += 1
+        mov rsi, [r12 + rax + 0];
+        add rsi, 1;
+        mov [r12 + rax + 0], rsi;
+        // residuals[max] = 0 so subsequent scans do not re-pick this
+        // slot before other Fills have their turn.
+        xor rsi, rsi;
+        mov [r13 + rax + 0], rsi;
+        sub rdi, 1;
+        jmp ls_p3_lr_top;
+
+      ls_p3_done:
+
+        // =====================================================================
+        // Phase 4: pack output rects.
+        // r15 reloaded with parent; r10 reloaded with out_rects_ptr.
+        // rsi = running offset along the split axis (initialized 0).
+        // =====================================================================
+        mov r15, [rsp + 1024];      // parent
+        mov r10, [rsp + 1040];      // out_rects_ptr
+        xor rsi, rsi;               // offset
+        xor rcx, rcx;               // byte offset (walks 0..count*8)
+
+      ls_p4_top:
+        cmp rcx, r9;
+        jae ls_p4_done;
+
+        // Load alloc_i.
+        mov rax, [r12 + rcx + 0];
+
+        // Load direction fresh (kept on stack; cheap).
+        mov r11, [rsp + 1032];
+        cmp r11, 0;
+        jne ls_p4_vertical;
+
+        // Horizontal: x = parent_x + offset, y = parent_y,
+        //             w = alloc, h = parent_h.
+        mov  rdi, r15;
+        and  rdi, 0xFFFF;           // parent_x
+        add  rdi, rsi;              // + offset
+        and  rdi, 0xFFFF;           // mask to u16 defensively
+
+        mov  rdx, r15;
+        shr  rdx, 16;
+        and  rdx, 0xFFFF;           // parent_y
+
+        mov  r8, rax;
+        and  r8, 0xFFFF;            // w = alloc (masked to u16)
+
+        mov  r11, r15;
+        shr  r11, 48;               // h = parent_h (upper 16, auto-zero)
+        jmp  ls_p4_pack;
+
+      ls_p4_vertical:
+        // Vertical: x = parent_x, y = parent_y + offset,
+        //           w = parent_w, h = alloc.
+        mov  rdi, r15;
+        and  rdi, 0xFFFF;           // parent_x
+
+        mov  rdx, r15;
+        shr  rdx, 16;
+        and  rdx, 0xFFFF;           // parent_y
+        add  rdx, rsi;              // + offset
+        and  rdx, 0xFFFF;           // mask
+
+        mov  r8, r15;
+        shr  r8, 32;
+        and  r8, 0xFFFF;            // parent_w
+
+        mov  r11, rax;
+        and  r11, 0xFFFF;           // h = alloc
+
+      ls_p4_pack:
+        // Compose: x | y<<16 | w<<32 | h<<48
+        shl rdx, 16;
+        shl r8,  32;
+        shl r11, 48;
+        mov rax, rdi;
+        or  rax, rdx;
+        or  rax, r8;
+        or  rax, r11;
+        mov [r10 + rcx + 0], rax;
+
+        // Advance running offset by alloc_i.
+        mov rdi, [r12 + rcx + 0];
+        add rsi, rdi;
+
+        add rcx, 8;
+        jmp ls_p4_top;
+
+      ls_p4_done:
+        // Success return path.
+        xor rax, rax;
+        jmp ls_epilogue;
+
+        // =====================================================================
+        // Error return paths (shared epilogue). Every sentinel is above
+        // 0x7FFFFFFF; paideia-as emits movabs for the mov reg, imm form
+        // (legal for mov, NOT for cmp/and).
+        // =====================================================================
+      ls_err_zero_count:
+        mov rax, 0xFFFFEBA0;
+        jmp ls_epilogue;
+
+      ls_err_too_many:
+        mov rax, 0xFFFFEBA1;
+        jmp ls_epilogue;
+
+      ls_err_bad_tag:
+        mov rax, 0xFFFFEBA2;
+        jmp ls_epilogue;
+
+      ls_err_bad_ratio:
+        mov rax, 0xFFFFEBA3;
+        jmp ls_epilogue;
+
+      ls_err_bad_direction:
+        mov rax, 0xFFFFEBA4;
+        jmp ls_epilogue;
+
+      ls_epilogue:
+        add rsp, 1056;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

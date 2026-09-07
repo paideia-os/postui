@@ -38,6 +38,7 @@ sources:
   - src/frame.pdx                 # M1-005: Frame/Terminal driver loop
   - src/block.pdx                 # M1-006: Block widget (borders, title, padding)
   - src/widget_kind.pdx           # M1-007: WidgetKind closed enum + widget_draw dispatch
+  - src/layout.pdx                # M2-001: Layout engine (integer constraint distribution)
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at
