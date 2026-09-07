@@ -88,7 +88,7 @@ mkdir -p "$BUILD_DIR"
 FAIL=0
 COUNT=0
 
-for pdx in src/*.pdx src/widgets/*.pdx; do
+for pdx in src/*.pdx src/widgets/*.pdx src/input/*.pdx; do
     [ -f "$pdx" ] || continue
     COUNT=$((COUNT + 1))
     base="$(basename "$pdx")"

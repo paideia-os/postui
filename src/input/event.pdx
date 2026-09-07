@@ -1,0 +1,348 @@
+// src/input/event.pdx -- postui.M4-005 (paideia-os/postui#31)
+//
+// Event: 16-byte input-event record shared between esc_parser and any
+//        widget-facing input handler.
+//
+// =============================================================================
+// WIRE FORMAT (docs/design.md §2.5, §2.7)
+// =============================================================================
+//
+// An Event is exactly 16 bytes on the wire, two u64 slots at byte offsets:
+//
+//   [+0..+8)   kind    u64   EVENT_KIND_* ordinal (0=Key, 1=Resize,
+//                            2=Mouse, 3=Paste); the discriminator every
+//                            downstream `handle(event)` switches on.
+//   [+8..+16)  payload u64   Kind-specific packed field (see PAYLOAD
+//                            LAYOUT below); interpretation depends on
+//                            kind.
+//
+// Two u64 slots rather than one packed word because a Mouse payload
+// (row/col/button/flags) already saturates u64 on its own; splitting kind
+// out into a separate word keeps every payload a full u64 and lets a
+// switch-on-kind be one memory load rather than a mask-and-shift.
+//
+// This module ships the wire-format constants + a handful of pack/unpack
+// leaf helpers. The actual state machine that produces Events from raw
+// bytes lives in esc_parser.pdx (M4-005 companion file); a widget-facing
+// handler (Frame::next_event downstream at M4-007 primary-path switch)
+// consumes them.
+//
+// =============================================================================
+// PAYLOAD LAYOUT
+// =============================================================================
+//
+// Key (kind=0):
+//   bits [ 0..32)   keycode  -- ASCII value (0..0xFF) for a printable /
+//                              control byte the parser passed through
+//                              verbatim, or a KEY_* special-code
+//                              (>= 0x1000) for arrow / function / named
+//                              editing keys the parser recognised out
+//                              of a CSI / SS3 sequence.
+//   bits [32..40)   modifiers -- EVENT_MOD_* bitmask (Shift=1, Ctrl=2,
+//                              Alt=4). The M4-005 parser always emits
+//                              modifiers=0; the CSI param-set that
+//                              carries them (e.g. CSI 1;5 A = Ctrl+Up)
+//                              lands at M4-006.
+//   bits [40..64)   reserved -- zero on emit.
+//
+// Resize (kind=1):
+//   bits [ 0..16)   cols     -- new column count (1..RECT_DIM_MAX-ish)
+//   bits [16..32)   rows     -- new row count
+//   bits [32..64)   reserved -- zero on emit.
+//
+// Mouse (kind=2, encoding reserved for M4-006 -- postui#32):
+//   bits [ 0..16)   button   -- EVENT_MOUSE_* ordinal
+//   bits [16..32)   col
+//   bits [32..48)   row
+//   bit  48         press (0) / release (1)
+//   bit  49         drag
+//   bits [50..64)   reserved
+//
+// Paste (kind=3, deferred to M4-006): payload TBD; the M4-005 parser
+// drops OSC content entirely rather than materialising a partial paste
+// record.
+//
+// =============================================================================
+// SPECIAL KEYCODES
+// =============================================================================
+//
+// Every special keycode is >= 0x1000 so a caller can disambiguate against
+// the ASCII 0..0xFF range with a single `cmp keycode, 0x1000; jae ...`.
+// The parser emits KEY_UP/DOWN/RIGHT/LEFT/HOME/END/PAGE_UP/PAGE_DOWN
+// from recognised CSI sequences, KEY_DELETE from CSI 3~, and KEY_F1..F4
+// from SS3 P/Q/R/S at M4-005. KEY_F5..F12 are declared but not yet
+// emitted (they arrive as CSI 15~..24~; the parser table lands at
+// M4-006 alongside mouse). KEY_ESC / KEY_ENTER / KEY_TAB / KEY_BACKSPACE
+// are declared for consumer convenience -- the parser passes 0x1B (bare
+// ESC never surfaces because every ESC starts a sequence attempt), 0x0D
+// (CR), 0x09 (TAB) and 0x08/0x7F (BS/DEL-as-BS) through as raw ASCII
+// keycodes so a consumer wanting the named form must translate the
+// ASCII themselves; the constants provide a stable name to compare
+// against.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Event`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - r11 reserved as LEA scratch (not used in this leaf module).
+//   - All immediates in `cmp reg, imm` and `and reg, imm` fit imm32
+//     (<= 0x7FFFFFFF): 0xFFFF (65535), 0xFF (255), 0xFFFFFFFF NOT used
+//     as an imm (masked via shl 32; shr 32 pair instead).
+//   - No 2-op `imul reg, imm`; no `imul` at all in this module.
+//   - Every function is a pure leaf (no memory unless the helper is a
+//     packed-Event accessor); pack helpers are register-only, unpack
+//     helpers touch [rdi]/[rdi+8] via qword loads only.
+//   - Labels: none (every helper is straight-line, no branch).
+
+module Event = structure {
+
+  // ==========================================================================
+  // Sizing / offset constants (locked at M4-005; every accessor below
+  // indexes against these named offsets so a downstream reader can
+  // trace every displacement back to docs/design.md §2.5 without
+  // reading raw numerals in the body).
+  // ==========================================================================
+
+  pub let EVENT_BYTES        : u64 = 16
+  pub let EVENT_OFF_KIND     : u64 = 0
+  pub let EVENT_OFF_PAYLOAD  : u64 = 8
+
+  // ==========================================================================
+  // Kind ordinals. Named rather than positional so a downstream trace
+  // stays readable.
+  // ==========================================================================
+
+  pub let EVENT_KIND_KEY     : u64 = 0
+  pub let EVENT_KIND_RESIZE  : u64 = 1
+  pub let EVENT_KIND_MOUSE   : u64 = 2
+  pub let EVENT_KIND_PASTE   : u64 = 3
+
+  // ==========================================================================
+  // Modifier bitmask (bits [32..40) of a Key payload).
+  // ==========================================================================
+
+  pub let EVENT_MOD_SHIFT    : u64 = 1
+  pub let EVENT_MOD_CTRL     : u64 = 2
+  pub let EVENT_MOD_ALT      : u64 = 4
+
+  // ==========================================================================
+  // Mouse button ordinals (M4-006 payload; declared here so the enum
+  // sits with the rest of the event constants).
+  // ==========================================================================
+
+  pub let EVENT_MOUSE_LEFT       : u64 = 0
+  pub let EVENT_MOUSE_MIDDLE     : u64 = 1
+  pub let EVENT_MOUSE_RIGHT      : u64 = 2
+  pub let EVENT_MOUSE_WHEEL_UP   : u64 = 3
+  pub let EVENT_MOUSE_WHEEL_DOWN : u64 = 4
+
+  // ==========================================================================
+  // Special keycodes (>= 0x1000 to disambiguate from ASCII).
+  //
+  // Arrow + editing cluster: 0x1001..0x100F. F-keys: 0x1101..0x110C.
+  // Named ASCII-adjacent keys (ESC/ENTER/TAB/BACKSPACE) also >=0x1000
+  // even though the parser emits them as raw ASCII -- the named
+  // constant is provided for consumer readability.
+  // ==========================================================================
+
+  pub let KEY_UP         : u64 = 0x1001
+  pub let KEY_DOWN       : u64 = 0x1002
+  pub let KEY_RIGHT      : u64 = 0x1003
+  pub let KEY_LEFT       : u64 = 0x1004
+  pub let KEY_HOME       : u64 = 0x1005
+  pub let KEY_END        : u64 = 0x1006
+  pub let KEY_PAGE_UP    : u64 = 0x1007
+  pub let KEY_PAGE_DOWN  : u64 = 0x1008
+  pub let KEY_DELETE     : u64 = 0x1009
+  pub let KEY_INSERT     : u64 = 0x100A
+  pub let KEY_ESC        : u64 = 0x100B
+  pub let KEY_ENTER      : u64 = 0x100C
+  pub let KEY_TAB        : u64 = 0x100D
+  pub let KEY_BACKSPACE  : u64 = 0x100E
+
+  pub let KEY_F1         : u64 = 0x1101
+  pub let KEY_F2         : u64 = 0x1102
+  pub let KEY_F3         : u64 = 0x1103
+  pub let KEY_F4         : u64 = 0x1104
+  pub let KEY_F5         : u64 = 0x1105
+  pub let KEY_F6         : u64 = 0x1106
+  pub let KEY_F7         : u64 = 0x1107
+  pub let KEY_F8         : u64 = 0x1108
+  pub let KEY_F9         : u64 = 0x1109
+  pub let KEY_F10        : u64 = 0x110A
+  pub let KEY_F11        : u64 = 0x110B
+  pub let KEY_F12        : u64 = 0x110C
+
+  // ==========================================================================
+  // event_pack_key(keycode, modifiers) -> u64  (packed Key payload)
+  //
+  // Packs a Key payload into one u64: keycode in bits [0..32), modifiers
+  // in bits [32..40), reserved zero elsewhere. Masks each field before
+  // OR so a caller with junk in the high bits of either arg truncates
+  // deterministically rather than corrupting a neighbouring slot.
+  //
+  // Register plan: rdi=keycode, rsi=modifiers, rax=return accumulator.
+  // Pure leaf.
+  // ==========================================================================
+
+  pub let event_pack_key : (u64, u64) -> u64 !{} @{} =
+    fn (keycode: u64) (modifiers: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_pack_key composes a Key payload as keycode[0..32) | modifiers[32..40). Truncate keycode to 32 bits via shl 32; shr 32 (avoids the imm64 0xFFFFFFFF mask that would violate the cmp/and imm32 gate). Mask modifiers to 8 bits with `and rsi, 0xFF` (0xFF fits imm32); shift into slot 32; OR into rax. Pure leaf: no memory access, no callee-save touched. Immediates: shift counts 32, 8 fit imm8; 0xFF fits imm32.",
+      block: {
+        mov rax, rdi;
+        shl rax, 32;
+        shr rax, 32;
+
+        and rsi, 0xFF;
+        shl rsi, 32;
+        or  rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // event_pack_resize(cols, rows) -> u64  (packed Resize payload)
+  //
+  // Packs a Resize payload: cols in bits [0..16), rows in bits [16..32),
+  // reserved zero elsewhere. Same masking discipline as event_pack_key.
+  // ==========================================================================
+
+  pub let event_pack_resize : (u64, u64) -> u64 !{} @{} =
+    fn (cols: u64) (rows: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_pack_resize composes a Resize payload as cols[0..16) | rows[16..32). Mask each u16 arg via `and reg, 0xFFFF` (0xFFFF=65535 fits imm32) before shifting rows into slot 16; OR into rax. Pure leaf; no memory access.",
+      block: {
+        and rdi, 0xFFFF;
+        and rsi, 0xFFFF;
+        shl rsi, 16;
+        mov rax, rdi;
+        or  rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // event_write_key(dst, keycode, modifiers) -> ()
+  //
+  // Serialize a Key event into 16 bytes at [dst..dst+16): kind=0 at
+  // [dst+0], packed key payload at [dst+8]. Used by esc_parser.pdx
+  // (M4-005 companion) at every emit-key path.
+  //
+  // Register plan: rdi=dst, rsi=keycode, rdx=modifiers, rax=scratch.
+  // Two 8-byte stores. Effect `!{mem}`.
+  // ==========================================================================
+
+  pub let event_write_key : (u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (keycode: u64) (modifiers: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_write_key writes a 16-byte Key event at [rdi]. Store kind=0 at [rdi+0] via xor rax,rax then mov [rdi+0], rax. Compose payload = keycode[0..32) | modifiers[32..40) into rax via shl 32/shr 32 truncation of keycode and `and rdx, 0xFF; shl rdx, 32` for modifiers; OR; store at [rdi+8]. 0xFF fits imm32; shift counts 32, 8 fit imm8. No callee-save touched, no push/pop. Effect !{mem} (two 8-byte stores).",
+      block: {
+        // kind = 0 at [rdi+0]
+        xor rax, rax;
+        mov [rdi + 0], rax;
+
+        // payload = keycode[0..32) | modifiers[32..40)
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;
+        and rdx, 0xFF;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [rdi + 8], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // event_write_resize(dst, cols, rows) -> ()
+  //
+  // Serialize a Resize event into 16 bytes at [dst..dst+16): kind=1 at
+  // [dst+0], packed resize payload at [dst+8]. Consumed by a downstream
+  // Frame::next_event that surfaces a SIGWINCH-shaped resize as a real
+  // Event; the M4-005 parser itself never emits Resize (bytes carrying
+  // a resize arrive out-of-band, not through the ESC stream).
+  // ==========================================================================
+
+  pub let event_write_resize : (u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (cols: u64) (rows: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_write_resize writes a 16-byte Resize event at [rdi]. Store kind=1 at [rdi+0]. Compose payload = cols[0..16) | rows[16..32) via `and rsi, 0xFFFF; and rdx, 0xFFFF; shl rdx, 16; mov rax, rsi; or rax, rdx`; store at [rdi+8]. 0xFFFF fits imm32; shift count 16 fits imm8. No callee-save, no push/pop. Effect !{mem} (two 8-byte stores).",
+      block: {
+        mov rax, 1;
+        mov [rdi + 0], rax;
+
+        and rsi, 0xFFFF;
+        and rdx, 0xFFFF;
+        shl rdx, 16;
+        mov rax, rsi;
+        or  rax, rdx;
+        mov [rdi + 8], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // event_kind(src) -> u64
+  // event_payload(src) -> u64
+  //
+  // Field accessors for the two u64 slots. Cheap qword loads; kept as
+  // named helpers so a consumer never re-derives the wire layout
+  // independently.
+  // ==========================================================================
+
+  pub let event_kind : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_kind returns the u64 kind slot at [rdi+0]. One qword load; pure leaf; effect !{mem}.",
+      block: {
+        mov rax, [rdi + 0];
+        ret;
+      }
+    }
+
+  pub let event_payload : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_payload returns the u64 payload slot at [rdi+8]. One qword load; pure leaf; effect !{mem}.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // event_key_code(src) -> u64  (low 32 bits of payload, zero-extended)
+  // event_key_mods(src) -> u64  (bits [32..40) of payload, zero-extended)
+  //
+  // Sub-field accessors for a Key payload. Undefined behaviour if kind
+  // != EVENT_KIND_KEY -- caller is expected to gate on event_kind first.
+  // ==========================================================================
+
+  pub let event_key_code : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_key_code loads payload at [rdi+8], truncates to low 32 bits via shl 32; shr 32 (avoids imm64 0xFFFFFFFF mask). Pure leaf; effect !{mem}.",
+      block: {
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      }
+    }
+
+  pub let event_key_mods : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): event_key_mods loads payload at [rdi+8], shifts right 32, masks 0xFF to isolate the 8-bit modifier slot. Pure leaf; 0xFF fits imm32; effect !{mem}.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        and rax, 0xFF;
+        ret;
+      }
+    }
+
+}

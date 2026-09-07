@@ -1,0 +1,452 @@
+// src/input/esc_parser.pdx -- postui.M4-005 (paideia-os/postui#31)
+//
+// EscParser: byte-oriented CSI/SS3/OSC escape-sequence state machine.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.5, §2.7)
+// =============================================================================
+//
+// This module ships the state machine that turns raw bytes coming off
+// Frame::next_event (sys_read(0) fallback today, KIND_TTY raw-mode at
+// M4-007) into decoded `Event` records the widget-facing handler at
+// docs/design.md §2.7 consumes.
+//
+// The machine recognises three canonical VT sequence families:
+//
+//   * CSI: ESC [ <params> <final>            e.g. ESC [ A = Up arrow
+//   * SS3: ESC O <final>                     e.g. ESC O P = F1
+//   * OSC: ESC ] <text> <BEL | ESC \>        used by bracketed-paste
+//
+// docs/design.md §2.5 (last paragraph) frames the parser as: "a small
+// state machine over three prefixes -- CSI, SS3, OSC -- accumulating
+// parameter bytes until a final byte in the appropriate range terminates
+// the sequence, then mapping the recognized sequence to an Event. This
+// is ordinary byte-oriented state-machine logic (a match over
+// (state, byte) pairs)."
+//
+// This M4-005 landing implements every state transition the widget
+// catalogue actually needs at v1: arrow keys, HOME/END/PGUP/PGDN/DELETE
+// via CSI numeric tilde, and F1..F4 via SS3. Mouse (CSI < ... M) and
+// bracketed-paste (OSC 200 ~ ... OSC 201 ~) are declared reserved but
+// dropped -- their landing is postui.M4-006 (postui#32).
+//
+// =============================================================================
+// ESCPARSERSTATE LAYOUT (32 bytes, caller-allocated)
+// =============================================================================
+//
+//   [+0]   state       (u64)   ESC_STATE_* ordinal (0=Idle .. 4=OSC)
+//   [+8]   param0      (u64)   first accumulated numeric parameter
+//                              (0 when no digit has been consumed yet)
+//   [+16]  param1      (u64)   second accumulated numeric parameter
+//                              (reserved for M4-006 mouse/modifier
+//                              extension; left at 0 by M4-005)
+//   [+24]  reserved    (u64)   zero on the wire; keeps the struct at a
+//                              round 32 bytes and leaves room for a
+//                              future paste-buffer index without
+//                              breaking existing callers
+//
+// The state slot is caller-allocated (a stack local, a widget-owned
+// static, whichever suits) rather than a module-level singleton because
+// a downstream may want to run more than one parser in parallel (e.g.
+// one per multiplexed TTY once postui grows a multi-tab shell). Keeping
+// the slot per-call also matches the shape esc_parser_init/feed's ptr
+// arg carries -- a global would have made ptr redundant.
+//
+// =============================================================================
+// STATE MACHINE (docs/design.md §2.5)
+// =============================================================================
+//
+//   Idle:
+//     byte == 0x1B (ESC)        -> SawEsc  (no event)
+//     otherwise                 -> Idle    (emit Key(byte))
+//
+//   SawEsc:
+//     byte == '[' (0x5B)        -> CSI     (clear params, no event)
+//     byte == 'O' (0x4F)        -> SS3     (no event)
+//     byte == ']' (0x5D)        -> OSC     (no event)
+//     otherwise                 -> Idle    (invalid, drop)
+//
+//   CSI:
+//     byte in '0'..'9'          -> CSI     (param0 = param0*10 + digit)
+//     byte == 'A' (0x41)        -> Idle    (emit Key(KEY_UP))
+//     byte == 'B' (0x42)        -> Idle    (emit Key(KEY_DOWN))
+//     byte == 'C' (0x43)        -> Idle    (emit Key(KEY_RIGHT))
+//     byte == 'D' (0x44)        -> Idle    (emit Key(KEY_LEFT))
+//     byte == '~' (0x7E)        -> Idle    (emit Key(param0-mapped))
+//       param0=1 -> KEY_HOME
+//       param0=3 -> KEY_DELETE
+//       param0=4 -> KEY_END
+//       param0=5 -> KEY_PAGE_UP
+//       param0=6 -> KEY_PAGE_DOWN
+//       otherwise -> Idle (drop)
+//     otherwise                 -> Idle    (invalid, drop)
+//
+//   SS3:
+//     byte == 'P' (0x50)        -> Idle    (emit Key(KEY_F1))
+//     byte == 'Q' (0x51)        -> Idle    (emit Key(KEY_F2))
+//     byte == 'R' (0x52)        -> Idle    (emit Key(KEY_F3))
+//     byte == 'S' (0x53)        -> Idle    (emit Key(KEY_F4))
+//     otherwise                 -> Idle    (invalid, drop)
+//
+//   OSC:
+//     byte == 0x07 (BEL)        -> Idle    (drop; paste at M4-006)
+//     byte == 0x1B (ESC)        -> Idle    (drop; ESC \ terminator
+//                                            simplified to plain reset)
+//     otherwise                 -> OSC     (consume, no event)
+//
+// Invalid transitions call the same ep_reset_ret0 arm: state -> Idle,
+// params zeroed, return 0. The parser NEVER surfaces a parse error to
+// the caller; drop-on-invalid is the standard VT-parser posture and
+// keeps a garbled TTY stream from wedging the widget-facing loop.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`EscParser`), matches file
+//     basename (esc_parser.pdx -> EscParser per PascalCase mapping;
+//     underscores collapse and each segment capitalises, mirroring
+//     the widget_kind.pdx -> WidgetKind precedent).
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - r11 is scratch (paideia-as conformance); not used in this module.
+//   - Every immediate in `cmp reg, imm` and `and reg, imm` fits imm32
+//     (<= 0x7FFFFFFF): 0..0x7E (ASCII), 0xFF (mask), 10 (radix). The
+//     KEY_* constants (max 0x110C = 4364) are all well within imm32.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall); the CSI accumulator
+//     multiplies by 10 via a scratch register (mov r8, 10; imul rax, r8)
+//     -- 2-op imul reg,reg is the accepted shape.
+//   - No `mul` (unsigned mul is a pitfall; imul is the only shape used).
+//   - Every function is pointer-driven; effect row `!{mem} @{}` on both.
+//   - Labels prefixed `ep_` per docs/design.md fingerprint discipline.
+//     Sub-labels use ep_<state>_<action> (ep_csi_up, ep_ss3_f1, etc.)
+//     so a downstream disassembly trace maps back to the state table
+//     without cross-referencing.
+//   - No callee-save touched, no push/pop in either function -- every
+//     scratch is caller-save (rax, rdi, rsi, rdx, r8, r9) and the
+//     function is a leaf.
+
+module EscParser = structure {
+
+  // ==========================================================================
+  // Sizing / offset constants.
+  // ==========================================================================
+
+  pub let ESC_PARSER_STATE_BYTES : u64 = 32
+
+  pub let ESC_PARSER_OFF_STATE    : u64 = 0
+  pub let ESC_PARSER_OFF_PARAM0   : u64 = 8
+  pub let ESC_PARSER_OFF_PARAM1   : u64 = 16
+  pub let ESC_PARSER_OFF_RESERVED : u64 = 24
+
+  // ==========================================================================
+  // State ordinals. Named rather than positional; the cmp/je dispatch
+  // in esc_parser_feed compares against these literals directly. Kept
+  // as pub let for consumer observability (a downstream can peek at
+  // [state_ptr+0] and know what state the parser is in).
+  // ==========================================================================
+
+  pub let ESC_STATE_IDLE    : u64 = 0
+  pub let ESC_STATE_SAW_ESC : u64 = 1
+  pub let ESC_STATE_CSI     : u64 = 2
+  pub let ESC_STATE_SS3     : u64 = 3
+  pub let ESC_STATE_OSC     : u64 = 4
+
+  // ==========================================================================
+  // Error band anchor (defensive; the parser never returns an error to
+  // the caller -- invalid sequences drop silently, matching every
+  // production VT parser -- but the band is reserved so a future
+  // instrumentation build can surface a fault code without colliding
+  // with Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80) or the frame band
+  // (0xFFFFEB90). 0xFFFFEBE8 sits in the wave-scoped tail slice.
+  // ==========================================================================
+
+  pub let ESC_ERR_BAND : u64 = 0xFFFFEBE8
+
+  // ==========================================================================
+  // esc_parser_init(slot_ptr) -> ()
+  //
+  // Zero-init a 32-byte EscParserState at [slot_ptr..slot_ptr+32). Every
+  // field starts at ESC_STATE_IDLE=0 / param0=0 / param1=0 / reserved=0;
+  // four qword stores, no callee-save touched.
+  //
+  // Register plan: rdi=slot_ptr, rax=zero source. Pure store leaf.
+  // Effect `!{mem}` (four 8-byte stores).
+  // ==========================================================================
+
+  pub let esc_parser_init : (u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): esc_parser_init zeroes a 32-byte EscParserState at [rdi]. xor rax, rax then four 8-byte stores at [rdi+0], [rdi+8], [rdi+16], [rdi+24] -- state=Idle=0, param0=0, param1=0, reserved=0. Pure leaf: no callee-save touched, no push/pop. Effect !{mem} (four 8-byte stores).",
+      block: {
+        xor rax, rax;
+        mov [rdi + 0],  rax;
+        mov [rdi + 8],  rax;
+        mov [rdi + 16], rax;
+        mov [rdi + 24], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // esc_parser_feed(state_ptr, byte, out_event_ptr) -> u64
+  //
+  // Feed one byte to the state machine. Returns 1 iff a complete Event
+  // has been written to [out_event_ptr..out_event_ptr+16); returns 0
+  // otherwise (either the machine is mid-sequence and needs more bytes,
+  // or the byte terminated an invalid sequence and the parser has
+  // silently reset to Idle).
+  //
+  // On every "reset" path (invalid sequence, event emission), state is
+  // set to Idle and param0/param1 are zeroed. The caller may re-invoke
+  // immediately with the next byte from the same buffer -- there is no
+  // ordering constraint between feed calls.
+  //
+  // Register plan: rdi = state_ptr (preserved across every internal
+  // branch), rsi = byte (masked to 0xFF at entry so a caller with
+  // junk in the high 56 bits is not silently mis-classified), rdx =
+  // out_event_ptr (preserved across every internal branch), rax =
+  // state / arithmetic scratch / return, r8 = per-branch scratch
+  // (radix, byte-swap staging), r9 = keycode staging for the shared
+  // emit-key-and-reset arm.
+  //
+  // No callee-save touched, no push/pop -- every function-local
+  // register is caller-save, and this is a leaf (no nested call).
+  // Effect `!{mem} @{}` (loads state, stores state + Event bytes).
+  //
+  // Labels prefixed `ep_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+
+  pub let esc_parser_feed : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (byte: u64) (out_event_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-005 (#31): esc_parser_feed is the byte-driven state machine driver. Entry masks byte to 0xFF (defensive: caller with junk in high bits would silently mis-classify against 0x1B / '[' / etc. compares). State dispatch is a cmp/je chain on [rdi+0]: 0=Idle -> ep_state_idle; 1=SawEsc -> ep_state_sawesc; 2=CSI -> ep_state_csi; 3=SS3 -> ep_state_ss3; 4=OSC -> ep_state_osc; anything else falls through to ep_reset_ret0 (defensive against a corrupted slot). Each arm mirrors the table at the top of the module: Idle branches on byte==0x1B (jump to SawEsc-transition helper) else emits Key(byte); SawEsc branches on '['/'O'/']' to CSI/SS3/OSC transition (with CSI's param0/param1 pre-zero) else falls through to reset; CSI branches on 0x30..0x39 for digit accumulation (param0 = param0*10 + (byte - 0x30) via mov r8, 10; imul rax, r8 -- 2-op imul reg,reg, the accepted shape), then on 'A'/'B'/'C'/'D' to arrow-emit helpers, then on '~' to the param0-indexed tilde table (1/3/4/5/6 -> HOME/DELETE/END/PGUP/PGDN), else reset; SS3 branches on 'P'/'Q'/'R'/'S' to F1..F4, else reset; OSC drops every non-terminator, resets on BEL (0x07) or ESC (0x1B). Every emit-key path centralises in ep_emit_key_and_reset, which stores kind=0 at [rdx+0], stores keycode (r9) as payload at [rdx+8], zeroes state/param0/param1, and returns rax=1. Every no-event path returns xor rax, rax=0. Every immediate in cmp/and fits imm32 (0..0x7E ASCII, 0xFF mask, 10 radix, KEY_* constants max 0x110C=4364). No test, no mul, no 2-op imul reg,imm, no cmp reg,[mem]. No callee-save touched, no push/pop. Effect !{mem} (state loads/stores and event stores). Labels ep_state_*/ep_csi_*/ep_ss3_*/ep_sawesc_*/ep_emit_key_and_reset/ep_reset_ret0 per fingerprint discipline.",
+      block: {
+        // ---- Entry: normalise byte to low 8 bits ------------------------
+        and rsi, 0xFF;
+
+        // ---- Dispatch on current state ----------------------------------
+        mov rax, [rdi + 0];
+        cmp rax, 0;
+        je  ep_state_idle;
+        cmp rax, 1;
+        je  ep_state_sawesc;
+        cmp rax, 2;
+        je  ep_state_csi;
+        cmp rax, 3;
+        je  ep_state_ss3;
+        cmp rax, 4;
+        je  ep_state_osc;
+        jmp ep_reset_ret0;
+
+        // -----------------------------------------------------------------
+        // Idle: pass byte through as Key(byte), unless byte==ESC in which
+        // case transition to SawEsc without emitting.
+        // -----------------------------------------------------------------
+      ep_state_idle:
+        cmp rsi, 0x1B;
+        je  ep_idle_to_sawesc;
+
+        // Emit Key(byte). kind=0 at [rdx+0]; payload=byte at [rdx+8].
+        xor rax, rax;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], rsi;
+        mov rax, 1;
+        ret;
+
+      ep_idle_to_sawesc:
+        mov rax, 1;
+        mov [rdi + 0], rax;
+        xor rax, rax;
+        ret;
+
+        // -----------------------------------------------------------------
+        // SawEsc: pick a prefix (CSI/SS3/OSC) or drop.
+        // -----------------------------------------------------------------
+      ep_state_sawesc:
+        cmp rsi, 0x5B;
+        je  ep_sawesc_to_csi;
+        cmp rsi, 0x4F;
+        je  ep_sawesc_to_ss3;
+        cmp rsi, 0x5D;
+        je  ep_sawesc_to_osc;
+        jmp ep_reset_ret0;
+
+      ep_sawesc_to_csi:
+        // Zero params before entering CSI (param0 is the accumulator).
+        xor rax, rax;
+        mov [rdi + 8],  rax;
+        mov [rdi + 16], rax;
+        mov rax, 2;
+        mov [rdi + 0], rax;
+        xor rax, rax;
+        ret;
+
+      ep_sawesc_to_ss3:
+        mov rax, 3;
+        mov [rdi + 0], rax;
+        xor rax, rax;
+        ret;
+
+      ep_sawesc_to_osc:
+        mov rax, 4;
+        mov [rdi + 0], rax;
+        xor rax, rax;
+        ret;
+
+        // -----------------------------------------------------------------
+        // CSI: accumulate digits into param0, dispatch on final byte.
+        // -----------------------------------------------------------------
+      ep_state_csi:
+        // Digit? (byte in 0x30..0x39)
+        cmp rsi, 0x30;
+        jb  ep_csi_final;
+        cmp rsi, 0x39;
+        ja  ep_csi_final;
+
+        // param0 = param0 * 10 + (byte - 0x30)
+        mov rax, [rdi + 8];
+        mov r8, 10;
+        imul rax, r8;
+        mov r8, rsi;
+        sub r8, 0x30;
+        add rax, r8;
+        mov [rdi + 8], rax;
+        xor rax, rax;
+        ret;
+
+      ep_csi_final:
+        cmp rsi, 0x41;
+        je  ep_csi_up;
+        cmp rsi, 0x42;
+        je  ep_csi_down;
+        cmp rsi, 0x43;
+        je  ep_csi_right;
+        cmp rsi, 0x44;
+        je  ep_csi_left;
+        cmp rsi, 0x7E;
+        je  ep_csi_tilde;
+        jmp ep_reset_ret0;
+
+      ep_csi_up:
+        mov r9, 0x1001;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_down:
+        mov r9, 0x1002;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_right:
+        mov r9, 0x1003;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_left:
+        mov r9, 0x1004;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde:
+        // Map param0 to a keycode; drop on unrecognised.
+        mov rax, [rdi + 8];
+        cmp rax, 1;
+        je  ep_csi_tilde_home;
+        cmp rax, 3;
+        je  ep_csi_tilde_delete;
+        cmp rax, 4;
+        je  ep_csi_tilde_end;
+        cmp rax, 5;
+        je  ep_csi_tilde_pgup;
+        cmp rax, 6;
+        je  ep_csi_tilde_pgdn;
+        jmp ep_reset_ret0;
+
+      ep_csi_tilde_home:
+        mov r9, 0x1005;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde_delete:
+        mov r9, 0x1009;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde_end:
+        mov r9, 0x1006;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde_pgup:
+        mov r9, 0x1007;
+        jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde_pgdn:
+        mov r9, 0x1008;
+        jmp ep_emit_key_and_reset;
+
+        // -----------------------------------------------------------------
+        // SS3: F1..F4 via ESC O P/Q/R/S.
+        // -----------------------------------------------------------------
+      ep_state_ss3:
+        cmp rsi, 0x50;
+        je  ep_ss3_f1;
+        cmp rsi, 0x51;
+        je  ep_ss3_f2;
+        cmp rsi, 0x52;
+        je  ep_ss3_f3;
+        cmp rsi, 0x53;
+        je  ep_ss3_f4;
+        jmp ep_reset_ret0;
+
+      ep_ss3_f1:
+        mov r9, 0x1101;
+        jmp ep_emit_key_and_reset;
+
+      ep_ss3_f2:
+        mov r9, 0x1102;
+        jmp ep_emit_key_and_reset;
+
+      ep_ss3_f3:
+        mov r9, 0x1103;
+        jmp ep_emit_key_and_reset;
+
+      ep_ss3_f4:
+        mov r9, 0x1104;
+        jmp ep_emit_key_and_reset;
+
+        // -----------------------------------------------------------------
+        // OSC: drop payload; reset on BEL or ESC. Bracketed-paste
+        //      surfacing lands at M4-006 (postui#32).
+        // -----------------------------------------------------------------
+      ep_state_osc:
+        cmp rsi, 0x07;
+        je  ep_reset_ret0;
+        cmp rsi, 0x1B;
+        je  ep_reset_ret0;
+        // stay in OSC, no event
+        xor rax, rax;
+        ret;
+
+        // -----------------------------------------------------------------
+        // Shared emit-key-and-reset arm: r9 holds the keycode, rdx points
+        // at the Event slot. Write kind=0 / payload=keycode; zero state /
+        // param0 / param1; return rax=1.
+        // -----------------------------------------------------------------
+      ep_emit_key_and_reset:
+        xor rax, rax;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], r9;
+        mov [rdi + 0], rax;
+        mov [rdi + 8], rax;
+        mov [rdi + 16], rax;
+        mov rax, 1;
+        ret;
+
+        // -----------------------------------------------------------------
+        // Shared reset-and-return-0 arm: no event, state -> Idle, params
+        // zeroed. Every invalid transition jumps here.
+        // -----------------------------------------------------------------
+      ep_reset_ret0:
+        xor rax, rax;
+        mov [rdi + 0],  rax;
+        mov [rdi + 8],  rax;
+        mov [rdi + 16], rax;
+        ret;
+      }
+    }
+
+}

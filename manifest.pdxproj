@@ -53,6 +53,13 @@ sources:
   - src/widgets/barchart.pdx      # M3-004: BarChart + BarChartView@0.1
   - src/widgets/chart.pdx         # M3-005: Chart/axis/dataset + ChartView@0.1
   - src/widgets/canvas.pdx        # M3-006: Canvas (Fixed64/braille) + CanvasView@0.1
+  - src/padding.pdx               # M4-004: Padding utility (Rect inset/uniform)
+  - src/widgets/text_input.pdx    # M4-001: TextInput/TextArea + TextInputView@0.1
+  - src/widgets/tree.pdx          # M4-002: Tree + TreeView@0.1
+  - src/widgets/calendar.pdx      # M4-003: Calendar + CalendarView@0.1
+  - src/widgets/clear.pdx         # M4-004: Clear widget + ClearView@0.1
+  - src/input/event.pdx           # M4-005: Event enum + Key/Resize/Mouse/Paste kinds
+  - src/input/esc_parser.pdx      # M4-005: CSI/SS3/OSC ESC-sequence state machine
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at
