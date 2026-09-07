@@ -1,0 +1,582 @@
+// src/widgets/gauge.pdx -- postui.M3-002 (paideia-os/postui#21)
+//
+// Gauge and LineGauge widgets (integer percentage math) +
+// GaugeView@0.1 semantic-pipe record.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M3-002)
+// =============================================================================
+//
+// Gauge is the 6th ordinal (WK_GAUGE = 5) in the closed widget catalog
+// and the second M3 landing after Fixed64 (M3-001). It ships two
+// visual variants dispatched off a single u64 `kind` field inside a
+// unified GaugeSpec, rather than two separate specs / two separate
+// widget_draw bodies:
+//
+//   kind = 0 (Bar)  -- rectangular fill; the whole Rect height is
+//                      stamped with either the fill glyph or the empty
+//                      glyph per column.
+//   kind = 1 (Line) -- single-row bar along the midline of the Rect
+//                      (y = ry + rh/2); uses horizontal-line glyphs
+//                      instead of full-block glyphs.
+//
+// The M3-002 issue's "green" classification (docs/design.md §1.6)
+// permits Gauge/LineGauge to ship at v1 because the percentage math
+// is pure integer -- `fill_cells = (value * width) / max` -- so no
+// Fixed64 (M3-001) dependency is dragged in. This module compiles
+// clean against the M2 register (no libpdx-semantic-pipe entry yet).
+//
+// This file lands:
+//   - GaugeSpec state record (48-byte struct laid out in memory; see
+//     WIRE block below).
+//   - Four u32 UTF-8 glyph words: two for Bar (█ fill, ░ empty), two
+//     for Line (═ fill, ─ empty).
+//   - gauge_draw: the widget_draw-shape entry that dispatches on
+//     `kind` and stamps the appropriate glyph pattern.
+//   - gauge_view_pack: pack a GaugeView@0.1 semantic-pipe record into
+//     caller-provided memory (M2-009 wires the actual
+//     semantic_pipe::send_record call).
+//   - GAU_ERR_BAND sentinel (defensive; unused at v1).
+//
+// =============================================================================
+// GAUGESPEC WIRE (48 bytes, GAUGE_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect          u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  value         u64  current filled amount (0..=max)
+//   [+16..+24) max           u64  denominator (max == 0 -> fill_cells = 0,
+//                                 the whole bar renders empty; NO error)
+//   [+24..+32) kind          u64  0 = Bar, 1 = Line
+//   [+32..+40) style_filled  u64  Style-packed (fg | bg<<24 | mods<<48)
+//   [+40..+48) style_empty   u64  Style-packed for the empty-fill glyph
+//
+// 48 bytes is exactly 3 x 16-byte pairs, matches BlockSpec's cache-line
+// posture (src/block.pdx L54), and keeps every field at a natural
+// 8-byte alignment so the draw body loads each with a single qword
+// mov. `value` and `max` are u64 (rather than u32) so a gauge measuring
+// e.g. bytes-read-out-of-file-size or ticks-out-of-deadline does not
+// need to premultiply-and-truncate to hit a narrower slot.
+//
+// value > max at the API surface is not rejected here: the fill_cells
+// computation clamps to `width` after the multiply-and-divide, so a
+// runaway numerator paints the whole bar filled and the semantic-pipe
+// record still reports the raw (value, max) pair the caller passed in.
+// Callers that want strict validation gate it upstream.
+//
+// =============================================================================
+// GLYPH WORDS (3-byte UTF-8 packed into u32 dword slot)
+// =============================================================================
+//
+// A Cell's symbol field lives at cell bytes [+0..+4) (Cell wire, §2.1).
+// Each of our four glyphs is a 3-byte UTF-8 sequence; storing it as a
+// u32 with byte 3 = 0 means a single 8-byte store of the composed
+// word0 (`symbol | fg | bg.r`) stamps the symbol slot with the
+// trailing zero cleared as a side effect, guaranteeing a prior
+// multi-byte glyph left behind by an earlier writer does not bleed
+// into byte 3 of the symbol slot.
+//
+// Little-endian u32 encoding of the byte sequence [b0, b1, b2, 0]:
+//   glyph_u32 = b0 | (b1 << 8) | (b2 << 16) | (0 << 24)
+//
+//   Bar fill        █  (U+2588)  bytes 0xE2 0x96 0x88  ->  0x008896E2
+//   Bar empty       ░  (U+2591)  bytes 0xE2 0x96 0x91  ->  0x009196E2
+//   Line fill       ═  (U+2550)  bytes 0xE2 0x95 0x90  ->  0x009095E2
+//   Line empty      ─  (U+2500)  bytes 0xE2 0x94 0x80  ->  0x008094E2
+//
+// All four values fit imm32 (< 0x80000000) so paideia-as emits the
+// compact 5-byte mov r32, imm32 form when loaded via `mov reg, imm`.
+// (The Bar fill glyph is identical to Scrollbar's thumb glyph; the
+// Line empty glyph is identical to Scrollbar's horizontal track glyph
+// -- both by intent, so a terminal font that resolves the block set
+// resolves consistently across widgets.)
+//
+// =============================================================================
+// FILL MATH (integer)
+// =============================================================================
+//
+// Let W = track width (bw for both Bar and Line -- the column-count
+// of the Rect), V = value, M = max. Then:
+//
+//   if M == 0:               fill_cells = 0
+//   else:                    fill_cells = (V * W) / M
+//   then clamp:              fill_cells = min(fill_cells, W)
+//
+// The multiply-first ordering avoids the (V/M)*W rounding loss that
+// would truncate small ratios to 0 for the entire bar. The final
+// clamp guards a caller passing V > M (which would otherwise stamp
+// fill glyphs past the Rect's right edge -- undefined behavior on the
+// buffer; the clamp turns it into a full-bar paint).
+//
+// Every product is a u64 * u64 -> u64 (2-op imul reg, reg, paideia-as-
+// safe). Every division is `xor rdx, rdx; div reg` to keep the
+// dividend in rax with a clean high half, mirroring the discipline
+// scrollbar_draw and layout_split (src/layout.pdx L702) already
+// established.
+//
+// =============================================================================
+// GAUGEVIEW@0.1 WIRE (semantic-pipe record, 32 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic        u32 = 0x57564747 ("GGVW" LE)
+//   [+4..+8)   record_len   u32 = 32 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack    u64 verbatim from GaugeSpec+0
+//   [+16..+24) value        u64 verbatim from GaugeSpec+8
+//   [+24..+32) max          u64 verbatim from GaugeSpec+16
+//
+// kind, style_filled, and style_empty are deliberately excluded from
+// the semantic-pipe record:
+//   - `kind` is a visual dispatch selector, not semantic state (a
+//     downstream reader interested in "how full is this thing" does
+//     not care whether it's rendered as a bar or a line);
+//   - the two `style_*` fields are visual attributes with no
+//     semantically-meaningful value for a downstream reader.
+// This matches ScrollbarView@0.1's exclusion of style_track/thumb
+// (scrollbar.pdx L145) and BlockView@0.1's exclusion of fill_cell
+// (block.pdx L84).
+//
+// record_len is fixed at 32 bytes and already 8-aligned, so no padding
+// loop is needed -- the header stores are exact. Both value and max
+// are stored as u64 (unlike ScrollbarView's u32 truncation of
+// position/content_length/viewport_length) because a gauge tracking
+// bytes-out-of-file-size can legitimately exceed 4G.
+//
+// =============================================================================
+// SIGNATURE DEVIATION FROM ISSUE TEXT
+// =============================================================================
+//
+// The postui#21 issue text names gauge_draw as (spec_ptr, buf_ptr,
+// rows, cols) -> u64 and this landing takes it verbatim. `rows` is
+// unread (back region starts at buf_ptr+0) but kept for signature
+// uniformity with the widget_draw dispatch shape (src/widget_kind.pdx
+// L216) so plugging Gauge into the M2+ jump table at future
+// WidgetKind revisions requires no per-widget shim -- matches the
+// posture scrollbar_draw / block_draw take.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Gauge`), matches file basename
+//     (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64). No byte
+//     loads are needed in this module -- every spec field is 8-byte
+//     aligned and read as a qword.
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 0,
+//     1, shift counts <= 56. The error sentinel 0xFFFFEBD2 (> 0x7FFFFFFF)
+//     is loaded via `mov reg, imm64` (movabs) if ever emitted; the
+//     glyph-word imms (< 0x80000000) emit `mov r32, imm32` (5-byte
+//     form). No `cmp reg, imm64` and no `and reg, imm64` anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is
+//     2-op `imul reg, reg` -- the 16-byte-per-cell address math folds
+//     the constant multiplier into `shl reg, 4`.
+//   - Labels prefixed `gau_` per docs/design.md fingerprint discipline
+//     (issue text explicitly calls out avoiding `gg_` which might
+//     collide with a future gauge-adjacent module). Sub-prefixes
+//     gau_kind_ for kind-dispatch glyph select, gau_fw_/gau_ew_ for
+//     filled/empty word compute, gau_yloop/gau_xloop for the draw
+//     loops, gau_x_empty/gau_x_advance for the per-cell branch,
+//     gau_line_setup for the LineGauge y-range branch,
+//     gau_ret_zero for the shared success epilogue, gau_bv_ for
+//     gauge_view_pack (no labels needed at v1 -- record is
+//     fixed-length, no branches).
+//   - gauge_draw pushes 5 SysV callee-save regs (rbx, r12, r13, r14,
+//     r15) = 40 bytes plus `sub rsp, 32` for cell-word scratch (4
+//     u64 slots for the two [word0, word1] pairs); entry rsp%16==8,
+//     +40==48 (aligned), +32==80 (aligned). Body makes NO nested
+//     calls (all cell writes, address math, and divisions are inline).
+//     Alignment is a discipline anchor mirroring block_draw /
+//     scrollbar_draw / layout_split.
+//   - gauge_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save
+//     registers, matching scrollbar_view_pack / block_view_pack.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments). No cap / sysreg effect.
+
+module Gauge = structure {
+
+  // ==========================================================================
+  // Kind ordinals (callers build a GaugeSpec against these; the draw
+  // body reads spec+24 directly as a u64 and branches on 0/non-zero
+  // rather than switch-chaining these ordinals).
+  // ==========================================================================
+  pub let GAUGE_KIND_BAR  : u64 = 0
+  pub let GAUGE_KIND_LINE : u64 = 1
+
+  // ==========================================================================
+  // GaugeSpec layout (48 bytes)
+  // ==========================================================================
+  pub let GAUGE_SPEC_BYTES         : u64 = 48
+
+  pub let GAUGE_OFF_RECT           : u64 = 0
+  pub let GAUGE_OFF_VALUE          : u64 = 8
+  pub let GAUGE_OFF_MAX            : u64 = 16
+  pub let GAUGE_OFF_KIND           : u64 = 24
+  pub let GAUGE_OFF_STYLE_FILLED   : u64 = 32
+  pub let GAUGE_OFF_STYLE_EMPTY    : u64 = 40
+
+  // ==========================================================================
+  // Glyph u32 words (3 UTF-8 bytes + 1 zero pad, little-endian).
+  // Loaded via `mov reg, imm` at draw time; each value is < 0x80000000
+  // so paideia-as emits the compact 5-byte mov r32, imm32 form.
+  // ==========================================================================
+  pub let GAUGE_GLYPH_BAR_FILL   : u64 = 0x008896E2
+  pub let GAUGE_GLYPH_BAR_EMPTY  : u64 = 0x009196E2
+  pub let GAUGE_GLYPH_LINE_FILL  : u64 = 0x009095E2
+  pub let GAUGE_GLYPH_LINE_EMPTY : u64 = 0x008094E2
+
+  // ==========================================================================
+  // GaugeView@0.1 wire constants.
+  //
+  // GGVW_MAGIC = 0x57564747 = 1_465_270_599 (< 0x7FFFFFFF, imm32 form).
+  // Bytes 'G','G','V','W' = 0x47,0x47,0x56,0x57, LE u32 = 0x57564747.
+  // ==========================================================================
+  pub let GGVW_MAGIC           : u64 = 0x57564747
+  pub let GGVW_RECORD_BYTES    : u64 = 32
+  pub let GGVW_OFF_MAGIC       : u64 = 0
+  pub let GGVW_OFF_RECORD_LEN  : u64 = 4
+  pub let GGVW_OFF_RECT        : u64 = 8
+  pub let GGVW_OFF_VALUE       : u64 = 16
+  pub let GGVW_OFF_MAX         : u64 = 24
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // via the M3 slice (0xFFFFEBD0..0xFFFFEBDF; see
+  // design/architecture.md §5.1). Gauge takes 0xFFFFEBD2 (M3-002
+  // ordinal-mapped inside the batch).
+  //
+  // At v1 no gauge_draw path returns this -- the body accepts any
+  // spec (a rect of 0x0 returns 0 with no cells written; a max of 0
+  // paints an entirely-empty bar/line; value > max is clamped to full
+  // fill). The sentinel is reserved for a future revision that may
+  // want to trap e.g. a rect that overflows the canvas (widened to a
+  // u32 return today keeps the signature stable if that trap ever
+  // lands). 0xFFFFEBD2 > 0x7FFFFFFF so `mov reg, imm64` (movabs) is
+  // the only legal load path; NEVER usable in cmp/and.
+  // ==========================================================================
+  pub let GAU_ERR_BAND : u64 = 0xFFFFEBD2
+
+  // ==========================================================================
+  // gauge_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry. `rows` is unread (back region starts at
+  // buf_ptr+0). Returns 0 (OK) in every case that actually paints; a
+  // zero-sized rect (bw==0 || bh==0) returns 0 with no cells written.
+  //
+  // Draw sequence:
+  //   1. Cache invariants (buf_ptr, cols, spec_ptr, packed rect).
+  //   2. Extract bw / bh from packed rect; early-return 0 if either 0.
+  //   3. Compute fill_cells = (value * bw) / max, div-by-zero guarded
+  //      (max==0 -> 0) and clamped to <= bw. Stash in r15.
+  //   4. Precompute two [word0, word1] cell pairs into stack scratch:
+  //        [rsp+0..8)   filled_word0 (glyph selected by kind + style_filled)
+  //        [rsp+8..16)  filled_word1
+  //        [rsp+16..24) empty_word0  (glyph selected by kind + style_empty)
+  //        [rsp+24..32) empty_word1
+  //   5. Determine outer y-range by kind:
+  //        Bar  (kind==0): y in [by, by+bh)
+  //        Line (kind!=0): y == by + bh/2 (single row)
+  //   6. For each y, iterate x in [bx, bx+bw); per cell decide filled
+  //      (x < bx + fill_cells) vs empty and stamp the pair.
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the
+  // canvas's stamped rows/cols; matches block_draw / scrollbar_draw
+  // posture.
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 32; entry rsp%16==8,
+  // +40==48, +32==80, aligned):
+  //   rbx = buf_ptr        r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect (then repurposed to y_end after re-extract)
+  //   r15 = fill_cells (survives Phase 2 through end of loop)
+  //   Stack scratch:
+  //     [rsp+0..8)   filled_word0
+  //     [rsp+8..16)  filled_word1
+  //     [rsp+16..24) empty_word0
+  //     [rsp+24..32) empty_word1
+  //
+  // Labels prefixed gau_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let gauge_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-002 (postui#21): gauge_draw is the widget_draw-shape entry for WK_GAUGE (5). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 32 (four u64 cell-word scratch slots, keeps rsp%16==0). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / scrollbar_draw / layout_split. Phase 0 (prologue): cache buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (loaded once from [r13+0]). Phase 1 (early-return on zero rect): bw = (r14 >> 32) & 0xFFFF into r8; if 0 -> gau_ret_zero. bh = r14 >> 48 (top 16 bits, no mask needed) into r9; if 0 -> gau_ret_zero. Phase 2 (fill_cells compute with div-by-zero guard + clamp): load max into r11 from [r13+16]; if 0 -> r15 = 0 (all-empty bar), skip the div. Else load value into rax from [r13+8]; imul rax, r8 (2-op reg,reg; rax = value * bw); xor rdx, rdx; div r11 (rax = quotient = raw fill_cells). Clamp: cmp rax, r8; jbe gau_no_clamp; mov rax, r8; then r15 = rax. Phase 3 (precompute both cell-word pairs into stack scratch): load kind from [r13+24] into r10; if 0 (Bar) -> filled glyph is 0x008896E2 (U+2588 block full); else (Line) -> 0x009095E2 (U+2550 double-horizontal). Compose filled_word0 = glyph | ((style_filled & 0xFFFFFF) << 32) | (((style_filled >> 24) & 0xFF) << 56) using r10 = style_filled from [r13+32], immediates 0xFFFFFF/0xFF and shift counts 24/32/56 all fit imm32/imm8; store to [rsp+0]. Compose filled_word1 = ((style_filled >> 32) & 0xFFFF) | (((style_filled >> 48) & 0xFF) << 16); store to [rsp+8]. Repeat for empty pair: reload kind from [r13+24] into r10; if 0 -> empty glyph 0x009196E2 (U+2591 light shade), else -> 0x008094E2 (U+2500 single-horizontal). Compose against style_empty from [r13+40]; store empty_word0 to [rsp+16], empty_word1 to [rsp+24]. Phase 4 (re-extract rect fields and set up outer y-range by kind): r8 = bx = r14 & 0xFFFF; r9 = by = (r14 >> 16) & 0xFFFF; r10 = bw = (r14 >> 32) & 0xFFFF; r11 = bh = r14 >> 48. xe (rsi) = bx + bw; fill_threshold (rdi) = bx + fill_cells (r15). Reload kind from [r13+24] into rax; if 0 (Bar) -> y counter rdx = by, y_end r14 = by + bh (r14 no longer needed for packed rect; been fully extracted); else (Line) -> mid = bh/2 via `mov rax, r11; shr rax, 1`; y counter rdx = by + mid; y_end r14 = rdx + 1 (single row). Phase 5 (paint loop): outer gau_yloop: cmp rdx, r14; jae gau_ret_zero. Inner gau_xloop: x counter rcx starts at bx (r8); cmp rcx, rsi; jae gau_ynext. dst compute: mov rax, rdx; imul rax, r12 (2-op reg,reg); add rax, rcx; shl rax, 4; add rax, rbx. Per-cell branch: cmp rcx, rdi; jae gau_x_empty; else load filled_word0/1 from [rsp+0]/[rsp+8] into r10 and stamp [rax+0]/[rax+8]; jmp gau_x_advance. gau_x_empty: load empty_word0/1 from [rsp+16]/[rsp+24] and stamp. gau_x_advance: add rcx, 1; jmp gau_xloop. gau_ynext: add rdx, 1; jmp gau_yloop. Epilogue gau_ret_zero: xor rax, rax; add rsp, 32; pop r15/r14/r13/r12/rbx (reverse); ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0, 1, shift counts 1/4/16/24/32/48/56) fits imm32/imm8; glyph words and style masks fit imm32. 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. No 2-op `imul reg, imm`. Effect `!{mem}` (fill loops + spec/stack reads). Labels prefixed gau_ per docs fingerprint discipline (avoid gg_ which might collide per issue text).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 32;
+
+        // ---- Phase 0: cache invariants -----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+        mov r14, [r13 + 0];               // r14 = packed rect
+
+        // ---- Phase 1: early-return on zero-sized rect --------------------
+        // bw = (r14 >> 32) & 0xFFFF
+        mov r8, r14;
+        shr r8, 32;
+        and r8, 0xFFFF;
+        cmp r8, 0;
+        je  gau_ret_zero;
+        // bh = r14 >> 48 (top 16 bits, no mask needed)
+        mov r9, r14;
+        shr r9, 48;
+        cmp r9, 0;
+        je  gau_ret_zero;
+
+        // ---- Phase 2: fill_cells compute (div-by-zero guard + clamp) -----
+        // r15 = fill_cells
+        mov r11, [r13 + 16];              // r11 = max
+        cmp r11, 0;
+        jne gau_have_max;
+        xor r15, r15;                     // max==0 -> fill_cells = 0
+        jmp gau_fill_ok;
+      gau_have_max:
+        mov rax, [r13 + 8];               // rax = value
+        imul rax, r8;                     // rax = value * bw (2-op reg,reg)
+        xor rdx, rdx;
+        div r11;                          // rax = quotient = raw fill_cells
+        // Clamp: fill_cells <= bw
+        cmp rax, r8;
+        jbe gau_no_clamp;
+        mov rax, r8;
+      gau_no_clamp:
+        mov r15, rax;                     // r15 = fill_cells (survives)
+      gau_fill_ok:
+
+        // ==================================================================
+        // Phase 3: precompute BOTH cell-word pairs into stack scratch
+        // ==================================================================
+
+        // ---- filled pair (glyph selected by kind + style_filled) ---------
+        mov r10, [r13 + 24];              // r10 = kind
+        cmp r10, 0;
+        jne gau_kind_line_fw;
+        mov rax, 0x008896E2;              // Bar fill glyph █ (U+2588)
+        jmp gau_fw_glyph_done;
+      gau_kind_line_fw:
+        mov rax, 0x009095E2;              // Line fill glyph ═ (U+2550)
+      gau_fw_glyph_done:
+
+        // filled_word0 = glyph | ((style_filled & 0xFFFFFF) << 32)
+        //                       | (((style_filled >> 24) & 0xFF) << 56)
+        mov r10, [r13 + 32];              // r10 = style_filled
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;                // fg (low 24 bits of style)
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r10;
+        shr rcx, 24;
+        and rcx, 0xFF;                    // bg.r
+        shl rcx, 56;
+        or  rax, rcx;
+        mov [rsp + 0], rax;               // filled_word0
+
+        // filled_word1 = ((style_filled >> 32) & 0xFFFF)
+        //                | (((style_filled >> 48) & 0xFF) << 16)
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;                  // bg.g | bg.b in low 16 bits
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;                    // mods
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 8], rax;               // filled_word1
+
+        // ---- empty pair (glyph selected by kind + style_empty) -----------
+        mov r10, [r13 + 24];              // r10 = kind (reload)
+        cmp r10, 0;
+        jne gau_kind_line_ew;
+        mov rax, 0x009196E2;              // Bar empty glyph ░ (U+2591)
+        jmp gau_ew_glyph_done;
+      gau_kind_line_ew:
+        mov rax, 0x008094E2;              // Line empty glyph ─ (U+2500)
+      gau_ew_glyph_done:
+
+        // empty_word0
+        mov r10, [r13 + 40];              // r10 = style_empty
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r10;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        shl rcx, 56;
+        or  rax, rcx;
+        mov [rsp + 16], rax;              // empty_word0
+
+        // empty_word1
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 24], rax;              // empty_word1
+
+        // ==================================================================
+        // Phase 4: re-extract rect fields and set up outer y-range
+        // ==================================================================
+
+        // Re-extract bx (r8), by (r9), bw (r10), bh (r11) from r14.
+        // After this block, r14 is free to be repurposed as y_end
+        // since every rect field has been captured.
+        mov r8, r14;
+        and r8, 0xFFFF;                   // r8 = bx
+
+        mov r9, r14;
+        shr r9, 16;
+        and r9, 0xFFFF;                   // r9 = by
+
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFFFF;                  // r10 = bw
+
+        mov r11, r14;
+        shr r11, 48;                      // r11 = bh
+
+        // xe = bx + bw -> rsi
+        mov rsi, r8;
+        add rsi, r10;
+
+        // fill_threshold = bx + fill_cells -> rdi
+        mov rdi, r8;
+        add rdi, r15;
+
+        // Determine y counter (rdx) and y_end (r14) by kind.
+        mov rax, [r13 + 24];              // kind
+        cmp rax, 0;
+        jne gau_line_setup;
+
+        // Bar: y iterates from by to by + bh
+        mov rdx, r9;                      // y counter = by
+        mov r14, r9;
+        add r14, r11;                     // y_end = by + bh
+        jmp gau_yloop;
+
+      gau_line_setup:
+        // Line: single row at y = by + bh/2
+        mov rax, r11;
+        shr rax, 1;                       // bh / 2
+        mov rdx, r9;
+        add rdx, rax;                     // y = by + bh/2
+        mov r14, rdx;
+        add r14, 1;                       // y_end = y + 1
+
+        // ==================================================================
+        // Phase 5: paint loop
+        // ==================================================================
+
+      gau_yloop:
+        cmp rdx, r14;
+        jae gau_ret_zero;
+
+        mov rcx, r8;                      // x counter = bx
+
+      gau_xloop:
+        cmp rcx, rsi;
+        jae gau_ynext;
+
+        // dst = buf_ptr + (y * cols + x) * 16
+        mov rax, rdx;
+        imul rax, r12;                    // 2-op reg,reg
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Per-cell branch: filled if x < fill_threshold, else empty
+        cmp rcx, rdi;
+        jae gau_x_empty;
+
+        // Filled cell
+        mov r10, [rsp + 0];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+        jmp gau_x_advance;
+
+      gau_x_empty:
+        // Empty cell
+        mov r10, [rsp + 16];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 24];
+        mov [rax + 8], r10;
+
+      gau_x_advance:
+        add rcx, 1;
+        jmp gau_xloop;
+
+      gau_ynext:
+        add rdx, 1;
+        jmp gau_yloop;
+
+      gau_ret_zero:
+        xor rax, rax;
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // gauge_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a GaugeView@0.1 semantic-pipe record into [dst..dst+32).
+  // record_len is fixed at 32 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to postui.M2-009 -- this packer is the wire-format authority so
+  // M2-009's registry glue only has to know the schema-name string
+  // (for BLAKE3 hashing) and this packer (for the byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call. Effect `!{mem}` (reads
+  // through rdi, writes through rsi).
+  // ==========================================================================
+  pub let gauge_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-002 (postui#21): gauge_view_pack lays a fixed-32-byte GaugeView@0.1 record at [rsi..rsi+32). Header phase writes seven scalar fields in one straight-line sequence: `mov rax, 0x57564747` then `mov_d [rsi+0], rax` stamps the 'GGVW' magic (0x57564747 = 1_465_270_599 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches block_view_pack's BLKV and scrollbar_view_pack's SBVW magic idiom). record_len is a hard 32 (no variable-length data), stored via `mov rax, 32; mov_d [rsi+4], rax`. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store -- GaugeSpec's rect slot and GaugeView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. value (u64) is loaded qword from [rdi+8] and stored qword to [rsi+16]; max (u64) is loaded qword from [rdi+16] and stored qword to [rsi+24]. Both are kept full u64 (unlike ScrollbarView's u32 truncation of position/content_length/viewport_length) because a gauge tracking bytes-out-of-file-size can legitimately exceed 4G. kind and both style_* fields are deliberately excluded from the wire -- kind is a visual dispatch selector (not semantic state) and style_* are visual attributes with no semantic meaning; matches ScrollbarView's exclusion of style_track/thumb and BlockView's exclusion of fill_cell. return rax = 32. Every immediate (0x57564747, 32, 0, 4, 8, 16, 24) fits imm32 (0x57564747 = 1_465_270_599 < 0x7FFFFFFF; the rest are small). No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 3 qword-loads / 2 qword-stores / 1 dword-magic-store / 1 dword-record_len-store / 1 qword-rect-store. Labels prefixed gau_bv_ per docs fingerprint discipline (none needed at v1 -- record is fixed-length, no branches).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564747;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 32;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- value (u64) at [rsi + 16] -------------------------------------
+        mov rax, [rdi + 8];
+        mov [rsi + 16], rax;
+
+        // ---- max (u64) at [rsi + 24] ---------------------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 24], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 32;
+        ret;
+      }
+    }
+
+}
