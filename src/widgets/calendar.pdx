@@ -1,0 +1,1181 @@
+// src/widgets/calendar.pdx -- postui.M4-003 (paideia-os/postui#29)
+//
+// Calendar widget: month-grid renderer with integer civil date math.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M4-003)
+// =============================================================================
+//
+// Calendar is the third M4 widget-body landing (after Tree M4-001 and
+// TextInput M4-002 -- both preceding it in the M4 batch's sentinel
+// allocation, 0xFFFFEBE0..0xFFFFEBEF, per design/architecture.md
+// §5.1). Widget_draw-shape entry (spec_ptr, buf_ptr, rows, cols) -> u64
+// matches every other renderer's dispatch signature.
+//
+// This file ships:
+//   - The CalendarSpec state record (48-byte struct laid out in
+//     memory; see WIRE block below).
+//   - Four static tables (days-in-month base, Sakamoto's t[12],
+//     three-letter month names, two-letter day-of-week abbreviations)
+//     as .data / .rodata via the same `pub let X : [u8; N] = "..."`
+//     shape sparkline.pdx L350 uses for its glyph table.
+//   - cal_days_in_month(year, month) -> u64 : leap-adjusted length.
+//   - cal_weekday_of_first(year, month) -> u64 : Sakamoto's method
+//     (integer-only, no floating-point, no lookup for weekday).
+//   - calendar_draw : the widget_draw-shape entry that fills the Rect
+//     with normal-style space cells, then overlays a "Mmm YYYY" header
+//     row, a two-letter day-of-week header row, and the day grid.
+//   - calendar_view_pack : pack a CalendarView@0.1 semantic-pipe
+//     record (32 bytes, "CLVW" LE = 0x57564C43) into caller memory.
+//
+// =============================================================================
+// CALENDARSPEC WIRE (48 bytes, CALENDAR_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect             u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  year             u64 (e.g. 2026; used by both leap and
+//                                    Sakamoto; no upper bound enforced
+//                                    but the header row's 4-digit year
+//                                    truncates the display at 9999)
+//   [+16..+24) month            u64 (1..=12; 0 or > 12 returns
+//                                    CAL_ERR_BAD_MONTH)
+//   [+24..+32) selected_day     u64 (1..=days_in_month, or 0 for no
+//                                    selection; a value outside
+//                                    1..=days_in_month is silently
+//                                    treated as no-selection since no
+//                                    grid cell matches)
+//   [+32..+40) style_normal     u64 Style-packed (fg | bg<<24 | mods<<48)
+//   [+40..+48) style_selected   u64 Style-packed
+//
+// 48 bytes exact -- rect (8) + 5 u64 fields (40) = 48. Matches the
+// issue-text estimate. Every runtime numeric field is a u64 for
+// uniform spec-load shape (`mov reg, [spec+off]`); year is a u64 so
+// the four-digit-year header renders correctly for the entire practical
+// span the design targets (Gregorian civil dates from 0 to 9999) with
+// truncation beyond that documented, not silently mis-rendered. No
+// cache-line concerns -- draw reads every field ONCE at prologue and
+// stashes derived values into stack scratch.
+//
+// =============================================================================
+// STATIC TABLES
+// =============================================================================
+//
+// cal_days_in_month_table : 12 u8 values, the non-leap base day counts
+//   { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+// February's leap adjustment (+1 when leap) is applied inline by the
+// draw prologue, not baked into a second table -- the single table
+// keeps rodata compact and mirrors sparkline.pdx's single-table
+// discipline.
+//
+// cal_sakamoto_t : 12 u8 values, the tie-breaker offsets for Sakamoto's
+// weekday-of-month-first algorithm (see WEEKDAY ALGORITHM block below)
+//   { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+//
+// cal_month_names : 48 bytes, twelve 4-byte slots each holding a
+// 3-letter ASCII abbreviation plus one trailing NUL:
+//   "Jan\0Feb\0Mar\0Apr\0May\0Jun\0Jul\0Aug\0Sep\0Oct\0Nov\0Dec\0"
+// A 4-byte stride lets the draw path address any slot via
+//   src = table_base + (month - 1) * 4
+// without a per-slot indirection table; the trailing NUL of each slot
+// is never emitted (the draw loop stops after 3 bytes), it is padding
+// only.
+//
+// cal_dow_names : 14 bytes, seven 2-byte slots each holding a two-
+// letter ASCII day-of-week abbreviation ("Su", "Mo", "Tu", "We", "Th",
+// "Fr", "Sa"). Position 0 = Sunday matches the Sakamoto convention
+// (return 0..6 with 0 = Sunday, per the issue-text algorithm block).
+//
+// =============================================================================
+// LEAP YEAR RULE (integer-only)
+// =============================================================================
+//
+// A year is a Gregorian leap year iff:
+//   (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+//
+// Encoded as a short-circuit chain that fires the cheapest test first
+// (year % 4 fails immediately for 3 out of every 4 non-leap years):
+//
+//   if (year % 4 != 0)   -> not leap
+//   else if (year % 100 != 0) -> leap
+//   else if (year % 400 != 0) -> not leap
+//   else                 -> leap
+//
+// Only applied when month == 2; for every other month days_in_month is
+// the table value verbatim.
+//
+// =============================================================================
+// WEEKDAY ALGORITHM (Sakamoto's method, integer-only)
+// =============================================================================
+//
+//   static t[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+//   if (month < 3) year -= 1
+//   return (year + year/4 - year/100 + year/400 + t[month-1] + 1) % 7
+//
+// The `day` parameter is always 1 (we want the first-of-month
+// weekday; every other day's slot is derived from
+// (first_weekday + day - 1) inside the grid loop).
+//
+// Register plan follows the paideia-as div convention (dividend in
+// rax, divisor in a live reg, xor rdx before every div to clear the
+// high half). Three divides -- year/4, year/100, year/400 -- plus one
+// final % 7 divide give four div instructions total per invocation;
+// the branch on month < 3 is a single `cmp rax, 3 ; jae` chain.
+//
+// Sanity checks (verified during design):
+//   * Jan 1, 2026 -> (2025 + 506 + 5 - 20 + 0 + 1) % 7 = 2517 % 7 = 4  (Thursday)
+//   * Feb 1, 2026 -> (2025 + 506 + 5 - 20 + 3 + 1) % 7 = 2520 % 7 = 0  (Sunday)
+//   * Mar 1, 2026 -> (2026 + 506 + 5 - 20 + 2 + 1) % 7 = 2520 % 7 = 0  (Sunday)
+//   * Sep 1, 2026 -> (2026 + 506 + 5 - 20 + 4 + 1) % 7 = 2522 % 7 = 2  (Tuesday)
+// All match the canonical Gregorian calendar.
+//
+// =============================================================================
+// DRAW LAYOUT
+// =============================================================================
+//
+// The widget draws three horizontal bands from the rect's top-left:
+//
+//   Row by + 0 : header "Mmm YYYY" (3-char name + space + 4-char year
+//                                   = 8 cells starting at bx); skipped
+//                                   iff bw < 8.
+//   Row by + 1 : day-of-week header "Su Mo Tu We Th Fr Sa" (7 * 3 - 1
+//                                   = 20 cells wide, occupies cells
+//                                   bx..bx+19); skipped iff bw < 20 or
+//                                   bh < 2.
+//   Rows by + 2 .. : day grid, one grid row per week, each day taking
+//                                   2 cells (right-aligned; single-
+//                                   digit days show as " 1" .. " 9",
+//                                   two-digit days show as "10" .. "31").
+//                                   The gap column between days is left
+//                                   as a normal-style space (baked by
+//                                   phase 1's fill). Rows past by + bh
+//                                   are silently dropped.
+//
+// Every non-grid cell already carries the normal-space style from the
+// phase 1 fill; the overlay phases only rewrite the cells they own.
+// A caller with a Block-drawn background sees the fill obliterate the
+// interior of the block; this is intentional and matches sparkline /
+// gauge / barchart posture (widgets that own their rect fully).
+//
+// Day-cell placement for day d:
+//   slot = first_weekday + (d - 1)     -- 0..41 across a 6-week span
+//   row  = slot / 7                    -- 0..5
+//   col  = slot % 7                    -- 0..6
+//   x    = bx + col * 3                -- 2 digit cells + 1 gap cell
+//   y    = by + 2 + row
+//   (if y >= by + bh: stop -- rare 6-week case)
+//
+// Style selection per cell: if d == selected_day, both cells (tens
+// and units) use style_selected; otherwise style_normal.
+//
+// =============================================================================
+// CALENDARVIEW@0.1 WIRE (semantic-pipe record, 32 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic          u32 = 0x57564C43 ("CLVW" LE:
+//                                    'C' 0x43, 'L' 0x4C, 'V' 0x56, 'W' 0x57)
+//   [+4..+8)   record_len     u32 = 32 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack      u64 verbatim from CalendarSpec+0
+//   [+16..+24) year           u64 verbatim from CalendarSpec+8
+//   [+24..+28) month          u32 (spec u64 truncated for slot; month
+//                                   is 1..=12 so no truncation risk)
+//   [+28..+32) selected_day   u32 (spec u64 truncated for slot;
+//                                   selected_day is 0..=31 so no
+//                                   truncation risk)
+//
+// style_normal / style_selected are deliberately excluded -- visual
+// attributes only, matching ScrollbarView's exclusion of style_track /
+// style_thumb and BlockView's exclusion of fill_cell.
+//
+// record_len is fixed at 32 bytes and already 8-aligned, so no padding
+// loop is needed. Full u64 retention for year (a downstream analyzer
+// wanting to reason about the calendar's semantics must round-trip
+// years > 65535 verbatim); u32 for month and selected_day both stay
+// within their nominal 1-byte range so no downstream reader loses
+// information.
+//
+// The BLAKE3-schema-hash constant for CLVW will be added to
+// src/semantic_registry.pdx by a future postui.M4-close-out landing
+// alongside the other M4 widgets (Tree, TextInput). Not part of this
+// landing's scope (issue #29 names src/widgets/calendar.pdx as the
+// sole source touched); the registration follows the same v1 posture
+// SBVW / SPVW / TABV / TBVW took at M2-009.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Calendar`), matches file
+//     basename (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor reg, reg` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64 --
+//     paideia-as pitfall #1248, see width.pdx L285 / list.pdx L672).
+//   - All immediates in cmp/and fit imm32: 0, 1, 2, 3, 4, 7, 8, 10,
+//     12, 20, 100, 400, 1000, 0xFF, 0xFFFF, 0xFFFFFF, and shift counts
+//     <= 56. The error sentinels 0xFFFFEBE4 / 0xFFFFEBE5 and the CLVW
+//     magic 0x57564C43 fit into `mov reg, imm` -- the sentinels
+//     > 0x7FFFFFFF force paideia-as's 10-byte movabs form (legal for
+//     mov, NOT for cmp/and), and 0x57564C43 fits imm32 signed positive
+//     so the compact 5-byte `mov r32, imm32` form is emitted (same
+//     shape SBVW / SPVW take).
+//   - No 2-op `imul reg, imm`. Every imul is 2-op `imul reg, reg`
+//     (address math uses `imul reg, r12` where r12 = cols).
+//   - No `cmp reg, [mem]` -- every cmp is reg-to-reg or reg-to-imm.
+//   - No `or reg, [mem]` -- glyph/style combines always stage the
+//     memory operand into a scratch register first.
+//   - Division uses standard `xor rdx, rdx; mov rcx, N; div rcx`
+//     (unsigned; matches layout_split L702 / scrollbar_draw L484
+//     / sparkline_draw L668 discipline).
+//   - Labels prefixed `cal_` per docs/design.md fingerprint discipline
+//     (cal_ret_ok / cal_err_bad_month for the two epilogues;
+//     cal_days_ready / cal_is_leap for the leap-year decision chain;
+//     cal_sak_year_ok for the year-adjust gate; cal_fill_yloop/xloop/
+//     ynext/done for the phase-1 fill; cal_skip_header / cal_hdr_name
+//     for the header row; cal_skip_dow / cal_dow_loop for the DOW row;
+//     cal_grid_loop / cal_grid_selected / cal_grid_style_done /
+//     cal_grid_tens_digit / cal_grid_tens_ready for the day grid).
+//   - calendar_draw pushes 5 SysV callee-save regs (rbx, r12, r13, r14,
+//     r15) = 40 bytes plus `sub rsp, 128` for scratch; entry
+//     rsp%16==8, +40==48 (aligned), +128==176 (aligned). Body makes NO
+//     nested calls; alignment is a discipline anchor mirroring
+//     block_draw / scrollbar_draw / sparkline_draw.
+//   - cal_days_in_month, cal_weekday_of_first, calendar_view_pack are
+//     pure leafs (no push/pop, no callee-save writes, no nested calls).
+//   - Effect row `!{mem}` on calendar_draw (reads spec + static tables,
+//     writes cells) and calendar_view_pack (reads spec, writes dst);
+//     `!{}` on the two pure numeric helpers.
+
+module Calendar = structure {
+
+  // ==========================================================================
+  // CalendarSpec layout (48 bytes)
+  // ==========================================================================
+  pub let CALENDAR_SPEC_BYTES        : u64 = 48
+
+  pub let CALENDAR_OFF_RECT          : u64 = 0
+  pub let CALENDAR_OFF_YEAR          : u64 = 8
+  pub let CALENDAR_OFF_MONTH         : u64 = 16
+  pub let CALENDAR_OFF_SELECTED_DAY  : u64 = 24
+  pub let CALENDAR_OFF_STYLE_NORMAL  : u64 = 32
+  pub let CALENDAR_OFF_STYLE_SELECTED: u64 = 40
+
+  // ==========================================================================
+  // CalendarView@0.1 semantic-pipe wire (docs/design.md §2.3)
+  //
+  // MAGIC 0x57564C43 = "CLVW" little-endian
+  //   byte 0 = 0x43 'C', byte 1 = 0x4C 'L',
+  //   byte 2 = 0x56 'V', byte 3 = 0x57 'W'
+  // Fits imm32 signed positive so the loader emits `mov r32, imm32`
+  // (5 bytes), not the 10-byte movabs form -- matches SBVW / SPVW
+  // magic idioms (scrollbar.pdx L687, sparkline.pdx L793).
+  // ==========================================================================
+  pub let CLVW_MAGIC             : u64 = 0x57564C43
+  pub let CLVW_RECORD_LEN        : u64 = 32
+  pub let CLVW_OFF_MAGIC         : u64 = 0
+  pub let CLVW_OFF_RECORD_LEN    : u64 = 4
+  pub let CLVW_OFF_RECT          : u64 = 8
+  pub let CLVW_OFF_YEAR          : u64 = 16
+  pub let CLVW_OFF_MONTH         : u64 = 24
+  pub let CLVW_OFF_SELECTED_DAY  : u64 = 28
+
+  // Schema name ("CalendarView@0.1", NUL-terminated) -- the authoritative
+  // source a future M4 close-out schema-hash landing hashes via BLAKE3.
+  pub let CLVW_SCHEMA_NAME     : [u8; 17] = "CalendarView@0.1\0"
+  pub let CLVW_SCHEMA_NAME_LEN : u64 = 16
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x64/0x65 offsets = 0xFFFFEBE4/0xFFFFEBE5, in the M4 sub-band
+  // 0xFFFFEBE0..0xFFFFEBEF (design/architecture.md §5.1). Every sentinel
+  // > 0x7FFFFFFF -- movabs required for `mov reg, imm`; NEVER usable
+  // in cmp/and.
+  //
+  // CAL_ERR_BAND      -- defensive catch-all; unused at v1 (no draw
+  //                      path returns this today; reserved for a future
+  //                      trap such as rect-overflows-canvas).
+  // CAL_ERR_BAD_MONTH -- returned by calendar_draw when month is 0 or
+  //                      > 12. The two pure-numeric helpers do not
+  //                      validate month (a call with month == 0 yields
+  //                      an underflow-wrapped index into the tables;
+  //                      documented caller responsibility).
+  // ==========================================================================
+  pub let CAL_ERR_BAND      : u64 = 0xFFFFEBE4
+  pub let CAL_ERR_BAD_MONTH : u64 = 0xFFFFEBE5
+
+  // ==========================================================================
+  // Static tables
+  //
+  // cal_days_in_month_table: 12 u8 base day counts (Feb = 28; leap
+  // adjustment applied by the draw prologue only when month == 2).
+  //   0x1F=31 0x1C=28 0x1E=30
+  // ==========================================================================
+  pub let cal_days_in_month_table : [u8; 12] = "\x1F\x1C\x1F\x1E\x1F\x1E\x1F\x1F\x1E\x1F\x1E\x1F"
+
+  // Sakamoto's t[12] offsets, indexed by (month - 1).
+  //   { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+  pub let cal_sakamoto_t : [u8; 12] = "\x00\x03\x02\x05\x00\x03\x05\x01\x04\x06\x02\x04"
+
+  // Three-letter month names, 4-byte-per-slot stride with trailing NUL
+  // pad; addressed as base + (month - 1) * 4 for the 3-byte name copy.
+  pub let cal_month_names : [u8; 48] = "Jan\x00Feb\x00Mar\x00Apr\x00May\x00Jun\x00Jul\x00Aug\x00Sep\x00Oct\x00Nov\x00Dec\x00"
+
+  // Two-letter day-of-week names, 2-byte-per-slot stride. Sunday first
+  // to match the Sakamoto convention (return 0 = Sunday .. 6 = Saturday).
+  pub let cal_dow_names : [u8; 14] = "SuMoTuWeThFrSa"
+
+  // ==========================================================================
+  // cal_days_in_month(year, month) -> u64
+  //
+  // Return the number of days in the given (year, month), 28/29/30/31.
+  // Month must be in 1..=12; a value outside that range yields an
+  // underflow-wrapped or out-of-bounds table read (documented caller
+  // responsibility -- the draw path validates month before calling).
+  //
+  // Leap year rule (integer-only): a February in year Y has 29 days iff
+  //   (Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0
+  //
+  // Pure leaf: no push/pop, no callee-save touched, no nested call.
+  // Effect `!{}` (reads the static table via lea/mov_b -- no caller
+  // memory involved and no side-effect visible past return).
+  // Labels prefixed cal_dim_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let cal_days_in_month : (u64, u64) -> u64 !{} @{} =
+    fn (year: u64) (month: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M4-003 (postui#29): cal_days_in_month is a pure numeric leaf. rdi=year, rsi=month per SysV. Load base days from cal_days_in_month_table[month-1] via `lea r11, [rip + cal_days_in_month_table]` then `xor rax, rax; mov_b rax, [r11 + rsi + 0 - 1]`. Wait, need to sub 1 from month first: `mov r10, rsi; sub r10, 1; xor rax, rax; mov_b rax, [r11 + r10 + 0]`. If month != 2, done. Else check leap year via short-circuit chain: (year%4==0 && year%100!=0) || year%400==0. Emit as three unsigned divides (rax=dividend, xor rdx, mov rcx, N, div rcx; remainder in rdx). First divide: year%4; jne cal_dim_ret (not leap). Second divide: year%100; jne cal_dim_leap (year%4==0 && year%100!=0 -> leap). Third divide: year%400; jne cal_dim_ret (year%400 != 0 -> not leap). cal_dim_leap: add rax, 1 (base 28 -> 29). cal_dim_ret: ret. Pure leaf: no push/pop, no callee-save touched, no nested call. Every immediate (2, 4, 100, 400, 1) fits imm32; shift counts unused. No `test`, no `imul`, no `cmp reg, imm64`. lea into r11 is safe because paideia-as's lea-emission uses r11 as internal scratch; leaing INTO r11 sidesteps that (matches canvas.pdx L525 discipline). Labels prefixed cal_dim_ per docs fingerprint discipline.",
+      block: {
+        // ---- Load base days from table via month-1 index ----------------
+        lea r11, [rip + cal_days_in_month_table];
+        mov r10, rsi;
+        sub r10, 1;
+        xor rax, rax;
+        mov_b rax, [r11 + r10 + 0];
+
+        // ---- If month != 2, return the base value verbatim -------------
+        cmp rsi, 2;
+        jne cal_dim_ret;
+
+        // ---- Leap-year test: (Y%4==0 && Y%100!=0) || Y%400==0 ----------
+        // year % 4
+        mov r8, rax;                       // save base (28) across divides
+        mov rax, rdi;
+        xor rdx, rdx;
+        mov rcx, 4;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_dim_not_leap;
+
+        // year % 100
+        mov rax, rdi;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_dim_leap;                  // %4==0 && %100!=0 -> leap
+
+        // year % 400
+        mov rax, rdi;
+        xor rdx, rdx;
+        mov rcx, 400;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_dim_not_leap;
+
+      cal_dim_leap:
+        mov rax, r8;                       // restore base (28)
+        add rax, 1;                        // 29
+        ret;
+
+      cal_dim_not_leap:
+        mov rax, r8;                       // restore base (28)
+        ret;
+
+      cal_dim_ret:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cal_weekday_of_first(year, month) -> u64
+  //
+  // Return the weekday (0 = Sunday .. 6 = Saturday) of the first of the
+  // given (year, month), via Sakamoto's method:
+  //
+  //   if (month < 3) year -= 1
+  //   return (year + year/4 - year/100 + year/400 + t[month-1] + 1) % 7
+  //
+  // Month must be in 1..=12 (documented caller responsibility -- the
+  // draw path validates month before calling; a value outside 1..=12
+  // yields an out-of-bounds table read).
+  //
+  // Pure leaf: no push/pop, no callee-save touched, no nested call.
+  // Effect `!{}` (reads the static table via lea/mov_b only).
+  // Labels prefixed cal_wf_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let cal_weekday_of_first : (u64, u64) -> u64 !{} @{} =
+    fn (year: u64) (month: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M4-003 (postui#29): cal_weekday_of_first is a pure numeric leaf implementing Sakamoto's method. rdi=year, rsi=month per SysV. Snapshot table addr into r11 via `lea r11, [rip + cal_sakamoto_t]` (leaing INTO r11 sidesteps paideia-as's r11 lea-scratch discipline). Copy year into r8 (working reg); if month < 3, sub r8, 1 (year -= 1). Compute year/4 via `mov rax, r8; xor rdx, rdx; mov rcx, 4; div rcx` -> quotient in rax, stash to r9. Compute year/100 similarly, stash to r10. Compute year/400 similarly, keep in rax. Load t[month-1] via `mov rdx, rsi; sub rdx, 1; xor rcx, rcx; mov_b rcx, [r11 + rdx + 0]`. Sum = year + year/4 - year/100 + year/400 + t + 1: mov rdx, r8 (year); add rdx, r9 (+year/4); sub rdx, r10 (-year/100); add rdx, rax (+year/400); add rdx, rcx (+t); add rdx, 1 (+1). Final % 7: mov rax, rdx; xor rdx, rdx; mov rcx, 7; div rcx; return remainder in rax (mov rax, rdx). Pure leaf. Every immediate (1, 3, 4, 7, 100, 400) fits imm32. No `test`, no `imul`, no `cmp reg, imm64`. Labels prefixed cal_wf_ per docs fingerprint discipline (cal_wf_year_ok for the year-adjust gate).",
+      block: {
+        // ---- Snapshot table addr into r11 -------------------------------
+        lea r11, [rip + cal_sakamoto_t];
+
+        // ---- year adjust: if month < 3, year -= 1 -----------------------
+        mov r8, rdi;                       // r8 = working year
+        cmp rsi, 3;
+        jae cal_wf_year_ok;
+        sub r8, 1;
+      cal_wf_year_ok:
+
+        // ---- year/4 -> r9 -----------------------------------------------
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 4;
+        div rcx;
+        mov r9, rax;
+
+        // ---- year/100 -> r10 --------------------------------------------
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;
+        mov r10, rax;
+
+        // ---- year/400 -> rax --------------------------------------------
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 400;
+        div rcx;
+
+        // ---- t[month-1] -> rcx (mov_b, pre-zero for pitfall #1248) -----
+        mov rdx, rsi;
+        sub rdx, 1;
+        xor rcx, rcx;
+        mov_b rcx, [r11 + rdx + 0];
+
+        // ---- Sum = year + year/4 - year/100 + year/400 + t + 1 ---------
+        mov rdx, r8;                       // rdx = year
+        add rdx, r9;                       // + year/4
+        sub rdx, r10;                      // - year/100
+        add rdx, rax;                      // + year/400
+        add rdx, rcx;                      // + t[month-1]
+        add rdx, 1;                        // + 1
+
+        // ---- % 7 --------------------------------------------------------
+        mov rax, rdx;
+        xor rdx, rdx;
+        mov rcx, 7;
+        div rcx;
+        mov rax, rdx;                      // return remainder (weekday)
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // calendar_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (matches WidgetKind::widget_draw dispatch
+  // per src/widget_kind.pdx L216). `rows` is unread (back region
+  // starts at buf_ptr+0). Returns 0 (OK) on any successful render
+  // (including zero-sized rect and tail-truncated grids); returns
+  // CAL_ERR_BAD_MONTH (0xFFFFEBE5) when month == 0 or > 12.
+  //
+  // Draw sequence:
+  //   0. Cache invariants (rbx=buf_ptr, r12=cols, r13=spec_ptr,
+  //      r14=packed rect). Snapshot 4 table addresses to stack
+  //      (BEFORE any r11 state, since paideia-as's `lea reg, [rip+lbl]`
+  //      uses r11 internally; matches sparkline.pdx L447 discipline).
+  //      Early-return 0 on zero-sized rect (bw==0 || bh==0).
+  //   1. Validate month (1..=12); else return CAL_ERR_BAD_MONTH.
+  //   2. Compute days_in_month (leap-adjust for Feb).
+  //   3. Compute first_weekday via Sakamoto's method (inline;
+  //      calendar_draw does NOT call cal_weekday_of_first to keep
+  //      the body a strict leaf so the alignment budget is only the
+  //      one-time push+sub discipline anchor).
+  //   4. Precompute normal and selected style-word halves into stack
+  //      scratch.
+  //   5. Fill entire rect with normal-space cells.
+  //   6. Overlay header row: "Mmm YYYY" at (bx..bx+7, by). Skipped
+  //      iff bw < 8.
+  //   7. Overlay day-of-week header at (bx..bx+19, by+1). Skipped
+  //      iff bw < 20 or bh < 2.
+  //   8. Overlay day grid at rows by+2 .. by+bh-1, cols bx+col*3 for
+  //      col in 0..6. Skipped entirely iff bh < 3; individual grid
+  //      rows past by+bh are dropped silently.
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the
+  // canvas's stamped rows/cols; adding a gate here would double-charge
+  // every cell write for no marginal safety (same posture buffer_at /
+  // block_draw / scrollbar_draw / sparkline_draw take).
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 128; entry rsp%16==8,
+  // +40==48 aligned, +128==176 aligned):
+  //   rbx = buf_ptr       r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect (also reused as day counter in phase 8)
+  //   Stack scratch (128 bytes):
+  //     [rsp+0]   normal_style_high    ((s & 0xFFFFFF) << 32) |
+  //                                    (((s >> 24) & 0xFF) << 56)
+  //     [rsp+8]   normal_word1         ((s >> 32) & 0xFFFF) |
+  //                                    (((s >> 48) & 0xFF) << 16)
+  //     [rsp+16]  selected_style_high  as above for style_selected
+  //     [rsp+24]  selected_word1       as above for style_selected
+  //     [rsp+32]  bx                   (rect.x)
+  //     [rsp+40]  by                   (rect.y)
+  //     [rsp+48]  bw                   (rect.w)
+  //     [rsp+56]  bh                   (rect.h)
+  //     [rsp+64]  days_in_month        (28..=31)
+  //     [rsp+72]  first_weekday        (0..=6)
+  //     [rsp+80]  month_names_addr     (lea rip + cal_month_names)
+  //     [rsp+88]  dow_names_addr       (lea rip + cal_dow_names)
+  //     [rsp+96]  selected_day         (0..=31 verbatim from spec)
+  //     [rsp+104] days_table_addr      (lea rip + cal_days_in_month_table)
+  //     [rsp+112] sakamoto_t_addr      (lea rip + cal_sakamoto_t)
+  //     [rsp+120] year                 (verbatim; needed for leap,
+  //                                    Sakamoto, and header row)
+  //
+  // Labels prefixed cal_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let calendar_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-003 (postui#29): calendar_draw is the widget_draw-shape entry for WK_CALENDAR (M4-003). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 128 (16 u64 slots, keeps rsp%16==0). Body makes NO nested calls (Sakamoto and leap are inlined so the alignment budget is one-time). Phase 0 (prologue): cache buf_ptr in rbx, cols in r12, spec_ptr in r13; snapshot 4 table addresses (cal_month_names, cal_dow_names, cal_days_in_month_table, cal_sakamoto_t) into stack BEFORE loading r14 or any other r11-clobber-sensitive state -- paideia-as's `lea reg, [rip + label]` uses r11 as internal scratch (sparkline.pdx L447 discipline). Then mov r14, [r13+0] (packed rect). Extract bx/by/bw/bh via mov+shr+and 0xFFFF chains, store to [rsp+32..64]. Early-return 0 (xor rax + unwind) if bw==0 or bh==0. Phase 1 (month validate): load month from [r13+16] into rax; if 0 or > 12, mov rax, 0xFFFFEBE5 (movabs; > 0x7FFFFFFF, legal for mov not cmp/and) and jump to cal_err_epilogue. Phase 2 (days_in_month): load days_table_addr from [rsp+104]; compute month-1 as index; xor r15, r15; mov_b r15, [table + idx + 0]. If month != 2, skip leap. Else leap chain: load year from [r13+8] into r9 (also save to [rsp+120] for Sakamoto + header); year%4 via mov rax, r9; xor rdx; mov rcx, 4; div rcx; if remainder != 0 -> cal_days_ready. year%100 similarly; if remainder != 0 -> cal_is_leap. year%400 similarly; if remainder != 0 -> cal_days_ready. cal_is_leap: add r15, 1 (28 -> 29). cal_days_ready: mov [rsp+64], r15. Also make sure year at [rsp+120] is set regardless of the month==2 branch: an unconditional `mov r9, [r13+8]; mov [rsp+120], r9` right before the leap-year test satisfies both paths (leap uses r9, non-Feb months skip leap but Sakamoto + header still need the stashed year). Phase 3 (Sakamoto weekday of month first): load sakamoto_t_addr from [rsp+112]; load month from [r13+16]. If month < 3, r9 (working year) = year - 1; else r9 = year (reload from [rsp+120]). Compute year/4 into a scratch reg via mov rax, r9; xor rdx; mov rcx, 4; div rcx; save to r10. Compute year/100 into r11 (not conflicting -- r11 is caller-save and unused across the divides). Actually r11 conflicts with the LEA-scratch discipline BUT no lea remains in the function past prologue, so r11 is freely usable as a scratch reg from here to end. Compute year/400 -> stash to r15 (we clobber r15 after phase-2 finishes storing days_in_month to [rsp+64], so r15 is free). Load t[month-1] via `mov rdx, [r13+16]; sub rdx, 1; mov rcx, [rsp+112]; xor r8, r8; mov_b r8, [rcx + rdx + 0]`. Sum = r9 + r10 - r11 + r15 + r8 + 1 into an accumulator (e.g. mov rax, r9; add rax, r10; sub rax, r11; add rax, r15; add rax, r8; add rax, 1). Mod 7: xor rdx, rdx; mov rcx, 7; div rcx; store rdx to [rsp+72]. Phase 4 (style precompute): load style_normal from [r13+32] into r11; compute style_high = ((s & 0xFFFFFF) << 32) | (((s >> 24) & 0xFF) << 56) via mask/shift/or (all immediates fit imm32); store to [rsp+0]. Compute word1 = ((s >> 32) & 0xFFFF) | (((s >> 48) & 0xFF) << 16); store to [rsp+8]. Repeat for style_selected from [r13+40], storing to [rsp+16] / [rsp+24]. Load selected_day from [r13+24], store to [rsp+96]. Phase 5 (fill rect with normal-space cells): re-load bx/by/bw/bh from stack; compute xe = bx + bw, ye = by + bh; outer y loop rdx from by to ye-1, inner x loop rcx from bx to xe-1; per cell dst = buf_ptr + (y*cols + x)*16 via mov rax, rdx; imul rax, r12 (2-op reg,reg); add rax, rcx; shl rax, 4; add rax, rbx. word0 = normal_style_high | 0x20 (space; stage style_high through r10 with `mov r10, [rsp+0]; or r10, 0x20`; the codebase avoids `or reg, mem` and `or reg, imm64` -- imm 0x20 fits imm32 so `or r10, 0x20` is safe). word1 = [rsp+8]. Two 8-byte stores. Phase 6 (header row 'Mmm YYYY'): early-out if bw < 8. src = month_names_addr + (month-1)*4; store src into [rsp+104] (repurpose days_table_addr slot -- days_table no longer needed after phase 2). y_hdr in r9 = by ([rsp+40]). Draw 3 name bytes at (bx..bx+2, y_hdr): loop i 0..3, xor rax, rax; mov_b rax, [src + i + 0]; compose word0 = rax | [rsp+0] (stage through r10); dst compute as above; two stores. After name (r10 = bx + 3), skip space cell (already normal-space from fill); r10 = bx + 4 for the year digits. Draw 4 year digits at (bx+4..bx+7, y_hdr) via a right-to-left divmod-10 chain: divide year by 1000, 100, 10, 1 in sequence. Thousands: mov rax, [rsp+120]; xor rdx; mov rcx, 1000; div rcx (rax = thousands, rdx = rem). Save rdx into r11 (working year remainder). Stamp thousands: add rax, 0x30 (imm32); or rax, [rsp+0] via a scratch reg; dst compute at r10; two stores; add r10, 1. Hundreds: mov rax, r11; xor rdx; mov rcx, 100; div rcx; r11 = rdx; stamp rax + 0x30. Tens: same pattern with rcx=10. Units: rax = r11 (rem after tens divide); stamp rax + 0x30. Phase 7 (DOW header at y_hdr + 1): early-out if bw < 20 or bh < 2. y_dow = by + 1. Loop dow 0..7: x = bx + dow * 3 (via triple-add: r8 = dow; add r8, dow; add r8, dow; add r8, bx). Load byte0 = dow_names[dow*2] via `mov r8, dow; add r8, dow; mov rcx, [rsp+88]; xor rax, rax; mov_b rax, [rcx + r8 + 0]`. Compose word0 = rax | [rsp+0] (stage via scratch reg). dst compute at (x, y_dow). Two stores. Byte 1 at (x+1, y_dow) with similar shape (idx = dow*2 + 1). Phase 8 (day grid): early-out if bh < 3. r14 = day counter starting at 1 (r14 was packed rect, no longer needed). Loop cal_grid_loop: cmp r14, [rsp+64]; ja cal_ret_ok. slot = first_weekday + d - 1 into r8; row = slot / 7, col = slot % 7 (single divide, quotient in rax, remainder in rdx). y = by + 2 + row; if y >= by + bh, cal_ret_ok (grid tail overflow). x = bx + col * 3 via triple-add. Choose style pair: if r14 == selected_day, r8 = selected_style_high, r10 = selected_word1; else r8 = normal_style_high, r10 = normal_word1. digits = d / 10 (tens in rax) and d % 10 (units in rdx) via single divide with rcx=10. Tens cell: if tens == 0, rax = 0x20 (space); else rax = tens + 0x30. or rax, r8 (word0). dst compute at (x, y); mov [dst+0], rax; mov [dst+8], r10. Units cell: rax = units + 0x30; or rax, r8; dst compute at (x+1, y); two stores. add r14, 1; jmp cal_grid_loop. Epilogue cal_ret_ok: xor rax, rax; add rsp, 128; pop r15/r14/r13/r12/rbx (reverse); ret. Epilogue cal_err_epilogue: mov rax, 0xFFFFEBE5; add rsp, 128; pop 5; ret. Every immediate (0, 1, 2, 3, 4, 7, 8, 10, 12, 20, 100, 400, 1000, 0x20, 0x30, 0xFF, 0xFFFF, 0xFFFFFF, shift counts 4/16/24/32/48/56) fits imm32/imm8. The two sentinels (CAL_ERR_BAND 0xFFFFEBE4 -- unused at v1 -- and CAL_ERR_BAD_MONTH 0xFFFFEBE5) are loaded via mov reg, imm (movabs, > 0x7FFFFFFF, legal for mov). 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. No `cmp reg, [mem]`. No `or reg, [mem]` (every glyph/style combine stages the memory operand into a scratch reg first). Effect `!{mem}` (fill + overlay cell writes + spec + static-table reads). Labels prefixed cal_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 128;
+
+        // ---- Prologue: cache invariants ----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+
+        // ---- Snapshot table addresses (lea BEFORE any r11 use) ----------
+        lea rax, [rip + cal_month_names];
+        mov [rsp + 80], rax;
+        lea rax, [rip + cal_dow_names];
+        mov [rsp + 88], rax;
+        lea rax, [rip + cal_days_in_month_table];
+        mov [rsp + 104], rax;
+        lea rax, [rip + cal_sakamoto_t];
+        mov [rsp + 112], rax;
+
+        // ---- Load packed rect and extract fields ------------------------
+        mov r14, [r13 + 0];               // r14 = packed rect
+
+        mov r8, r14;
+        and r8, 0xFFFF;                   // bx
+        mov [rsp + 32], r8;
+
+        mov r8, r14;
+        shr r8, 16;
+        and r8, 0xFFFF;                   // by
+        mov [rsp + 40], r8;
+
+        mov r8, r14;
+        shr r8, 32;
+        and r8, 0xFFFF;                   // bw
+        mov [rsp + 48], r8;
+
+        mov r9, r14;
+        shr r9, 48;                       // bh
+        mov [rsp + 56], r9;
+
+        // ---- Early-return on zero-sized rect ----------------------------
+        mov r8, [rsp + 48];
+        cmp r8, 0;
+        je  cal_ret_ok;
+        cmp r9, 0;
+        je  cal_ret_ok;
+
+        // ---- Validate month (1..=12) ------------------------------------
+        mov rax, [r13 + 16];              // month
+        cmp rax, 0;
+        je  cal_err_epilogue;
+        cmp rax, 12;
+        ja  cal_err_epilogue;
+
+        // ---- Compute days_in_month (leap-adjust Feb) --------------------
+        mov rcx, [rsp + 104];             // days_table_addr
+        mov rdx, rax;                     // month
+        sub rdx, 1;                       // month - 1
+        xor r15, r15;
+        mov_b r15, [rcx + rdx + 0];       // base days (28/30/31)
+
+        // Stash year unconditionally (needed by Sakamoto + header row) ---
+        mov r9, [r13 + 8];                // year
+        mov [rsp + 120], r9;
+
+        // If month != 2, skip leap chain -----------------------------------
+        cmp rax, 2;
+        jne cal_days_ready;
+
+        // year % 4
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 4;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_days_ready;               // %4 != 0 -> not leap
+
+        // year % 100
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_is_leap;                  // %4==0 && %100!=0 -> leap
+
+        // year % 400
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 400;
+        div rcx;
+        cmp rdx, 0;
+        jne cal_days_ready;               // %400 != 0 -> not leap
+
+      cal_is_leap:
+        add r15, 1;                       // 28 -> 29
+
+      cal_days_ready:
+        mov [rsp + 64], r15;              // days_in_month
+
+        // ---- Sakamoto weekday of month first -----------------------------
+        // reload month
+        mov rax, [r13 + 16];
+        // r9 = working year; if month < 3, year -= 1
+        mov r9, [rsp + 120];
+        cmp rax, 3;
+        jae cal_sak_year_ok;
+        sub r9, 1;
+      cal_sak_year_ok:
+
+        // year/4 -> r10
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 4;
+        div rcx;
+        mov r10, rax;
+
+        // year/100 -> r11
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;
+        mov r11, rax;
+
+        // year/400 -> r15  (r15 = days_in_month is safely stashed at [rsp+64])
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 400;
+        div rcx;
+        mov r15, rax;
+
+        // t[month-1] -> r8
+        mov rdx, [r13 + 16];
+        sub rdx, 1;
+        mov rcx, [rsp + 112];             // sakamoto_t_addr
+        xor r8, r8;
+        mov_b r8, [rcx + rdx + 0];
+
+        // sum = year + year/4 - year/100 + year/400 + t + 1
+        mov rax, r9;                      // year
+        add rax, r10;                     // + year/4
+        sub rax, r11;                     // - year/100
+        add rax, r15;                     // + year/400
+        add rax, r8;                      // + t
+        add rax, 1;                       // + 1
+
+        // % 7 -> [rsp+72]
+        xor rdx, rdx;
+        mov rcx, 7;
+        div rcx;
+        mov [rsp + 72], rdx;              // first_weekday
+
+        // ---- Precompute normal style words ------------------------------
+        mov r11, [r13 + 32];              // style_normal
+
+        // normal_style_high = ((s & 0xFFFFFF) << 32) | (((s >> 24) & 0xFF) << 56)
+        mov rcx, r11;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r11;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rcx, rax;
+        mov [rsp + 0], rcx;
+
+        // normal_word1 = ((s >> 32) & 0xFFFF) | (((s >> 48) & 0xFF) << 16)
+        mov rax, r11;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rdx, r11;
+        shr rdx, 48;
+        and rdx, 0xFF;
+        shl rdx, 16;
+        or  rax, rdx;
+        mov [rsp + 8], rax;
+
+        // ---- Precompute selected style words ----------------------------
+        mov r11, [r13 + 40];              // style_selected
+
+        mov rcx, r11;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r11;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rcx, rax;
+        mov [rsp + 16], rcx;
+
+        mov rax, r11;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rdx, r11;
+        shr rdx, 48;
+        and rdx, 0xFF;
+        shl rdx, 16;
+        or  rax, rdx;
+        mov [rsp + 24], rax;
+
+        // ---- Cache selected_day -----------------------------------------
+        mov rax, [r13 + 24];
+        mov [rsp + 96], rax;
+
+        // =====================================================================
+        // Phase 5: fill entire rect with normal-space cells
+        // =====================================================================
+        mov r8, [rsp + 32];               // bx
+        mov r9, [rsp + 40];               // by
+        mov r10, [rsp + 48];              // bw
+        mov r11, [rsp + 56];              // bh
+
+        mov rsi, r8;
+        add rsi, r10;                     // xe = bx + bw
+        mov rdi, r9;
+        add rdi, r11;                     // ye = by + bh
+
+        mov rdx, r9;                      // y counter = by
+
+      cal_fill_yloop:
+        cmp rdx, rdi;
+        jae cal_fill_done;
+
+        mov rcx, r8;                      // x counter = bx
+
+      cal_fill_xloop:
+        cmp rcx, rsi;
+        jae cal_fill_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp normal-space cell: word0 = 0x20 | normal_style_high
+        mov r10, [rsp + 0];
+        or  r10, 0x20;
+        mov [rax + 0], r10;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp cal_fill_xloop;
+
+      cal_fill_ynext:
+        add rdx, 1;
+        jmp cal_fill_yloop;
+
+      cal_fill_done:
+
+        // =====================================================================
+        // Phase 6: header row "Mmm YYYY" at (bx..bx+7, by)
+        // =====================================================================
+        mov r11, [rsp + 48];              // bw
+        cmp r11, 8;
+        jb  cal_skip_header;
+
+        // src = month_names_addr + (month - 1) * 4
+        mov rcx, [r13 + 16];              // month
+        sub rcx, 1;                       // month - 1
+        shl rcx, 2;                       // * 4
+        mov rax, [rsp + 80];              // month_names_addr
+        add rax, rcx;
+        mov [rsp + 104], rax;             // src (repurpose days_table slot)
+
+        // y_hdr = by (kept in r9 for whole header phase)
+        mov r9, [rsp + 40];
+
+        // x counter r10 = bx
+        mov r10, [rsp + 32];
+
+        // Draw 3 name bytes at (bx..bx+2, by)
+        xor r15, r15;                     // i = 0
+
+      cal_hdr_name:
+        cmp r15, 3;
+        jae cal_hdr_name_done;
+
+        mov rcx, [rsp + 104];             // src
+        xor rax, rax;
+        mov_b rax, [rcx + r15 + 0];       // byte
+
+        // word0 = byte | normal_style_high
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+
+        // dst = buf_ptr + (y_hdr * cols + x) * 16
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r10;
+        shl rcx, 4;
+        add rcx, rbx;
+
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];               // normal_word1
+        mov [rcx + 8], rax;
+
+        add r10, 1;                       // x++
+        add r15, 1;
+        jmp cal_hdr_name;
+
+      cal_hdr_name_done:
+        // r10 now = bx + 3; the space cell at (bx+3, by) stays as filled.
+        add r10, 1;                       // r10 = bx + 4 (thousands column)
+
+        // ---- Year digits (thousands, hundreds, tens, units) --------------
+        // Thousands
+        mov rax, [rsp + 120];             // year
+        xor rdx, rdx;
+        mov rcx, 1000;
+        div rcx;
+        mov r11, rdx;                     // remainder (year % 1000)
+        add rax, 0x30;
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r10;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+        add r10, 1;
+
+        // Hundreds
+        mov rax, r11;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;
+        mov r11, rdx;
+        add rax, 0x30;
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r10;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+        add r10, 1;
+
+        // Tens
+        mov rax, r11;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;
+        mov r11, rdx;
+        add rax, 0x30;
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r10;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+        add r10, 1;
+
+        // Units
+        mov rax, r11;
+        add rax, 0x30;
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r10;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+
+      cal_skip_header:
+
+        // =====================================================================
+        // Phase 7: DOW header "Su Mo Tu We Th Fr Sa" at (bx..bx+19, by+1)
+        // =====================================================================
+        mov r11, [rsp + 56];              // bh
+        cmp r11, 2;
+        jb  cal_skip_dow;
+        mov r11, [rsp + 48];              // bw
+        cmp r11, 20;
+        jb  cal_skip_dow;
+
+        // y_dow = by + 1 (in r9)
+        mov r9, [rsp + 40];
+        add r9, 1;
+
+        xor r10, r10;                     // dow counter = 0
+
+      cal_dow_loop:
+        cmp r10, 7;
+        jae cal_dow_done;
+
+        // x = bx + dow * 3 (into r11 for cell target)
+        mov r8, r10;
+        add r8, r10;
+        add r8, r10;                      // dow * 3
+        mov r11, [rsp + 32];
+        add r11, r8;                      // r11 = bx + dow*3
+
+        // Byte 0 at (x, y_dow): dow_names[dow * 2]
+        mov r8, r10;
+        add r8, r10;                      // dow * 2
+        mov rcx, [rsp + 88];              // dow_names_addr
+        xor rax, rax;
+        mov_b rax, [rcx + r8 + 0];
+
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r11;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+
+        // Byte 1 at (x+1, y_dow): dow_names[dow*2 + 1]
+        add r11, 1;                       // x++
+        mov r8, r10;
+        add r8, r10;
+        add r8, 1;                        // dow * 2 + 1
+        mov rcx, [rsp + 88];
+        xor rax, rax;
+        mov_b rax, [rcx + r8 + 0];
+
+        mov rdx, [rsp + 0];
+        or  rax, rdx;
+
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r11;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov rax, [rsp + 8];
+        mov [rcx + 8], rax;
+
+        add r10, 1;
+        jmp cal_dow_loop;
+
+      cal_dow_done:
+      cal_skip_dow:
+
+        // =====================================================================
+        // Phase 8: day grid at rows by+2 .. by+bh-1
+        // =====================================================================
+        mov r11, [rsp + 56];              // bh
+        cmp r11, 3;
+        jb  cal_ret_ok;                   // no room for even one grid row
+
+        // r14 = day counter, starting at 1 (packed rect no longer needed)
+        mov r14, 1;
+
+      cal_grid_loop:
+        // Check d <= days_in_month
+        mov r11, [rsp + 64];
+        cmp r14, r11;
+        ja  cal_ret_ok;
+
+        // slot = first_weekday + d - 1
+        mov r8, [rsp + 72];               // first_weekday
+        add r8, r14;
+        sub r8, 1;
+
+        // row = slot / 7 (rax), col = slot % 7 (rdx)
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 7;
+        div rcx;
+
+        // y = by + 2 + row  (into r9)
+        mov r9, [rsp + 40];
+        add r9, 2;
+        add r9, rax;
+
+        // Check y < by + bh
+        mov rcx, [rsp + 40];
+        add rcx, [rsp + 56];
+        cmp r9, rcx;
+        jae cal_ret_ok;                   // grid overflowed
+
+        // x = bx + col * 3 (into r11)
+        mov r11, rdx;
+        add r11, rdx;
+        add r11, rdx;                     // col * 3
+        add r11, [rsp + 32];              // + bx
+
+        // Choose style: r8 = style_high, r10 = word1
+        mov rax, [rsp + 96];              // selected_day
+        cmp r14, rax;
+        je  cal_grid_selected;
+        mov r8, [rsp + 0];
+        mov r10, [rsp + 8];
+        jmp cal_grid_style_done;
+
+      cal_grid_selected:
+        mov r8, [rsp + 16];
+        mov r10, [rsp + 24];
+
+      cal_grid_style_done:
+
+        // digits: d / 10 -> tens (rax), d % 10 -> units (rdx)
+        mov rax, r14;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;
+
+        // Tens cell at (x, y): if tens == 0, space; else tens + '0'
+        cmp rax, 0;
+        jne cal_grid_tens_digit;
+        mov rax, 0x20;
+        jmp cal_grid_tens_ready;
+
+      cal_grid_tens_digit:
+        add rax, 0x30;
+
+      cal_grid_tens_ready:
+        or  rax, r8;                      // word0 = char | style_high
+
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r11;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], r10;
+
+        // Units cell at (x+1, y): rdx (units) + '0'
+        mov rax, rdx;
+        add rax, 0x30;
+        or  rax, r8;
+
+        add r11, 1;                       // x++
+        mov rcx, r9;
+        imul rcx, r12;
+        add rcx, r11;
+        shl rcx, 4;
+        add rcx, rbx;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], r10;
+
+        add r14, 1;
+        jmp cal_grid_loop;
+
+      cal_ret_ok:
+        xor rax, rax;
+        add rsp, 128;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cal_err_epilogue:
+        mov rax, 0xFFFFEBE5;              // CAL_ERR_BAD_MONTH (movabs)
+        add rsp, 128;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // calendar_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a CalendarView@0.1 semantic-pipe record into [dst..dst+32).
+  // record_len is fixed at 32 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to a later postui.M4-close-out revision that adds
+  // SEMANTIC_SCHEMA_CLVW to src/semantic_registry.pdx -- this packer
+  // is the wire-format authority so that landing's registry glue only
+  // has to know the schema-name string (for BLAKE3 hashing) and this
+  // packer (for the byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call.
+  // Effect `!{mem}` (reads through rdi, writes through rsi).
+  // Labels prefixed cal_bv_ per docs fingerprint discipline (none
+  // needed at v1 -- record is fixed-length, no branches).
+  // ==========================================================================
+  pub let calendar_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-003 (postui#29): calendar_view_pack lays a fixed-32-byte CalendarView@0.1 record at [rsi..rsi+32). Header phase writes six scalar fields in one straight-line sequence: `mov rax, 0x57564C43` then `mov_d [rsi+0], rax` stamps the 'CLVW' magic (0x57564C43 = 1_465_267_267 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches scrollbar_view_pack's SBVW and sparkline_view_pack's SPVW idioms). record_len is a hard 32 (no variable-length payload), stored via `mov rax, 32; mov_d [rsi+4], rax`. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store -- CalendarSpec's rect slot and CalendarView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. year (u64) is loaded from [rdi+8] and stored qword at [rsi+16] (full u64 retention because a downstream analyzer wanting to reason about the calendar's semantics must round-trip years > 65535 verbatim). month (u64 in spec) is stored as u32 at [rsi+24] via mov_d -- month is 1..=12 so no truncation risk. selected_day (u64 in spec) is stored as u32 at [rsi+28] via mov_d -- selected_day is 0..=31 so no truncation risk. return rax = 32. Every immediate (0x57564C43, 32, 0, 4, 8, 16, 24, 28) fits imm32. No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 4 qword-loads / 2 qword-stores / 1 dword-magic-store / 1 dword-record_len-store / 1 dword-month-store / 1 dword-selected_day-store.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564C43;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 32;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- year (u64) at [rsi + 16] --------------------------------------
+        mov rax, [rdi + 8];
+        mov [rsi + 16], rax;
+
+        // ---- month (u32) at [rsi + 24] -------------------------------------
+        mov rax, [rdi + 16];
+        mov_d [rsi + 24], rax;
+
+        // ---- selected_day (u32) at [rsi + 28] ------------------------------
+        mov rax, [rdi + 24];
+        mov_d [rsi + 28], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 32;
+        ret;
+      }
+    }
+
+}
