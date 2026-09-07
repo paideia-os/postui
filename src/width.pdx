@@ -1,0 +1,518 @@
+// src/width.pdx -- postui.M2-003 (paideia-os/postui#12)
+//
+// Width module: UTF-8 grapheme-width approximation.
+//
+// =============================================================================
+// SCOPE (docs/design.md §1.5 grapheme width; §2.6 Paragraph / Table wrap)
+// =============================================================================
+//
+// Ratatui depends on the `unicode-width` crate for column-width computation
+// (a CJK ideograph occupies two terminal cells, a Latin letter one, a
+// combining mark zero). paideia-as has no such facility. docs/design.md
+// §1.5 argues this is a stdlib routine, not a compiler gap: "computing
+// UTF-8 continuation-byte spans and looking up a codepoint range against
+// a East-Asian-Width table is ordinary byte-scanning logic + a static
+// lookup table -- entirely expressible in plain .pdx today". This module
+// is exactly that -- the routine that every widget which wraps or clips
+// text (Paragraph M2-005, List M2-006, Table M2-007, Tabs M2-008,
+// TextInput M4-004, plus every Block title that exceeds its inner width)
+// routes through.
+//
+// =============================================================================
+// APPROXIMATION -- WHAT THIS MODULE IS AND IS NOT
+// =============================================================================
+//
+// v1 is an EAST-ASIAN-WIDTH APPROXIMATION over UTF-8 code units, NOT a
+// full UAX #29 extended-grapheme-cluster boundary detector. Specifically:
+//
+//   IN SCOPE (docs/design.md §1.5, "common East-Asian-Wide ranges"):
+//     * ASCII control chars (< 0x20 and 0x7F..0x9F) render as width 0
+//     * Printable ASCII and Latin-1 (0x20..0x7E, 0xA0..0xFF) width 1
+//     * 2-byte UTF-8 sequences (Latin-Extended, Greek, Cyrillic,
+//       Hebrew, Arabic, ...) all approximate to width 1
+//     * 3-byte UTF-8 sequences (U+0800..U+FFFF): consulted against a
+//       static wide-range table (7 ranges covering CJK Symbols,
+//       Hiragana, Katakana, CJK Unified Ideographs, Hangul Syllables,
+//       Fullwidth ASCII, Fullwidth punctuation). Match -> width 2.
+//     * 4-byte UTF-8 sequences (U+10000..U+10FFFF): all approximate
+//       to width 2 (covers CJK Extension B..G planes, kana supplement,
+//       emoji plane. Yes, this over-counts a handful of BMP-adjacent
+//       symbols and misses the rare narrow astral glyph -- documented
+//       trade-off; more expressive coverage costs a second table).
+//
+//   OUT OF SCOPE (postui.v1 known limitations; docs/design.md §1.5):
+//     * Combining marks (U+0300..U+036F, U+FE00..U+FE0F variation
+//       selectors, U+180B..U+180D Mongolian variation selectors, and
+//       the Devanagari / Hebrew combining-mark ranges) currently count
+//       as width 1 rather than 0. A future revision (§5.5 backlog)
+//       will fold a second static table for the zero-width slots; the
+//       WIDTH_WIDE_TABLE_BYTES + WIDTH_WIDE_RANGE_COUNT ceiling is
+//       deliberately sized to have room for that expansion without an
+//       API break.
+//     * Extended-grapheme-cluster boundaries (UAX #29): ZWJ sequences,
+//       regional-indicator flag sequences, and skin-tone modifiers
+//       currently render as multiple cells (each codepoint's width is
+//       counted independently). This mirrors the docs/design.md §1.5
+//       posture "multi-codepoint emoji sequences may render as
+//       multiple cells rather than one".
+//
+// The API surface is deliberately shaped so a v2 upgrade can plug
+// a richer width policy behind the same char_display_width /
+// str_display_width entry points without changing a single caller.
+//
+// =============================================================================
+// WIDE-RANGE TABLE ENCODING
+// =============================================================================
+//
+// The table is stored as a `[u8; WIDTH_WIDE_TABLE_BYTES]` byte array with
+// each range encoded as two little-endian u32 words (start, end) laid
+// out contiguously. WIDTH_WIDE_RANGE_COUNT = 7 ranges * 8 bytes per
+// range = 56 bytes total.
+//
+// A u32 encoding (rather than u16) is a deliberate future-proofing
+// choice: the same table shape can hold 4-byte-plane ranges (astral
+// wide chars like Egyptian Hieroglyphs, U+13000..U+1342F, or emoji
+// Symbols & Pictographs, U+1F300..U+1F5FF) at a later revision without
+// re-encoding the payload. The 3-byte-only lookup path in
+// char_display_width currently ignores that headroom -- every entry
+// today has both start and end in the u16 subrange -- but the byte
+// layout stays stable across the future expansion.
+//
+// Little-endian is x86_64's native byte order; `mov_d reg, [ptr]`
+// naturally reconstructs the u32 without a byte-swap step. Every u32
+// load is preceded by `xor reg, reg` (paideia-as pitfall #1248: mov_d
+// load-side needs explicit zero-extension of the high 32 bits so a
+// subsequent cmp against a u32 value sees a clean high half).
+//
+// Ranges (sorted ascending by start; every start < every end):
+//
+//   (0x3000, 0x303E)   CJK Symbols and Punctuation
+//   (0x3040, 0x309F)   Hiragana
+//   (0x30A0, 0x30FF)   Katakana
+//   (0x4E00, 0x9FFF)   CJK Unified Ideographs
+//   (0xAC00, 0xD7A3)   Hangul Syllables
+//   (0xFF00, 0xFF60)   Halfwidth and Fullwidth Forms (fullwidth)
+//   (0xFFE0, 0xFFE6)   Fullwidth signs (¥, ₩, ¢, £, ¯, ¦)
+//
+// The scan is a linear compare through 7 pairs; at that count linear
+// beats binary search on both LOC and branch-predictability (same
+// argument widget_kind.pdx makes for its 15-branch dispatch chain over
+// a function-pointer table). Bumping to ~16+ ranges should switch to
+// binary search.
+//
+// =============================================================================
+// ERROR BAND -- NONE ALLOCATED
+// =============================================================================
+//
+// Width returns u64 cell counts, not error codes. Every input is valid:
+//   * Malformed UTF-8 (stray continuation, truncated multi-byte,
+//     leading byte 0xF8+) is handled by counting each malformed byte
+//     as width 1 (the U+FFFD replacement-char equivalent, matching the
+//     issue #12 contract "no trap on malformed -- a Width module
+//     cannot page-fault callers over bad UTF-8").
+//   * A zero-length string returns width 0.
+//   * A well-formed prefix followed by a truncated tail returns the
+//     prefix's cell width + one per remaining tail byte.
+//
+// There is no failure return that a caller would branch on. The M2
+// error band (0xFFFFEBC0..0xFFFFEBCF, per design/architecture.md §5.1)
+// was co-reserved for Width alongside Layout at the M2 batch design
+// step; Layout consumed 0xFFFFEBC0..0xFFFFEBC4 (see layout.pdx
+// LAYOUT_ERR_* block), and Width's natural next-slot region
+// (0xFFFFEBC5..0xFFFFEBC9) stays reserved for a v2 revision that
+// might introduce failure returns (e.g. an EAW table version-tag
+// mismatch when the table gains schema versioning at M2-009). At v1
+// nothing in this module allocates from that band; the reservation is
+// documented here so a future M2-004..008 landing does not
+// accidentally re-issue 0xFFFFEBC5..0xFFFFEBC9 to Paragraph or List.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Width`), matches file basename
+//     per manifest.pdxproj sources: entry.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`
+//     (only char_display_width's astral-plane and control-char
+//     compares plus str_display_width's loop-bound `cmp r13, r12`
+//     use compares here; no test anywhere).
+//   - Every `cmp reg, imm` / `and reg, imm` uses imm <= 0x7FFFFFFF.
+//     The widest immediate in this module is 0x10000 (astral-plane
+//     threshold, 65536); the widest mask is 0x3F (continuation-byte
+//     data mask); every shift count (6, 12, 18) is imm8.
+//   - No 2-op `imul reg, imm` (no `imul` at all in this module --
+//     every arithmetic is add / sub / and / shl / shr / or).
+//   - No `and reg, imm64` (widest mask 0x3F, well within imm32).
+//   - Every `mov_b` and `mov_d` load is preceded by `xor reg, reg`
+//     (paideia-as pitfall #1248 load-side zero-extension).
+//   - `pub let X : type = value` is single-line for every constant
+//     and for the table string literal (paideia-as pitfall: multi-line
+//     `pub let` bodies are rejected).
+//   - r11 discipline: neither function preserves r11 state across a
+//     `lea`. char_display_width's one `lea` (for the table base) sits
+//     BEFORE any r11 use; str_display_width does not `lea` anywhere
+//     in its own body -- it calls char_display_width which does its
+//     own lea, and r11 is caller-save across that call so no
+//     str_display_width state ever survives the call in r11 anyway.
+//   - SysV push/pop parity: char_display_width is a pure leaf (no
+//     pushes, no nested call, no rsp adjustment); str_display_width
+//     pushes 5 callee-save regs (rbx/r12/r13/r14/r15 = 40 bytes) so
+//     rsp%16 goes 8 -> 0, aligned for the nested call to
+//     char_display_width without any additional `sub rsp, 8`. Same
+//     5-push shape rect_intersect / block_draw use.
+//   - Labels prefixed `cd_` (char_display_width) and `sd_`
+//     (str_display_width) per docs/design.md fingerprint discipline.
+//     Neither prefix collides with any other postui module's `wd_` /
+//     `bl_` / `ls_` / `rc_` / `ri_` / `wk_` / `cd_` scan -- verified
+//     against every existing .pdx under src/ before landing.
+
+module Width = structure {
+
+  // ==========================================================================
+  // Wide-range table dimensions. Locked at v1: 7 ranges * 8 bytes/pair
+  // = 56 bytes. A v2 revision that adds combining-mark or astral-plane
+  // ranges bumps both constants together and grows the table byte
+  // string; call sites derive their loop bound from
+  // WIDTH_WIDE_TABLE_BYTES so no third source of truth exists.
+  // ==========================================================================
+  pub let WIDTH_WIDE_RANGE_COUNT : u64 = 7
+  pub let WIDTH_WIDE_TABLE_BYTES : u64 = 56
+
+  // ==========================================================================
+  // Byte thresholds used by the UTF-8 lead-byte classifier. Kept as
+  // named constants so a future switch to a different classification
+  // (say, splitting the 3-byte range at 0xED for surrogates) has one
+  // authoritative source. Every value fits imm32 as a positive number.
+  // ==========================================================================
+  pub let WIDTH_LEAD_ASCII_MAX   : u64 = 0x80   // < 0x80 -> ASCII
+  pub let WIDTH_LEAD_2BYTE_MIN   : u64 = 0xC0   // [0xC0..0xE0) -> 2-byte
+  pub let WIDTH_LEAD_3BYTE_MIN   : u64 = 0xE0   // [0xE0..0xF0) -> 3-byte
+  pub let WIDTH_LEAD_4BYTE_MIN   : u64 = 0xF0   // [0xF0..0xF8) -> 4-byte
+  pub let WIDTH_LEAD_INVALID_MIN : u64 = 0xF8   // >= 0xF8 -> invalid
+
+  // ==========================================================================
+  // Wide-range table: 7 pairs of little-endian u32 (start, end), each
+  // pair 8 bytes, sorted ascending by start. See "WIDE-RANGE TABLE
+  // ENCODING" in the module header for the byte layout.
+  //
+  // Ranges (start .. end):
+  //   0x3000..0x303E   CJK Symbols and Punctuation
+  //   0x3040..0x309F   Hiragana
+  //   0x30A0..0x30FF   Katakana
+  //   0x4E00..0x9FFF   CJK Unified Ideographs
+  //   0xAC00..0xD7A3   Hangul Syllables
+  //   0xFF00..0xFF60   Halfwidth and Fullwidth Forms (fullwidth)
+  //   0xFFE0..0xFFE6   Fullwidth signs
+  // ==========================================================================
+  pub let width_wide_table : [u8; 56] = "\x00\x30\x00\x00\x3E\x30\x00\x00\x40\x30\x00\x00\x9F\x30\x00\x00\xA0\x30\x00\x00\xFF\x30\x00\x00\x00\x4E\x00\x00\xFF\x9F\x00\x00\x00\xAC\x00\x00\xA3\xD7\x00\x00\x00\xFF\x00\x00\x60\xFF\x00\x00\xE0\xFF\x00\x00\xE6\xFF\x00\x00"
+
+  // ==========================================================================
+  // char_display_width(codepoint u32) -> u64
+  //
+  // Returns the number of terminal cells a Unicode codepoint occupies.
+  // 0 for controls / combining-mark placeholder, 1 for narrow, 2 for
+  // wide / fullwidth / astral. Never returns any other value.
+  //
+  // Classification order (first match wins):
+  //   cp < 0x20          -> 0   (ASCII C0 control chars)
+  //   cp == 0x7F         -> 0   (DEL)
+  //   cp < 0x80          -> 1   (printable ASCII)
+  //   cp < 0xA0          -> 0   (C1 control chars 0x80..0x9F)
+  //   cp < 0x0800        -> 1   (Latin-1, Latin-Extended, Greek, Cyrillic,
+  //                              Arabic, Hebrew, Devanagari and other
+  //                              2-byte UTF-8 codepoints -- all narrow)
+  //   cp >= 0x10000      -> 2   (astral plane approximation; see module
+  //                              header for the trade-off)
+  //   scan wide table    -> 2 on hit, 1 on miss (3-byte range)
+  //
+  // Pure leaf: no callee-save regs touched, no push/pop, no nested
+  // call. Reads through rip-relative width_wide_table (static rodata)
+  // -- effect row is `!{mem}` following the block_inner precedent
+  // where a pointer-arg read is recorded as {mem}.
+  //
+  // Register plan:
+  //   rdi = cp (input, consumed and rewritten as scratch)
+  //   rax = return
+  //   r8  = table base (loaded via lea BEFORE any r11 use)
+  //   rcx = scan byte offset (0..56 step 8)
+  //   rdx = scan-loop bound (56)
+  //   r9  = table-word scratch (start then end, one at a time)
+  //
+  // Labels prefixed cd_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let char_display_width : (u64) -> u64 !{mem} @{} =
+    fn (cp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-003 (postui#12): char_display_width returns 0/1/2 for a Unicode codepoint. Classification order (first match wins): cp<0x20 -> 0 (C0 controls); cp==0x7F -> 0 (DEL); cp<0x80 -> 1 (printable ASCII); cp<0xA0 -> 0 (C1 controls 0x80..0x9F); cp<0x0800 -> 1 (2-byte-UTF-8 narrow); cp>=0x10000 -> 2 (astral-plane approximation, see module header); else 3-byte range -- linear scan through WIDTH_WIDE_RANGE_COUNT pairs of (u32 start, u32 end) in width_wide_table, matched pair yields 2, exhausted scan yields 1. Every immediate (0x20, 0x7F, 0x80, 0xA0, 0x0800, 0x10000, 0, 56, 1, 2) fits imm32 as a positive value (widest is 0x10000 = 65536); every shift count is imm8 (none in this function; the loop uses `add rcx, 8`). One `lea` in the whole body (`lea r8, [rip + width_wide_table]`) placed BEFORE the scan loop; no r11 state is loaded before that lea, so paideia-as's LEA-emission clobber of r11 is a no-op. Every mov_d load is preceded by `xor r9, r9` (paideia-as pitfall #1248 load-side zero-extension). No `test`, no `imul`, no `and reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (one u32 rodata load per scan iteration through rip-relative width_wide_table -- matches block_inner's convention of recording pointer-derived memory reads as {mem}). Labels prefixed cd_ per docs fingerprint discipline (cd_ascii_ / cd_c1_ / cd_narrow_ / cd_astral_ / cd_scan_ / cd_zero / cd_one / cd_two).",
+      block: {
+        // C0 control chars 0x00..0x1F -> width 0.
+        cmp rdi, 0x20;
+        jb  cd_zero;
+
+        // DEL 0x7F -> width 0.
+        cmp rdi, 0x7F;
+        je  cd_zero;
+
+        // Printable ASCII 0x20..0x7E (0x7F already handled) -> width 1.
+        cmp rdi, 0x80;
+        jb  cd_one;
+
+        // C1 control chars 0x80..0x9F -> width 0.
+        cmp rdi, 0xA0;
+        jb  cd_zero;
+
+        // 2-byte-UTF-8 narrow chars 0xA0..0x07FF -> width 1.
+        cmp rdi, 0x0800;
+        jb  cd_one;
+
+        // Astral plane 0x10000..0x10FFFF -> width 2 (approximation).
+        cmp rdi, 0x10000;
+        jae cd_two;
+
+        // 3-byte range 0x0800..0xFFFF: linear scan the wide table.
+        // Hoist `lea` here (before any r11-touching op) so paideia-as's
+        // r11 LEA-emission scratch does not clobber loop state.
+        lea r8, [rip + width_wide_table];
+        xor rcx, rcx;            // scan byte offset
+        mov rdx, 56;             // WIDTH_WIDE_TABLE_BYTES
+
+      cd_scan_top:
+        cmp rcx, rdx;
+        jae cd_one;              // no range matched -> narrow
+
+        // Load range start (u32 LE) into r9; cmp cp < start -> skip.
+        xor r9, r9;
+        mov_d r9, [r8 + rcx + 0];
+        cmp rdi, r9;
+        jb  cd_scan_next;
+
+        // Load range end (u32 LE); cmp cp > end -> skip.
+        xor r9, r9;
+        mov_d r9, [r8 + rcx + 4];
+        cmp rdi, r9;
+        ja  cd_scan_next;
+
+        // start <= cp <= end -> wide match.
+        jmp cd_two;
+
+      cd_scan_next:
+        add rcx, 8;
+        jmp cd_scan_top;
+
+      cd_zero:
+        xor rax, rax;
+        ret;
+
+      cd_one:
+        mov rax, 1;
+        ret;
+
+      cd_two:
+        mov rax, 2;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // str_display_width(ptr u64, byte_len u64) -> u64
+  //
+  // Returns the total number of terminal cells the UTF-8 byte string at
+  // [ptr..ptr+byte_len) would occupy. byte_len is a byte count, NOT a
+  // codepoint count. The scan walks the input once, byte-by-byte,
+  // classifying each byte as an ASCII byte, a UTF-8 lead byte
+  // (2/3/4-byte class), a stray continuation, or an invalid lead
+  // (>= 0xF8), reconstructs the codepoint for each well-formed
+  // multi-byte sequence, and delegates the width decision to
+  // char_display_width. Malformed / truncated bytes count as width 1
+  // (U+FFFD replacement equivalent) -- see module header ERROR BAND
+  // section.
+  //
+  // Register plan (5 callee-save pushes -> rsp%16 goes 8 -> 0, aligned
+  // for the nested char_display_width call without any additional
+  // `sub rsp, 8`; matches rect_intersect / block_draw discipline; r15
+  // is the alignment-only 5th push, never read or written in the body):
+  //
+  //   rbx = ptr (constant during body)
+  //   r12 = byte_len (constant during body)
+  //   r13 = byte index (loop var, 0..byte_len)
+  //   r14 = accumulated width (loop var, return value)
+  //   r15 = alignment-only, untouched
+  //
+  //   rdi = arg to char_display_width (call-site scratch)
+  //   rax = call return (call-site scratch)
+  //   rdx = current lead byte / reconstructed codepoint (scratch)
+  //   r8  = remaining-bytes count for truncation check (scratch)
+  //   r9  = continuation-byte load scratch (scratch)
+  //
+  // Every `mov_b` load is preceded by `xor reg, reg` (paideia-as
+  // pitfall #1248 load-side zero-extension).
+  //
+  // Labels prefixed sd_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let str_display_width : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (byte_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-003 (postui#12): str_display_width walks a UTF-8 byte string once, classifying each leading byte and delegating the width decision to char_display_width. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes); entry rsp%16 == 8, +40 = 48 (rsp%16 == 0), aligned for a nested SysV call without any additional `sub rsp, 8`. r15 is the alignment-only 5th push, never read or written in the body -- matches rect_intersect / block_draw discipline. Register plan: rbx = ptr (constant), r12 = byte_len (constant), r13 = byte index, r14 = accumulated width. Scratch: rdx (lead byte then reconstructed codepoint), r8 (remaining-bytes count for truncation check), r9 (continuation byte). Loop body: load one byte via `xor rdx, rdx; mov_b rdx, [rbx + r13]` (paideia-as pitfall #1248 load-side zero-extension), then cmp/jae chain on 0x80/0xC0/0xE0/0xF0/0xF8 (each imm32-safe). ASCII branch: mov rdi, rdx; call char_display_width; add r14, rax; add r13, 1. Stray continuation (0x80..0xBF): width 1, advance 1. 2-byte lead (0xC0..0xDF): check r12-r13 >= 2 else truncate; reconstruct cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F); call char_display_width; advance 2. 3-byte lead (0xE0..0xEF): check remaining >= 3 else truncate; cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F); call; advance 3. 4-byte lead (0xF0..0xF7): check remaining >= 4 else truncate; cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); call; advance 4. Invalid (>= 0xF8) or truncated: width 1, advance 1 (each malformed byte counts as one replacement cell per issue #12 contract). Every mask (0x1F, 0x0F, 0x07, 0x3F, 0xC0, 0xE0, 0xF0, 0xF8, 0x80) and count (2, 3, 4) fits imm32; every shift (6, 12, 18) is imm8. No `test`, no `imul`, no `and reg, imm64`. No `lea` in this function body -- char_display_width's `lea` executes inside the callee, and r11 is caller-save across the call so no str_display_width state ever lives in r11. Effect `!{mem}` (byte loads through rbx + transitive char_display_width table read). Labels prefixed sd_ per docs fingerprint discipline (sd_top / sd_ascii_ / sd_stray_ / sd_two_ / sd_three_ / sd_four_ / sd_invalid_ / sd_trunc_ / sd_done).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Prologue: cache args in callee-save regs.
+        mov rbx, rdi;               // rbx = ptr
+        mov r12, rsi;               // r12 = byte_len
+        xor r13, r13;               // r13 = index
+        xor r14, r14;               // r14 = accumulated width
+
+      sd_top:
+        cmp r13, r12;
+        jae sd_done;
+
+        // Load current byte b0.
+        xor rdx, rdx;
+        mov_b rdx, [rbx + r13 + 0];
+
+        // Fast-path ASCII (rdx < 0x80): call char_display_width(b0).
+        cmp rdx, 0x80;
+        jae sd_not_ascii;
+        mov rdi, rdx;
+        call char_display_width;
+        add r14, rax;
+        add r13, 1;
+        jmp sd_top;
+
+      sd_not_ascii:
+        // 0x80..0xBF: stray continuation byte -> width 1 replacement.
+        cmp rdx, 0xC0;
+        jae sd_multi;
+        add r14, 1;
+        add r13, 1;
+        jmp sd_top;
+
+      sd_multi:
+        // 0xC0..0xDF: 2-byte lead.
+        cmp rdx, 0xE0;
+        jae sd_three_or_more;
+
+        // Truncation check: need >= 2 bytes remaining.
+        mov r8, r12;
+        sub r8, r13;
+        cmp r8, 2;
+        jb  sd_trunc;
+
+        // cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+        and rdx, 0x1F;
+        shl rdx, 6;
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 1];
+        and r9, 0x3F;
+        or  rdx, r9;
+
+        mov rdi, rdx;
+        call char_display_width;
+        add r14, rax;
+        add r13, 2;
+        jmp sd_top;
+
+      sd_three_or_more:
+        // 0xE0..0xEF: 3-byte lead.
+        cmp rdx, 0xF0;
+        jae sd_four_or_more;
+
+        // Truncation check: need >= 3 bytes remaining.
+        mov r8, r12;
+        sub r8, r13;
+        cmp r8, 3;
+        jb  sd_trunc;
+
+        // cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+        and rdx, 0x0F;
+        shl rdx, 12;
+
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 1];
+        and r9, 0x3F;
+        shl r9, 6;
+        or  rdx, r9;
+
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 2];
+        and r9, 0x3F;
+        or  rdx, r9;
+
+        mov rdi, rdx;
+        call char_display_width;
+        add r14, rax;
+        add r13, 3;
+        jmp sd_top;
+
+      sd_four_or_more:
+        // 0xF0..0xF7: 4-byte lead.
+        cmp rdx, 0xF8;
+        jae sd_invalid;
+
+        // Truncation check: need >= 4 bytes remaining.
+        mov r8, r12;
+        sub r8, r13;
+        cmp r8, 4;
+        jb  sd_trunc;
+
+        // cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12)
+        //    | ((b2 & 0x3F) << 6)  | (b3 & 0x3F)
+        and rdx, 0x07;
+        shl rdx, 18;
+
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 1];
+        and r9, 0x3F;
+        shl r9, 12;
+        or  rdx, r9;
+
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 2];
+        and r9, 0x3F;
+        shl r9, 6;
+        or  rdx, r9;
+
+        xor r9, r9;
+        mov_b r9, [rbx + r13 + 3];
+        and r9, 0x3F;
+        or  rdx, r9;
+
+        mov rdi, rdx;
+        call char_display_width;
+        add r14, rax;
+        add r13, 4;
+        jmp sd_top;
+
+      sd_invalid:
+        // 0xF8..0xFF: never a valid UTF-8 lead byte -> replacement.
+        add r14, 1;
+        add r13, 1;
+        jmp sd_top;
+
+      sd_trunc:
+        // Truncated multi-byte header: count the lead byte as one
+        // replacement and advance one byte. Subsequent iterations
+        // reclassify each remaining continuation byte independently
+        // (each also counted as one replacement via the stray-
+        // continuation arm above). This yields "well-formed prefix
+        // width + one per malformed byte" per issue #12 contract.
+        add r14, 1;
+        add r13, 1;
+        jmp sd_top;
+
+      sd_done:
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
