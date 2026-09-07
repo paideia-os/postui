@@ -1,59 +1,102 @@
 // src/input/esc_parser.pdx -- postui.M4-005 (paideia-os/postui#31)
+//                             postui.M4-006 (paideia-os/postui#32)
 //
 // EscParser: byte-oriented CSI/SS3/OSC escape-sequence state machine.
 //
 // =============================================================================
-// SCOPE (docs/design.md §2.5, §2.7)
+// SCOPE (docs/design.md 2.5, 2.7)
 // =============================================================================
 //
 // This module ships the state machine that turns raw bytes coming off
 // Frame::next_event (sys_read(0) fallback today, KIND_TTY raw-mode at
 // M4-007) into decoded `Event` records the widget-facing handler at
-// docs/design.md §2.7 consumes.
+// docs/design.md 2.7 consumes.
 //
-// The machine recognises three canonical VT sequence families:
+// The machine recognises three canonical VT sequence families plus two
+// M4-006 extensions:
 //
-//   * CSI: ESC [ <params> <final>            e.g. ESC [ A = Up arrow
-//   * SS3: ESC O <final>                     e.g. ESC O P = F1
-//   * OSC: ESC ] <text> <BEL | ESC \>        used by bracketed-paste
+//   * CSI:            ESC [ <params> <final>       e.g. ESC [ A = Up
+//   * SS3:            ESC O <final>                e.g. ESC O P = F1
+//   * OSC:            ESC ] <text> <BEL | ESC \>   (drop; reserved)
+//   * CSI-SGR-mouse:  ESC [ < b ; x ; y M/m        M4-006 (postui#32)
+//   * CSI paste:      ESC [ 200 ~ ... ESC [ 201 ~  M4-006 (postui#32)
 //
-// docs/design.md §2.5 (last paragraph) frames the parser as: "a small
+// docs/design.md 2.5 (last paragraph) frames the parser as: "a small
 // state machine over three prefixes -- CSI, SS3, OSC -- accumulating
 // parameter bytes until a final byte in the appropriate range terminates
-// the sequence, then mapping the recognized sequence to an Event. This
-// is ordinary byte-oriented state-machine logic (a match over
-// (state, byte) pairs)."
+// the sequence, then mapping the recognized sequence to an Event."
 //
-// This M4-005 landing implements every state transition the widget
-// catalogue actually needs at v1: arrow keys, HOME/END/PGUP/PGDN/DELETE
-// via CSI numeric tilde, and F1..F4 via SS3. Mouse (CSI < ... M) and
-// bracketed-paste (OSC 200 ~ ... OSC 201 ~) are declared reserved but
-// dropped -- their landing is postui.M4-006 (postui#32).
+// The M4-006 landing adds two extensions on top of the M4-005 base:
+// SGR-style mouse decoding (button + col + row + press + drag) and
+// bracketed paste (start marker, terminator-aware byte buffering, end
+// marker). Both extensions live inside the SAME state machine surface --
+// only two new public state ordinals (CSI_MOUSE=5, IN_PASTE=6) and one
+// new scratch slot (_reserved at [+56]) are needed. No new function
+// beyond three helpers: esc_parser_init_paste (installs the caller-owned
+// paste buffer), esc_parser_paste_append (buffered append with silent
+// drop on overflow/unset), and no other public surface change.
 //
 // =============================================================================
-// ESCPARSERSTATE LAYOUT (32 bytes, caller-allocated)
+// ESCPARSERSTATE LAYOUT (64 bytes, caller-allocated)
 // =============================================================================
 //
-//   [+0]   state       (u64)   ESC_STATE_* ordinal (0=Idle .. 4=OSC)
-//   [+8]   param0      (u64)   first accumulated numeric parameter
-//                              (0 when no digit has been consumed yet)
-//   [+16]  param1      (u64)   second accumulated numeric parameter
-//                              (reserved for M4-006 mouse/modifier
-//                              extension; left at 0 by M4-005)
-//   [+24]  reserved    (u64)   zero on the wire; keeps the struct at a
-//                              round 32 bytes and leaves room for a
-//                              future paste-buffer index without
-//                              breaking existing callers
+//   [+0]   state             u64  ESC_STATE_* ordinal (0..6):
+//                                    0 = Idle       (default)
+//                                    1 = SawEsc     (saw 0x1B)
+//                                    2 = CSI        (saw ESC [)
+//                                    3 = SS3        (saw ESC O)
+//                                    4 = OSC        (saw ESC ]; drop)
+//                                    5 = CSI_MOUSE  (saw ESC [ <)
+//                                    6 = IN_PASTE   (saw ESC [ 200 ~)
+//   [+8]   param0            u64  running numeric accumulator (CSI
+//                                 digits; CSI_MOUSE current-param
+//                                 accumulator before it is committed
+//                                 to the next slot by the semicolon
+//                                 delimiter)
+//   [+16]  param1            u64  second parameter slot (holds the
+//                                 CSI_MOUSE `b` field once the first
+//                                 ';' commits it)
+//   [+24]  param2            u64  third parameter slot (holds the
+//                                 CSI_MOUSE `x` field once the second
+//                                 ';' commits it; `y` stays in
+//                                 param0 until 'M'/'m' terminates)
+//   [+32]  paste_buffer_ptr  u64  caller-provided paste-buffer base,
+//                                 or 0 if unset (paste bytes dropped
+//                                 on unset; the state machine still
+//                                 tracks the terminator so IN_PASTE
+//                                 exits cleanly at ESC [ 201 ~)
+//   [+40]  paste_len         u64  current write cursor within the
+//                                 paste buffer (bytes appended so far;
+//                                 zeroed at every paste-start; NOT
+//                                 zeroed at paste-end so the consumer
+//                                 can read the delivered length off
+//                                 the state slot before the next feed)
+//   [+48]  paste_cap         u64  paste-buffer capacity in bytes
+//                                 (bytes past cap are silently dropped)
+//   [+56]  _reserved         u64  state-local scratch (not part of the
+//                                 public ABI; documented so a future
+//                                 reader knows what it stores):
+//                                   CSI_MOUSE:  param_index (0=b,
+//                                               1=x, 2=y) -- how many
+//                                               ';' delimiters have
+//                                               committed param0 into
+//                                               a slot so far
+//                                   IN_PASTE:   match_count (0..5) --
+//                                               how many bytes of the
+//                                               terminator ESC [ 2 0 1
+//                                               have matched
+//                                   otherwise:  MUST be 0
 //
 // The state slot is caller-allocated (a stack local, a widget-owned
-// static, whichever suits) rather than a module-level singleton because
-// a downstream may want to run more than one parser in parallel (e.g.
-// one per multiplexed TTY once postui grows a multi-tab shell). Keeping
-// the slot per-call also matches the shape esc_parser_init/feed's ptr
-// arg carries -- a global would have made ptr redundant.
+// static, whichever suits) rather than a module-level singleton
+// because a downstream may want to run more than one parser in
+// parallel (e.g. one per multiplexed TTY once postui grows a
+// multi-tab shell). Keeping the slot per-call also matches the shape
+// esc_parser_init/feed's ptr arg carries -- a global would have made
+// ptr redundant.
 //
 // =============================================================================
-// STATE MACHINE (docs/design.md §2.5)
+// STATE MACHINE (docs/design.md 2.5)
 // =============================================================================
 //
 //   Idle:
@@ -67,18 +110,21 @@
 //     otherwise                 -> Idle    (invalid, drop)
 //
 //   CSI:
+//     byte == '<' (0x3C)        -> CSI_MOUSE (clear params/subidx)
 //     byte in '0'..'9'          -> CSI     (param0 = param0*10 + digit)
 //     byte == 'A' (0x41)        -> Idle    (emit Key(KEY_UP))
 //     byte == 'B' (0x42)        -> Idle    (emit Key(KEY_DOWN))
 //     byte == 'C' (0x43)        -> Idle    (emit Key(KEY_RIGHT))
 //     byte == 'D' (0x44)        -> Idle    (emit Key(KEY_LEFT))
-//     byte == '~' (0x7E)        -> Idle    (emit Key(param0-mapped))
-//       param0=1 -> KEY_HOME
-//       param0=3 -> KEY_DELETE
-//       param0=4 -> KEY_END
-//       param0=5 -> KEY_PAGE_UP
-//       param0=6 -> KEY_PAGE_DOWN
-//       otherwise -> Idle (drop)
+//     byte == '~' (0x7E)        -> dispatch on param0:
+//                                    1   -> Idle    (emit KEY_HOME)
+//                                    3   -> Idle    (emit KEY_DELETE)
+//                                    4   -> Idle    (emit KEY_END)
+//                                    5   -> Idle    (emit KEY_PGUP)
+//                                    6   -> Idle    (emit KEY_PGDN)
+//                                    200 -> IN_PASTE (reset paste_len,
+//                                                      match_count)
+//                                    else -> Idle   (drop)
 //     otherwise                 -> Idle    (invalid, drop)
 //
 //   SS3:
@@ -89,12 +135,82 @@
 //     otherwise                 -> Idle    (invalid, drop)
 //
 //   OSC:
-//     byte == 0x07 (BEL)        -> Idle    (drop; paste at M4-006)
+//     byte == 0x07 (BEL)        -> Idle    (drop payload)
 //     byte == 0x1B (ESC)        -> Idle    (drop; ESC \ terminator
 //                                            simplified to plain reset)
 //     otherwise                 -> OSC     (consume, no event)
 //
-// Invalid transitions call the same ep_reset_ret0 arm: state -> Idle,
+//   CSI_MOUSE (state=5):
+//     byte in '0'..'9'          -> CSI_MOUSE (param0 = param0*10+digit)
+//     byte == ';' (0x3B)        -> commit param0 to next slot:
+//                                    subidx=0: param1=param0; subidx=1
+//                                    subidx=1: param2=param0; subidx=2
+//                                    subidx>=2: drop (extra ';')
+//                                  reset param0=0, stay CSI_MOUSE
+//     byte == 'M' (0x4D)        -> Idle    (emit Mouse; press_bit=1)
+//                                          requires subidx==2 else drop
+//     byte == 'm' (0x6D)        -> Idle    (emit Mouse; press_bit=0)
+//                                          requires subidx==2 else drop
+//     otherwise                 -> Idle    (invalid, drop)
+//
+//     Mouse payload encoding (16-byte Event: kind=2 at [+0], payload
+//     at [+8]):
+//       button   = decode(param1)   in bits [ 0..16)
+//       col-1    = param2 - 1       in bits [16..32)
+//       row-1    = param0 - 1       in bits [32..48)
+//       press    = 1 iff 'M'        in bit  48
+//       drag     = (param1 >> 5)&1  in bit  49
+//     button decode: if param1 & 64: WHEEL_UP (=3) if (param1 & 1)==0,
+//                                     WHEEL_DOWN (=4) otherwise;
+//                    else: LEFT (=0)/MIDDLE (=1)/RIGHT (=2) per
+//                          (param1 & 3).
+//
+//   IN_PASTE (state=6):
+//     Sub-machine tracked by _reserved (match_count 0..5) advancing
+//     against the terminator ESC [ 2 0 1 ~:
+//
+//       match_count == 0:
+//         byte == 0x1B                    -> match_count=1 (no append)
+//         otherwise                       -> append(byte)
+//
+//       match_count == 1 (saw ESC):
+//         byte == '[' (0x5B)              -> match_count=2 (no append)
+//         otherwise                       -> flush: append(0x1B);
+//                                            append(byte or start new
+//                                            terminator match if
+//                                            byte==ESC)
+//
+//       match_count == 2 (saw ESC [):
+//         byte == '2' (0x32)              -> match_count=3
+//         otherwise                       -> flush partial + reprocess
+//
+//       match_count == 3 (saw ESC [ 2):
+//         byte == '0' (0x30)              -> match_count=4
+//         otherwise                       -> flush partial + reprocess
+//
+//       match_count == 4 (saw ESC [ 2 0):
+//         byte == '1' (0x31)              -> match_count=5
+//         otherwise                       -> flush partial + reprocess
+//
+//       match_count == 5 (saw ESC [ 2 0 1):
+//         byte == '~' (0x7E)              -> emit Paste event, reset
+//         otherwise                       -> flush partial + reprocess
+//
+//     On any mismatch the accumulated prefix bytes (0x1B, 0x5B, 0x32,
+//     0x30, 0x31 truncated to match_count entries) are flushed into
+//     the paste buffer via esc_parser_paste_append, then the current
+//     byte is reprocessed at match_count=0 (which either starts a
+//     fresh terminator match if it is ESC, or appends it verbatim).
+//     This preserves paste content that legitimately contains ESC
+//     bytes not followed by [ 2 0 1 ~.
+//
+//     Paste payload: pointer to the caller-owned paste buffer (i.e.,
+//     the same value passed to esc_parser_init_paste). The consumer
+//     reads paste_len off the state slot to determine the delivered
+//     byte count. If paste_buffer_ptr == 0 at emit time, no event is
+//     emitted (state resets to Idle silently).
+//
+// Invalid transitions call the shared ep_reset_ret0 arm: state -> Idle,
 // params zeroed, return 0. The parser NEVER surfaces a parse error to
 // the caller; drop-on-invalid is the standard VT-parser posture and
 // keeps a garbled TTY stream from wedging the widget-facing loop.
@@ -104,52 +220,83 @@
 // =============================================================================
 //
 //   - Module name PascalCase basename (`EscParser`), matches file
-//     basename (esc_parser.pdx -> EscParser per PascalCase mapping;
-//     underscores collapse and each segment capitalises, mirroring
-//     the widget_kind.pdx -> WidgetKind precedent).
+//     basename (esc_parser.pdx -> EscParser per PascalCase mapping).
 //   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
-//   - r11 is scratch (paideia-as conformance); not used in this module.
+//   - r11 remains scratch (paideia-as conformance); the M4-006 body
+//     uses it as a transient in the paste-flush and mouse-decode paths.
 //   - Every immediate in `cmp reg, imm` and `and reg, imm` fits imm32
-//     (<= 0x7FFFFFFF): 0..0x7E (ASCII), 0xFF (mask), 10 (radix). The
-//     KEY_* constants (max 0x110C = 4364) are all well within imm32.
-//   - No 2-op `imul reg, imm` (paideia-as pitfall); the CSI accumulator
-//     multiplies by 10 via a scratch register (mov r8, 10; imul rax, r8)
-//     -- 2-op imul reg,reg is the accepted shape.
-//   - No `mul` (unsigned mul is a pitfall; imul is the only shape used).
-//   - Every function is pointer-driven; effect row `!{mem} @{}` on both.
+//     (<= 0x7FFFFFFF): 0..0x7E ASCII, 0xFF and 0xFFFF masks, 10 radix,
+//     KEY_* constants (max 0x110C = 4364), 200/201 paste markers,
+//     mouse-b masks 3/32/64. No 0xFFFFFFFF or larger literal ever hits
+//     `and`/`cmp`; 32-bit truncation uses `shl 32; shr 32` where
+//     needed.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall); the CSI/CSI_MOUSE
+//     accumulator multiplies by 10 via a scratch register
+//     (mov r8, 10; imul rax, r8) -- 2-op imul reg,reg is the accepted
+//     shape.
+//   - No `mul` (unsigned mul is a pitfall; imul is the only shape).
+//   - No `cmp reg, [mem]` (paideia-as pitfall); every mem operand is
+//     loaded into a scratch register first before comparison.
+//   - esc_parser_init and esc_parser_init_paste are pure leaves (no
+//     push/pop; caller-save only). esc_parser_paste_append is a pure
+//     leaf. esc_parser_feed is a NON-leaf under M4-006 (it calls
+//     esc_parser_paste_append from inside the IN_PASTE arm): it uses
+//     the standard 5-push callee-save prologue (rbx/r12/r13/r14/r15
+//     = 40 bytes; entry rsp%16==8, +40==0, aligned for the nested
+//     call without any extra sub rsp).
 //   - Labels prefixed `ep_` per docs/design.md fingerprint discipline.
-//     Sub-labels use ep_<state>_<action> (ep_csi_up, ep_ss3_f1, etc.)
-//     so a downstream disassembly trace maps back to the state table
-//     without cross-referencing.
-//   - No callee-save touched, no push/pop in either function -- every
-//     scratch is caller-save (rax, rdi, rsi, rdx, r8, r9) and the
-//     function is a leaf.
+//     Sub-labels use ep_<state>_<action> (ep_csi_up, ep_ss3_f1,
+//     ep_mouse_press, ep_paste_flush_1b, ...) so a downstream
+//     disassembly trace maps back to the state table.
+//   - Byte stores into the paste buffer use `mov_b [addr], reg`
+//     (single-byte store; the low byte of the source reg is written).
+//     Byte loads (only used in a documentation-margin sense; the
+//     parser's byte inputs arrive in rsi/rdi as u64 already) go
+//     through the `xor reg, reg; mov_b reg, [addr]` idiom per
+//     paideia-as pitfall #1248 elsewhere in postui.
 
 module EscParser = structure {
 
   // ==========================================================================
   // Sizing / offset constants.
+  //
+  // ESCPARSERSTATE grows from 32 B (M4-005) to 64 B (M4-006) to carry
+  // paste_buffer_ptr / paste_len / paste_cap and the state-local
+  // _reserved scratch slot. Every consumer that spelled the size as a
+  // literal must switch to ESC_PARSER_STATE_BYTES; every offset name
+  // is stable across the grow.
   // ==========================================================================
 
-  pub let ESC_PARSER_STATE_BYTES : u64 = 32
+  pub let ESC_PARSER_STATE_BYTES : u64 = 64
 
-  pub let ESC_PARSER_OFF_STATE    : u64 = 0
-  pub let ESC_PARSER_OFF_PARAM0   : u64 = 8
-  pub let ESC_PARSER_OFF_PARAM1   : u64 = 16
-  pub let ESC_PARSER_OFF_RESERVED : u64 = 24
+  pub let ESC_PARSER_OFF_STATE            : u64 = 0
+  pub let ESC_PARSER_OFF_PARAM0           : u64 = 8
+  pub let ESC_PARSER_OFF_PARAM1           : u64 = 16
+  pub let ESC_PARSER_OFF_PARAM2           : u64 = 24
+  pub let ESC_PARSER_OFF_PASTE_BUFFER_PTR : u64 = 32
+  pub let ESC_PARSER_OFF_PASTE_LEN        : u64 = 40
+  pub let ESC_PARSER_OFF_PASTE_CAP        : u64 = 48
+  pub let ESC_PARSER_OFF_RESERVED         : u64 = 56
 
   // ==========================================================================
   // State ordinals. Named rather than positional; the cmp/je dispatch
   // in esc_parser_feed compares against these literals directly. Kept
   // as pub let for consumer observability (a downstream can peek at
   // [state_ptr+0] and know what state the parser is in).
+  //
+  // M4-006 adds CSI_MOUSE (5) and IN_PASTE (6). No further ordinals
+  // are used: sub-progression within each M4-006 state lives in the
+  // _reserved slot rather than in additional top-level ordinals so a
+  // consumer that peeks at [state_ptr+0] gets a stable public view.
   // ==========================================================================
 
-  pub let ESC_STATE_IDLE    : u64 = 0
-  pub let ESC_STATE_SAW_ESC : u64 = 1
-  pub let ESC_STATE_CSI     : u64 = 2
-  pub let ESC_STATE_SS3     : u64 = 3
-  pub let ESC_STATE_OSC     : u64 = 4
+  pub let ESC_STATE_IDLE      : u64 = 0
+  pub let ESC_STATE_SAW_ESC   : u64 = 1
+  pub let ESC_STATE_CSI       : u64 = 2
+  pub let ESC_STATE_SS3       : u64 = 3
+  pub let ESC_STATE_OSC       : u64 = 4
+  pub let ESC_STATE_CSI_MOUSE : u64 = 5
+  pub let ESC_STATE_IN_PASTE  : u64 = 6
 
   // ==========================================================================
   // Error band anchor (defensive; the parser never returns an error to
@@ -165,24 +312,107 @@ module EscParser = structure {
   // ==========================================================================
   // esc_parser_init(slot_ptr) -> ()
   //
-  // Zero-init a 32-byte EscParserState at [slot_ptr..slot_ptr+32). Every
-  // field starts at ESC_STATE_IDLE=0 / param0=0 / param1=0 / reserved=0;
-  // four qword stores, no callee-save touched.
+  // Zero-init a 64-byte EscParserState at [slot_ptr..slot_ptr+64).
+  // Every field starts zero: state=Idle, params=0, paste_buffer_ptr=0
+  // (so any paste that arrives before esc_parser_init_paste installs
+  // a real buffer is silently dropped), paste_len=0, paste_cap=0,
+  // _reserved=0.
   //
-  // Register plan: rdi=slot_ptr, rax=zero source. Pure store leaf.
-  // Effect `!{mem}` (four 8-byte stores).
+  // Eight qword stores, no callee-save touched. Pure leaf.
+  // Effect `!{mem}` (eight 8-byte stores).
   // ==========================================================================
 
   pub let esc_parser_init : (u64) -> () !{mem} @{} =
     fn (slot_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "postui.M4-005 (#31): esc_parser_init zeroes a 32-byte EscParserState at [rdi]. xor rax, rax then four 8-byte stores at [rdi+0], [rdi+8], [rdi+16], [rdi+24] -- state=Idle=0, param0=0, param1=0, reserved=0. Pure leaf: no callee-save touched, no push/pop. Effect !{mem} (four 8-byte stores).",
+      justification: "postui.M4-005/M4-006 (#31, #32): esc_parser_init zeroes a 64-byte EscParserState at [rdi..rdi+64). xor rax, rax then eight 8-byte stores at [rdi+0..+56] -- state=Idle=0, param0=0, param1=0, param2=0, paste_buffer_ptr=0 (unset; paste dropped until esc_parser_init_paste installs a real buffer), paste_len=0, paste_cap=0, _reserved=0. Pure leaf: no callee-save touched, no push/pop. Effect !{mem} (eight 8-byte stores). Every displacement (0/8/16/24/32/40/48/56) fits imm8 and is a stable named offset.",
       block: {
         xor rax, rax;
         mov [rdi + 0],  rax;
         mov [rdi + 8],  rax;
         mov [rdi + 16], rax;
         mov [rdi + 24], rax;
+        mov [rdi + 32], rax;
+        mov [rdi + 40], rax;
+        mov [rdi + 48], rax;
+        mov [rdi + 56], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // esc_parser_init_paste(slot_ptr, buf_ptr, buf_cap) -> ()
+  //
+  // Install the caller-owned paste buffer. paste_buffer_ptr = rsi,
+  // paste_len = 0, paste_cap = rdx. Called once after esc_parser_init
+  // (or any time the caller wants to swap buffers). If never called,
+  // paste_buffer_ptr stays 0 and every paste is silently dropped
+  // (state machine still tracks the terminator so IN_PASTE exits
+  // cleanly).
+  //
+  // Register plan: rdi=slot_ptr, rsi=buf_ptr, rdx=buf_cap, rax=zero.
+  // Pure leaf, three 8-byte stores.
+  // Effect `!{mem}`.
+  // ==========================================================================
+
+  pub let esc_parser_init_paste : (u64, u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (buf_ptr: u64) (buf_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-006 (#32): esc_parser_init_paste installs a caller-owned paste buffer into the EscParserState. Store buf_ptr (rsi) at [rdi+32], zero paste_len at [rdi+40] via xor rax, rax then mov, store buf_cap (rdx) at [rdi+48]. Does NOT touch state / param0 / param1 / param2 / _reserved -- caller may install or swap the paste buffer independently of the state machine's current position. Pure leaf: no callee-save touched, no push/pop. Effect !{mem} (three 8-byte stores). Every displacement (32/40/48) fits imm8.",
+      block: {
+        mov [rdi + 32], rsi;
+        xor rax, rax;
+        mov [rdi + 40], rax;
+        mov [rdi + 48], rdx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // esc_parser_paste_append(slot_ptr, byte) -> ()
+  //
+  // Append the low byte of `byte` to the paste buffer if there is
+  // space; silently drop otherwise. The two drop conditions are:
+  //   * paste_buffer_ptr == 0 (caller never installed a buffer)
+  //   * paste_len >= paste_cap (buffer full)
+  //
+  // Called from the IN_PASTE arm of esc_parser_feed at every
+  // "consume a byte into the paste buffer" step, including the
+  // partial-terminator-flush cascade at each mismatch site. Keeping
+  // this factored as a separate leaf lets esc_parser_feed's IN_PASTE
+  // arm chain multiple appends without inlining the guard nine times.
+  //
+  // Register plan: rdi = slot_ptr (preserved), rsi = byte (low 8
+  // bits significant), rax/r8/r9/r10 = scratch. Pure leaf.
+  // Effect `!{mem}` (state loads + one paste-buffer byte store).
+  // ==========================================================================
+
+  pub let esc_parser_paste_append : (u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-006 (#32): esc_parser_paste_append writes one byte into the caller-owned paste buffer, silently dropping on either unset (paste_buffer_ptr==0) or full (paste_len>=paste_cap). Loads buf_ptr into r8; cmp r8, 0; je ep_pa_drop for the unset guard. Loads paste_len into r9 and paste_cap into r10; cmp r9, r10; jae ep_pa_drop for the full guard. Computes store address in r10 = buf_ptr + paste_len (add reg,reg); masks byte to 8 bits (and rsi, 0xFF fits imm32); stores the byte via `mov_b [r10+0], rsi` (single-byte store; low byte of rsi written). Bumps paste_len by 1 and stores back. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect !{mem} (three qword loads + one byte store + one qword store). Every immediate (0, 0xFF, 1) fits imm32. No test, no imul, no cmp reg,[mem]: paste_cap is loaded into r10 before the len<cap compare.",
+      block: {
+        // Guard 1: paste_buffer_ptr == 0 -> silently drop.
+        mov r8, [rdi + 32];
+        cmp r8, 0;
+        je  ep_pa_drop;
+
+        // Guard 2: paste_len >= paste_cap -> silently drop.
+        mov r9,  [rdi + 40];
+        mov r10, [rdi + 48];
+        cmp r9, r10;
+        jae ep_pa_drop;
+
+        // Compute store address = buf_ptr + paste_len; store low byte.
+        add r8, r9;
+        and rsi, 0xFF;
+        mov_b [r8 + 0], rsi;
+
+        // paste_len += 1
+        add r9, 1;
+        mov [rdi + 40], r9;
+
+      ep_pa_drop:
         ret;
       }
     }
@@ -190,28 +420,40 @@ module EscParser = structure {
   // ==========================================================================
   // esc_parser_feed(state_ptr, byte, out_event_ptr) -> u64
   //
-  // Feed one byte to the state machine. Returns 1 iff a complete Event
-  // has been written to [out_event_ptr..out_event_ptr+16); returns 0
-  // otherwise (either the machine is mid-sequence and needs more bytes,
-  // or the byte terminated an invalid sequence and the parser has
-  // silently reset to Idle).
+  // Feed one byte to the state machine. Returns 1 iff a complete
+  // Event has been written to [out_event_ptr..out_event_ptr+16);
+  // returns 0 otherwise (either the machine is mid-sequence and
+  // needs more bytes, or the byte terminated an invalid sequence
+  // and the parser has silently reset to Idle).
   //
-  // On every "reset" path (invalid sequence, event emission), state is
-  // set to Idle and param0/param1 are zeroed. The caller may re-invoke
-  // immediately with the next byte from the same buffer -- there is no
-  // ordering constraint between feed calls.
+  // On every "reset" path (invalid sequence, event emission), state
+  // is set to Idle and param0/param1/param2/_reserved are zeroed.
+  // The paste_len slot is NOT zeroed on reset -- a Paste emission
+  // hands the consumer a pointer to the buffer, and the consumer
+  // reads paste_len off the state slot before the next feed call to
+  // learn how many bytes were delivered. paste_buffer_ptr /
+  // paste_cap are never touched by feed; they are managed exclusively
+  // by esc_parser_init_paste.
   //
-  // Register plan: rdi = state_ptr (preserved across every internal
-  // branch), rsi = byte (masked to 0xFF at entry so a caller with
-  // junk in the high 56 bits is not silently mis-classified), rdx =
-  // out_event_ptr (preserved across every internal branch), rax =
-  // state / arithmetic scratch / return, r8 = per-branch scratch
-  // (radix, byte-swap staging), r9 = keycode staging for the shared
-  // emit-key-and-reset arm.
+  // Register plan (M4-006 non-leaf shape):
+  //   rbx = state_ptr             (constant across body; from rdi)
+  //   r12 = byte, masked to 0xFF  (constant across body; from rsi)
+  //   r13 = out_event_ptr         (constant across body; from rdx)
+  //   r14 = staging: emit keycode (key path) / mouse press_bit
+  //   r15 = alignment placeholder (5th push keeps rsp%16==0 for the
+  //         nested esc_parser_paste_append call site inside the
+  //         IN_PASTE arm; also used as a transient in the mouse
+  //         payload composition and in the paste-flush cascade)
+  //   rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11 = local scratch (caller-save)
   //
-  // No callee-save touched, no push/pop -- every function-local
-  // register is caller-save, and this is a leaf (no nested call).
-  // Effect `!{mem} @{}` (loads state, stores state + Event bytes).
+  // Prologue: 5-push callee-save (rbx/r12/r13/r14/r15 = 40 bytes);
+  // entry rsp%16==8, +40==0, aligned for the nested paste-append
+  // call without any additional sub rsp. Epilogue is factored into
+  // shared ep_return_1 / ep_return_0 arms so every internal branch
+  // reaches the pop chain via a single-jmp tail.
+  //
+  // Effect `!{mem} @{}` (state loads/stores, Event stores, transitive
+  // paste-buffer store via esc_parser_paste_append).
   //
   // Labels prefixed `ep_` per docs/design.md fingerprint discipline.
   // ==========================================================================
@@ -219,13 +461,23 @@ module EscParser = structure {
   pub let esc_parser_feed : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (state_ptr: u64) (byte: u64) (out_event_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "postui.M4-005 (#31): esc_parser_feed is the byte-driven state machine driver. Entry masks byte to 0xFF (defensive: caller with junk in high bits would silently mis-classify against 0x1B / '[' / etc. compares). State dispatch is a cmp/je chain on [rdi+0]: 0=Idle -> ep_state_idle; 1=SawEsc -> ep_state_sawesc; 2=CSI -> ep_state_csi; 3=SS3 -> ep_state_ss3; 4=OSC -> ep_state_osc; anything else falls through to ep_reset_ret0 (defensive against a corrupted slot). Each arm mirrors the table at the top of the module: Idle branches on byte==0x1B (jump to SawEsc-transition helper) else emits Key(byte); SawEsc branches on '['/'O'/']' to CSI/SS3/OSC transition (with CSI's param0/param1 pre-zero) else falls through to reset; CSI branches on 0x30..0x39 for digit accumulation (param0 = param0*10 + (byte - 0x30) via mov r8, 10; imul rax, r8 -- 2-op imul reg,reg, the accepted shape), then on 'A'/'B'/'C'/'D' to arrow-emit helpers, then on '~' to the param0-indexed tilde table (1/3/4/5/6 -> HOME/DELETE/END/PGUP/PGDN), else reset; SS3 branches on 'P'/'Q'/'R'/'S' to F1..F4, else reset; OSC drops every non-terminator, resets on BEL (0x07) or ESC (0x1B). Every emit-key path centralises in ep_emit_key_and_reset, which stores kind=0 at [rdx+0], stores keycode (r9) as payload at [rdx+8], zeroes state/param0/param1, and returns rax=1. Every no-event path returns xor rax, rax=0. Every immediate in cmp/and fits imm32 (0..0x7E ASCII, 0xFF mask, 10 radix, KEY_* constants max 0x110C=4364). No test, no mul, no 2-op imul reg,imm, no cmp reg,[mem]. No callee-save touched, no push/pop. Effect !{mem} (state loads/stores and event stores). Labels ep_state_*/ep_csi_*/ep_ss3_*/ep_sawesc_*/ep_emit_key_and_reset/ep_reset_ret0 per fingerprint discipline.",
+      justification: "postui.M4-005/M4-006 (#31, #32): esc_parser_feed is the byte-driven state-machine driver. M4-005 base handled Idle/SawEsc/CSI/SS3/OSC with a leaf shape; M4-006 extends it with CSI_MOUSE (SGR mouse) and IN_PASTE (bracketed paste), which requires calling esc_parser_paste_append -- so the function is now a NON-LEAF with the standard 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B; entry rsp%16==8, +40==0, aligned for the nested SysV call without extra sub rsp). rbx=state_ptr, r12=byte (masked to 0xFF), r13=out_event_ptr, r14=staging (keycode / mouse press_bit), r15=alignment placeholder + transient scratch in the mouse and paste-flush cascades. State dispatch is a cmp/je chain on [rbx+0]: 0=Idle->ep_state_idle; 1=SawEsc->ep_state_sawesc; 2=CSI->ep_state_csi; 3=SS3->ep_state_ss3; 4=OSC->ep_state_osc; 5=CSI_MOUSE->ep_state_csi_mouse; 6=IN_PASTE->ep_state_in_paste; else falls through to ep_reset_ret0 (defensive against a corrupted slot). Each existing M4-005 arm is unchanged in semantics but re-cast to use rbx/r12/r13 instead of rdi/rsi/rdx and to reach the shared ep_return_0/ep_return_1 pop-and-ret tails. M4-006 additions: (1) CSI '<' (0x3C) branches to ep_csi_to_mouse which zeroes param0/param1/param2/_reserved and stamps state=5. (2) CSI '~' with param0==200 branches to ep_csi_tilde_paste_start which zeroes param0/1/2 and paste_len and _reserved, stamps state=6, returns 0. (3) CSI_MOUSE arm: digits (0x30..0x39) accumulate into param0 via mov r8, 10; imul rax, r8 (2-op reg,reg only) then sub 0x30 add; ';' (0x3B) dispatches on _reserved (subidx): 0->param1=param0, subidx=1; 1->param2=param0, subidx=2; else drop-return-0; each also zeroes param0 for the next accumulator. 'M' (0x4D) and 'm' (0x6D) each check subidx==2 (drop otherwise) then jump to ep_mouse_emit with r14=press_bit (1 for M, 0 for m). ep_mouse_emit decodes button from param1 (low 2 bits normally; if b & 64 then wheel and button = 3 + (b & 1) mapping 64->WHEEL_UP=3, 65->WHEEL_DOWN=4), computes drag_bit = (b >> 5) & 1, computes col-1 from param2 (with underflow guard -> 0), computes row-1 from param0 (accumulator holding y), composes payload = (button & 0xFFFF) | ((col_m1 & 0xFFFF) << 16) | ((row_m1 & 0xFFFF) << 32) | (press_bit << 48) | (drag_bit << 49), writes kind=2 at [r13+0] and payload at [r13+8], resets state/params/subidx to 0, returns 1. (4) IN_PASTE arm: loads match_count from [rbx+56] into r15 and dispatches 0..5. match_count==0: byte==0x1B->store match_count=1 and return 0; else call esc_parser_paste_append(rbx, r12) and return 0 (match_count stays 0). match_count in 1..5: if the byte matches the next terminator byte (5B/32/30/31/7E), advance match_count and return 0 -- except match_count==5 with byte==0x7E which emits Paste and resets. Any mismatch flushes prefix bytes 0x1B, 0x5B, 0x32, 0x30, 0x31 (truncated to match_count entries) via esc_parser_paste_append calls in order, resets match_count to 0, then reprocesses the current byte at match_count=0 semantics (jumps to ep_paste_process_current). ep_paste_process_current checks byte==0x1B: yes -> match_count=1 and return 0; no -> call append(r12), return 0. Paste emit path (ep_paste_emit): loads paste_buffer_ptr into r8; if 0, resets state to Idle silently and returns 0 (no event, consumer got no notice; the buffer was never installed so there is nothing to deliver); otherwise stores kind=3 at [r13+0], stores paste_buffer_ptr at [r13+8], resets state and params (but NOT paste_len -- consumer reads paste_len for delivered byte count), returns 1. Every immediate in cmp/and fits imm32: 0..0x7E ASCII (0x1B, 0x30..0x39, 0x3B, 0x3C, 0x41..0x44, 0x4D, 0x50..0x53, 0x5B, 0x5D, 0x6D, 0x7E), 0xFF and 0xFFFF masks, 10 radix, KEY_* constants (max 0x110C=4364), paste markers 200/201, mouse b masks 3/32/64, and 1. No test, no 2-op imul reg,imm (only 2-op imul reg,reg via r8 scratch), no mul, no cmp reg,[mem] (paste_cap always loaded into a register first inside the paste_append helper; here the state's numeric slots are loaded into rax/r14/r15 before comparison). Shared epilogue: ep_return_1 sets rax=1 and falls into ep_return_common which pops r15/r14/r13/r12/rbx and rets; ep_return_0 zeroes rax and falls into ep_return_common. Effect !{mem} (state loads/stores, Event stores, transitive paste-buffer store via esc_parser_paste_append call). Labels prefixed ep_ per docs/design.md fingerprint discipline (ep_state_*/ep_csi_*/ep_ss3_*/ep_sawesc_*/ep_mouse_*/ep_paste_*/ep_return_*).",
       block: {
-        // ---- Entry: normalise byte to low 8 bits ------------------------
-        and rsi, 0xFF;
+        // ---- Prologue: 5-push callee-save; cache args in rbx/r12/r13.
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;             // rbx = state_ptr
+        mov rax, rsi;
+        and rax, 0xFF;
+        mov r12, rax;             // r12 = byte (masked to 0xFF)
+        mov r13, rdx;             // r13 = out_event_ptr
 
         // ---- Dispatch on current state ----------------------------------
-        mov rax, [rdi + 0];
+        mov rax, [rbx + 0];
         cmp rax, 0;
         je  ep_state_idle;
         cmp rax, 1;
@@ -236,6 +488,10 @@ module EscParser = structure {
         je  ep_state_ss3;
         cmp rax, 4;
         je  ep_state_osc;
+        cmp rax, 5;
+        je  ep_state_csi_mouse;
+        cmp rax, 6;
+        je  ep_state_in_paste;
         jmp ep_reset_ret0;
 
         // -----------------------------------------------------------------
@@ -243,109 +499,110 @@ module EscParser = structure {
         // case transition to SawEsc without emitting.
         // -----------------------------------------------------------------
       ep_state_idle:
-        cmp rsi, 0x1B;
+        cmp r12, 0x1B;
         je  ep_idle_to_sawesc;
 
-        // Emit Key(byte). kind=0 at [rdx+0]; payload=byte at [rdx+8].
+        // Emit Key(byte). kind=0 at [r13+0]; payload=byte at [r13+8].
         xor rax, rax;
-        mov [rdx + 0], rax;
-        mov [rdx + 8], rsi;
-        mov rax, 1;
-        ret;
+        mov [r13 + 0], rax;
+        mov [r13 + 8], r12;
+        jmp ep_return_1;
 
       ep_idle_to_sawesc:
         mov rax, 1;
-        mov [rdi + 0], rax;
-        xor rax, rax;
-        ret;
+        mov [rbx + 0], rax;
+        jmp ep_return_0;
 
         // -----------------------------------------------------------------
         // SawEsc: pick a prefix (CSI/SS3/OSC) or drop.
         // -----------------------------------------------------------------
       ep_state_sawesc:
-        cmp rsi, 0x5B;
+        cmp r12, 0x5B;
         je  ep_sawesc_to_csi;
-        cmp rsi, 0x4F;
+        cmp r12, 0x4F;
         je  ep_sawesc_to_ss3;
-        cmp rsi, 0x5D;
+        cmp r12, 0x5D;
         je  ep_sawesc_to_osc;
         jmp ep_reset_ret0;
 
       ep_sawesc_to_csi:
-        // Zero params before entering CSI (param0 is the accumulator).
+        // Zero params/subidx before entering CSI (param0 is the accumulator).
         xor rax, rax;
-        mov [rdi + 8],  rax;
-        mov [rdi + 16], rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
         mov rax, 2;
-        mov [rdi + 0], rax;
-        xor rax, rax;
-        ret;
+        mov [rbx + 0], rax;
+        jmp ep_return_0;
 
       ep_sawesc_to_ss3:
         mov rax, 3;
-        mov [rdi + 0], rax;
-        xor rax, rax;
-        ret;
+        mov [rbx + 0], rax;
+        jmp ep_return_0;
 
       ep_sawesc_to_osc:
         mov rax, 4;
-        mov [rdi + 0], rax;
-        xor rax, rax;
-        ret;
+        mov [rbx + 0], rax;
+        jmp ep_return_0;
 
         // -----------------------------------------------------------------
-        // CSI: accumulate digits into param0, dispatch on final byte.
+        // CSI: '<' switches to CSI_MOUSE (SGR mouse extension); digits
+        // accumulate into param0; final byte dispatches on the table.
         // -----------------------------------------------------------------
       ep_state_csi:
+        // '<' (0x3C) -> transition to CSI_MOUSE.
+        cmp r12, 0x3C;
+        je  ep_csi_to_mouse;
+
         // Digit? (byte in 0x30..0x39)
-        cmp rsi, 0x30;
+        cmp r12, 0x30;
         jb  ep_csi_final;
-        cmp rsi, 0x39;
+        cmp r12, 0x39;
         ja  ep_csi_final;
 
         // param0 = param0 * 10 + (byte - 0x30)
-        mov rax, [rdi + 8];
+        mov rax, [rbx + 8];
         mov r8, 10;
         imul rax, r8;
-        mov r8, rsi;
+        mov r8, r12;
         sub r8, 0x30;
         add rax, r8;
-        mov [rdi + 8], rax;
-        xor rax, rax;
-        ret;
+        mov [rbx + 8], rax;
+        jmp ep_return_0;
 
       ep_csi_final:
-        cmp rsi, 0x41;
+        cmp r12, 0x41;
         je  ep_csi_up;
-        cmp rsi, 0x42;
+        cmp r12, 0x42;
         je  ep_csi_down;
-        cmp rsi, 0x43;
+        cmp r12, 0x43;
         je  ep_csi_right;
-        cmp rsi, 0x44;
+        cmp r12, 0x44;
         je  ep_csi_left;
-        cmp rsi, 0x7E;
+        cmp r12, 0x7E;
         je  ep_csi_tilde;
         jmp ep_reset_ret0;
 
       ep_csi_up:
-        mov r9, 0x1001;
+        mov r14, 0x1001;
         jmp ep_emit_key_and_reset;
 
       ep_csi_down:
-        mov r9, 0x1002;
+        mov r14, 0x1002;
         jmp ep_emit_key_and_reset;
 
       ep_csi_right:
-        mov r9, 0x1003;
+        mov r14, 0x1003;
         jmp ep_emit_key_and_reset;
 
       ep_csi_left:
-        mov r9, 0x1004;
+        mov r14, 0x1004;
         jmp ep_emit_key_and_reset;
 
       ep_csi_tilde:
-        // Map param0 to a keycode; drop on unrecognised.
-        mov rax, [rdi + 8];
+        // Map param0 to a keycode or a state transition.
+        mov rax, [rbx + 8];
         cmp rax, 1;
         je  ep_csi_tilde_home;
         cmp rax, 3;
@@ -356,95 +613,523 @@ module EscParser = structure {
         je  ep_csi_tilde_pgup;
         cmp rax, 6;
         je  ep_csi_tilde_pgdn;
+        cmp rax, 200;
+        je  ep_csi_tilde_paste_start;
+        // 201 (paste-end) here would be a stray -- only meaningful
+        // from within IN_PASTE via the match-count sub-machine. Drop.
         jmp ep_reset_ret0;
 
       ep_csi_tilde_home:
-        mov r9, 0x1005;
+        mov r14, 0x1005;
         jmp ep_emit_key_and_reset;
 
       ep_csi_tilde_delete:
-        mov r9, 0x1009;
+        mov r14, 0x1009;
         jmp ep_emit_key_and_reset;
 
       ep_csi_tilde_end:
-        mov r9, 0x1006;
+        mov r14, 0x1006;
         jmp ep_emit_key_and_reset;
 
       ep_csi_tilde_pgup:
-        mov r9, 0x1007;
+        mov r14, 0x1007;
         jmp ep_emit_key_and_reset;
 
       ep_csi_tilde_pgdn:
-        mov r9, 0x1008;
+        mov r14, 0x1008;
         jmp ep_emit_key_and_reset;
+
+      ep_csi_tilde_paste_start:
+        // Enter IN_PASTE. Zero param0/param1/param2, paste_len, _reserved.
+        // paste_buffer_ptr / paste_cap are untouched (managed by
+        // esc_parser_init_paste). Stamp state=6. Return 0 (no event yet).
+        xor rax, rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 40], rax;      // paste_len = 0
+        mov [rbx + 56], rax;      // match_count = 0
+        mov rax, 6;
+        mov [rbx + 0],  rax;      // state = IN_PASTE
+        jmp ep_return_0;
+
+      ep_csi_to_mouse:
+        // Enter CSI_MOUSE. Zero param0/param1/param2 and subidx.
+        // paste-buffer slots are untouched. Stamp state=5. Return 0.
+        xor rax, rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;      // subidx = 0 (accumulating b)
+        mov rax, 5;
+        mov [rbx + 0],  rax;      // state = CSI_MOUSE
+        jmp ep_return_0;
 
         // -----------------------------------------------------------------
         // SS3: F1..F4 via ESC O P/Q/R/S.
         // -----------------------------------------------------------------
       ep_state_ss3:
-        cmp rsi, 0x50;
+        cmp r12, 0x50;
         je  ep_ss3_f1;
-        cmp rsi, 0x51;
+        cmp r12, 0x51;
         je  ep_ss3_f2;
-        cmp rsi, 0x52;
+        cmp r12, 0x52;
         je  ep_ss3_f3;
-        cmp rsi, 0x53;
+        cmp r12, 0x53;
         je  ep_ss3_f4;
         jmp ep_reset_ret0;
 
       ep_ss3_f1:
-        mov r9, 0x1101;
+        mov r14, 0x1101;
         jmp ep_emit_key_and_reset;
 
       ep_ss3_f2:
-        mov r9, 0x1102;
+        mov r14, 0x1102;
         jmp ep_emit_key_and_reset;
 
       ep_ss3_f3:
-        mov r9, 0x1103;
+        mov r14, 0x1103;
         jmp ep_emit_key_and_reset;
 
       ep_ss3_f4:
-        mov r9, 0x1104;
+        mov r14, 0x1104;
         jmp ep_emit_key_and_reset;
 
         // -----------------------------------------------------------------
-        // OSC: drop payload; reset on BEL or ESC. Bracketed-paste
-        //      surfacing lands at M4-006 (postui#32).
+        // OSC: drop payload; reset on BEL or ESC. Bracketed-paste is
+        //      NOT delivered via OSC -- xterm-style paste is CSI 200~
+        //      ... CSI 201~, handled via ep_csi_tilde_paste_start and
+        //      the IN_PASTE arm below. OSC stays a drop-until-terminator
+        //      sink for M4-006, preserving the M4-005 posture.
         // -----------------------------------------------------------------
       ep_state_osc:
-        cmp rsi, 0x07;
+        cmp r12, 0x07;
         je  ep_reset_ret0;
-        cmp rsi, 0x1B;
+        cmp r12, 0x1B;
         je  ep_reset_ret0;
-        // stay in OSC, no event
-        xor rax, rax;
-        ret;
+        jmp ep_return_0;
 
         // -----------------------------------------------------------------
-        // Shared emit-key-and-reset arm: r9 holds the keycode, rdx points
-        // at the Event slot. Write kind=0 / payload=keycode; zero state /
-        // param0 / param1; return rax=1.
+        // CSI_MOUSE (state=5): SGR-format mouse decoding.
+        //   digits            -> accumulate into param0
+        //   ';'               -> commit param0 to param1 (subidx 0->1)
+        //                        or param2 (subidx 1->2); reset param0
+        //   'M' / 'm'         -> emit Mouse event, reset
+        //   otherwise         -> drop
+        // -----------------------------------------------------------------
+      ep_state_csi_mouse:
+        // Digit?
+        cmp r12, 0x30;
+        jb  ep_csi_mouse_nondigit;
+        cmp r12, 0x39;
+        ja  ep_csi_mouse_nondigit;
+
+        // param0 = param0 * 10 + (byte - 0x30)
+        mov rax, [rbx + 8];
+        mov r8, 10;
+        imul rax, r8;
+        mov r8, r12;
+        sub r8, 0x30;
+        add rax, r8;
+        mov [rbx + 8], rax;
+        jmp ep_return_0;
+
+      ep_csi_mouse_nondigit:
+        cmp r12, 0x3B;            // ';'
+        je  ep_csi_mouse_delim;
+        cmp r12, 0x4D;            // 'M' (press)
+        je  ep_csi_mouse_press;
+        cmp r12, 0x6D;            // 'm' (release)
+        je  ep_csi_mouse_release;
+        jmp ep_reset_ret0;
+
+      ep_csi_mouse_delim:
+        mov rax, [rbx + 56];      // subidx
+        cmp rax, 0;
+        je  ep_csi_mouse_delim_0;
+        cmp rax, 1;
+        je  ep_csi_mouse_delim_1;
+        // subidx >= 2: extra ';' before terminator; drop it silently.
+        jmp ep_return_0;
+
+      ep_csi_mouse_delim_0:
+        mov rax, [rbx + 8];       // param0 (accumulator)
+        mov [rbx + 16], rax;      // param1 = accumulator (b)
+        xor rax, rax;
+        mov [rbx + 8], rax;       // param0 = 0
+        mov rax, 1;
+        mov [rbx + 56], rax;      // subidx = 1
+        jmp ep_return_0;
+
+      ep_csi_mouse_delim_1:
+        mov rax, [rbx + 8];
+        mov [rbx + 24], rax;      // param2 = accumulator (x)
+        xor rax, rax;
+        mov [rbx + 8], rax;       // param0 = 0 (will accumulate y)
+        mov rax, 2;
+        mov [rbx + 56], rax;      // subidx = 2
+        jmp ep_return_0;
+
+      ep_csi_mouse_press:
+        // Require subidx==2 (we have b and x committed; y in param0).
+        mov rax, [rbx + 56];
+        cmp rax, 2;
+        jne ep_reset_ret0;
+        mov r14, 1;               // press_bit = 1
+        jmp ep_mouse_emit;
+
+      ep_csi_mouse_release:
+        mov rax, [rbx + 56];
+        cmp rax, 2;
+        jne ep_reset_ret0;
+        xor r14, r14;             // press_bit = 0
+        jmp ep_mouse_emit;
+
+        // -----------------------------------------------------------------
+        // Mouse emit: compose payload and write to [r13].
+        //   r14 = press_bit (0 or 1)
+        //   [rbx+16] = param1 = b        (raw SGR button/flags byte)
+        //   [rbx+24] = param2 = x (col, 1-based)
+        //   [rbx+ 8] = param0 = y (row, 1-based; current accumulator)
+        //
+        // Payload:
+        //   bits [ 0..16)  button ordinal (EVENT_MOUSE_*)
+        //   bits [16..32)  col - 1 (0-based)
+        //   bits [32..48)  row - 1 (0-based)
+        //   bit  48         press_bit
+        //   bit  49         drag_bit
+        // -----------------------------------------------------------------
+      ep_mouse_emit:
+        // Decode button from param1 (call it b):
+        //   if b & 64:  wheel; button = 3 + (b & 1)  (64->3, 65->4)
+        //   else:       button = b & 3               (0/1/2)
+        mov rax, [rbx + 16];      // rax = b
+        mov r8, rax;
+        and r8, 64;
+        cmp r8, 0;
+        je  ep_mouse_button_regular;
+        // Wheel path.
+        mov r8, rax;
+        and r8, 1;
+        add r8, 3;                // r8 = 3 or 4 (WHEEL_UP / WHEEL_DOWN)
+        jmp ep_mouse_button_ready;
+
+      ep_mouse_button_regular:
+        mov r8, rax;
+        and r8, 3;                // r8 = 0/1/2 (LEFT/MIDDLE/RIGHT)
+
+      ep_mouse_button_ready:
+        // drag_bit = (b >> 5) & 1 -- rax still holds b.
+        mov r9, rax;
+        shr r9, 5;
+        and r9, 1;
+
+        // col_m1 = param2 - 1 (clamp to 0 on underflow).
+        mov r10, [rbx + 24];
+        cmp r10, 0;
+        je  ep_mouse_col_zero;
+        sub r10, 1;
+        jmp ep_mouse_col_ready;
+
+      ep_mouse_col_zero:
+        xor r10, r10;
+
+      ep_mouse_col_ready:
+        and r10, 0xFFFF;
+
+        // row_m1 = param0 - 1 (clamp to 0 on underflow).
+        mov r11, [rbx + 8];
+        cmp r11, 0;
+        je  ep_mouse_row_zero;
+        sub r11, 1;
+        jmp ep_mouse_row_ready;
+
+      ep_mouse_row_zero:
+        xor r11, r11;
+
+      ep_mouse_row_ready:
+        and r11, 0xFFFF;
+
+        // Compose payload in rax.
+        //   rax = button (masked to 16 bits)
+        //       | (col_m1 << 16)
+        //       | (row_m1 << 32)
+        //       | (press_bit << 48)
+        //       | (drag_bit << 49)
+        and r8, 0xFFFF;
+        mov rax, r8;
+
+        mov r15, r10;
+        shl r15, 16;
+        or  rax, r15;
+
+        mov r15, r11;
+        shl r15, 32;
+        or  rax, r15;
+
+        mov r15, r14;
+        shl r15, 48;
+        or  rax, r15;
+
+        mov r15, r9;
+        shl r15, 49;
+        or  rax, r15;
+
+        // Write Event: kind=2 at [r13+0], payload at [r13+8].
+        mov r8, 2;
+        mov [r13 + 0], r8;
+        mov [r13 + 8], rax;
+
+        // Reset state / params / subidx (paste slots untouched).
+        xor rax, rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
+        jmp ep_return_1;
+
+        // -----------------------------------------------------------------
+        // IN_PASTE (state=6): bracketed-paste content collection.
+        //
+        // Sub-machine tracks the ESC [ 2 0 1 ~ terminator via _reserved
+        // (match_count in r15). Every mismatch flushes the partial
+        // terminator bytes into the paste buffer via
+        // esc_parser_paste_append(rbx, byte) and reprocesses the
+        // current byte at match_count=0 semantics.
+        // -----------------------------------------------------------------
+      ep_state_in_paste:
+        mov r15, [rbx + 56];      // match_count
+        cmp r15, 0;
+        je  ep_paste_match_0;
+        cmp r15, 1;
+        je  ep_paste_match_1;
+        cmp r15, 2;
+        je  ep_paste_match_2;
+        cmp r15, 3;
+        je  ep_paste_match_3;
+        cmp r15, 4;
+        je  ep_paste_match_4;
+        cmp r15, 5;
+        je  ep_paste_match_5;
+        // Corrupted match_count: reset to 0 and reprocess byte.
+        xor rax, rax;
+        mov [rbx + 56], rax;
+        jmp ep_paste_process_current;
+
+      ep_paste_match_0:
+        // Fresh: byte==ESC starts a terminator match; else append.
+        cmp r12, 0x1B;
+        je  ep_paste_set_match_1;
+        // Append current byte, stay match_count=0.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call esc_parser_paste_append;
+        jmp ep_return_0;
+
+      ep_paste_set_match_1:
+        mov rax, 1;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+      ep_paste_match_1:
+        // Saw ESC. Expect '['.
+        cmp r12, 0x5B;
+        je  ep_paste_set_match_2;
+        // Mismatch: flush prefix (0x1B), then reprocess current byte.
+        mov rdi, rbx;
+        mov rsi, 0x1B;
+        call esc_parser_paste_append;
+        jmp ep_paste_process_current;
+
+      ep_paste_set_match_2:
+        mov rax, 2;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+      ep_paste_match_2:
+        // Saw ESC [. Expect '2'.
+        cmp r12, 0x32;
+        je  ep_paste_set_match_3;
+        // Mismatch: flush 0x1B 0x5B, then reprocess.
+        mov rdi, rbx;
+        mov rsi, 0x1B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x5B;
+        call esc_parser_paste_append;
+        jmp ep_paste_process_current;
+
+      ep_paste_set_match_3:
+        mov rax, 3;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+      ep_paste_match_3:
+        // Saw ESC [ 2. Expect '0'.
+        cmp r12, 0x30;
+        je  ep_paste_set_match_4;
+        // Mismatch: flush 0x1B 0x5B 0x32, then reprocess.
+        mov rdi, rbx;
+        mov rsi, 0x1B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x5B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x32;
+        call esc_parser_paste_append;
+        jmp ep_paste_process_current;
+
+      ep_paste_set_match_4:
+        mov rax, 4;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+      ep_paste_match_4:
+        // Saw ESC [ 2 0. Expect '1'.
+        cmp r12, 0x31;
+        je  ep_paste_set_match_5;
+        // Mismatch: flush 0x1B 0x5B 0x32 0x30, then reprocess.
+        mov rdi, rbx;
+        mov rsi, 0x1B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x5B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x32;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x30;
+        call esc_parser_paste_append;
+        jmp ep_paste_process_current;
+
+      ep_paste_set_match_5:
+        mov rax, 5;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+      ep_paste_match_5:
+        // Saw ESC [ 2 0 1. Expect '~' -> paste-end.
+        cmp r12, 0x7E;
+        je  ep_paste_emit;
+        // Mismatch: flush 0x1B 0x5B 0x32 0x30 0x31, then reprocess.
+        mov rdi, rbx;
+        mov rsi, 0x1B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x5B;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x32;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x30;
+        call esc_parser_paste_append;
+        mov rdi, rbx;
+        mov rsi, 0x31;
+        call esc_parser_paste_append;
+        jmp ep_paste_process_current;
+
+      ep_paste_process_current:
+        // Reset match_count to 0; then treat r12 as a match_count=0
+        // byte: ESC starts a new terminator; anything else is appended.
+        xor rax, rax;
+        mov [rbx + 56], rax;
+        cmp r12, 0x1B;
+        je  ep_paste_set_match_1;
+        mov rdi, rbx;
+        mov rsi, r12;
+        call esc_parser_paste_append;
+        jmp ep_return_0;
+
+      ep_paste_emit:
+        // Paste-end terminator matched. If a buffer was installed,
+        // deliver the Paste event; otherwise silently reset to Idle.
+        // paste_len is deliberately NOT reset -- the consumer reads
+        // it off the state slot before the next feed to learn how
+        // many bytes were delivered. On the next paste-start,
+        // paste_len is zeroed by ep_csi_tilde_paste_start.
+        mov r8, [rbx + 32];       // paste_buffer_ptr
+        cmp r8, 0;
+        je  ep_paste_emit_no_buf;
+
+        // Emit: kind=3 at [r13+0], payload = buffer pointer at [r13+8].
+        mov r9, 3;
+        mov [r13 + 0], r9;
+        mov [r13 + 8], r8;
+
+        // Reset state / params / subidx. paste_len / paste_buffer_ptr
+        // / paste_cap all untouched.
+        xor rax, rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
+        jmp ep_return_1;
+
+      ep_paste_emit_no_buf:
+        // No buffer installed -- terminator recognised but nothing to
+        // deliver. Reset to Idle silently, return 0.
+        xor rax, rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+        // -----------------------------------------------------------------
+        // Shared emit-key-and-reset arm: r14 holds the keycode, r13
+        // points at the Event slot. Write kind=0 / payload=keycode;
+        // zero state / param0 / param1 / param2 / subidx; jmp to
+        // ep_return_1 (which pops and rets with rax=1).
         // -----------------------------------------------------------------
       ep_emit_key_and_reset:
         xor rax, rax;
-        mov [rdx + 0], rax;
-        mov [rdx + 8], r9;
-        mov [rdi + 0], rax;
-        mov [rdi + 8], rax;
-        mov [rdi + 16], rax;
-        mov rax, 1;
-        ret;
+        mov [r13 + 0], rax;
+        mov [r13 + 8], r14;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
+        jmp ep_return_1;
 
         // -----------------------------------------------------------------
-        // Shared reset-and-return-0 arm: no event, state -> Idle, params
-        // zeroed. Every invalid transition jumps here.
+        // Shared reset-and-return-0 arm: no event, state -> Idle,
+        // params + subidx zeroed. Every invalid transition jumps here.
+        // paste_len / paste_buffer_ptr / paste_cap untouched.
         // -----------------------------------------------------------------
       ep_reset_ret0:
         xor rax, rax;
-        mov [rdi + 0],  rax;
-        mov [rdi + 8],  rax;
-        mov [rdi + 16], rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 56], rax;
+        jmp ep_return_0;
+
+        // -----------------------------------------------------------------
+        // Shared epilogue: pop callee-save and ret. Two entry points:
+        // ep_return_1 sets rax=1, ep_return_0 sets rax=0. Both fall
+        // through to the same pop chain via ep_return_common.
+        // -----------------------------------------------------------------
+      ep_return_1:
+        mov rax, 1;
+        jmp ep_return_common;
+
+      ep_return_0:
+        xor rax, rax;
+
+      ep_return_common:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret;
       }
     }
