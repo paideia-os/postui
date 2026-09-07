@@ -1,0 +1,431 @@
+// tests/boot_block_smoke.pdx -- postui.M1-008 (paideia-os/postui#8)
+//
+// BootBlockSmoke: first-pixel boot smoke — render one Block into an
+// in-memory Buffer via WidgetKind::widget_draw dispatch and verify a
+// fixture's worth of cells byte-for-byte against expected bytes.
+//
+// =============================================================================
+// SCOPE (docs/design.md §5.1 M1-008, design/architecture.md §7)
+// =============================================================================
+//
+// postui is a userspace LIBRARY (design/architecture.md §2, no _start,
+// no boot log). Its "boot smoke" is therefore a TEST module living in
+// tests/, not a witness-in-the-boot-log the way a paideia-os kernel
+// smoke would be. The shape matches shell's tests/test_caps_narrow.pdx
+// precedent — a pure-function driver that:
+//
+//   1. Reserves fixture-sized .bss slabs (spec, buffer, title bytes),
+//   2. Packs a known BlockSpec via Block::block_spec_init,
+//   3. Calls WidgetKind::widget_draw with WK_BLOCK to render it,
+//   4. Compares specific cells in the buffer against expected bytes
+//      computed at design time (docs/design.md §2.1 Cell wire +
+//      block.pdx phase-1 fill / phase-2 border / phase-3 title docs),
+//   5. Returns 0 on ALL matches, a family-specific sentinel on the
+//      first mismatch so a smoke harness can attribute the failure.
+//
+// This lands the FIRST tests/*.pdx file in postui (manifest.pdxproj's
+// scaffold deliberately left the tests: section empty until M1-008 per
+// docs/design.md §5.1). Downstream consumer test harnesses (postui-top,
+// postui-hex, postui-dmesg) invoke boot_block_smoke() as part of
+// their own smoke suite before exercising their own widget bodies —
+// the test proves the M1-005..M1-007 dispatch machinery lays cells at
+// the right offsets before an app trusts a heavier widget's output.
+//
+// No boot integration: postui is a library, so this test is NOT
+// invoked from any _start. `paideia-as build --tests` will compile
+// tests/*.pdx once that flag lands; today `bash tools/build.sh` in
+// this repo already handles the tests/ directory in the same loop
+// (see tools/build.sh's "if [ -d tests ]" branch) — every test
+// source becomes build-out/tests-<basename>.o which a downstream
+// consumer links into its own smoke driver.
+//
+// =============================================================================
+// FIXTURE
+// =============================================================================
+//
+// Rect:         (x=0, y=0, w=10, h=5) — a 10-column × 5-row block
+// Border:       BLOCK_BORDER_PLAIN (glyphs ┌ ┐ └ ┘ ─ │)
+// Padding:      (top=1, right=1, bottom=1, left=1) — Block::block_inner
+//               would return a 6×1 interior at these dimensions, but the
+//               inner-Rect is unused here (we only exercise block_draw's
+//               border + title + fill overlay).
+// Title:        "Hi" (2 ASCII bytes)
+// fill_cell:    default (' ', white fg 0xFFFFFF, black bg 0, no mods)
+//               as laid by block_spec_init phase 5 = word0
+//               0x00FFFFFF_00000020, word1 0.
+//
+// Buffer:       5 rows × 10 cols × 16 bytes = 800 bytes = 100 u64
+//               slots, .bss-allocated at 16-byte alignment (matches
+//               Cell::CELL_BYTES so every (y*cols+x)*16 offset lands
+//               on a cell boundary).
+//
+// =============================================================================
+// EXPECTED CELL BYTES (verified against Block::block_draw's own docs)
+// =============================================================================
+//
+// After block_draw completes, the 5×5 area (5 rows × 10 cols in this
+// fixture) looks like:
+//
+//   Row 0:  ┌  H  i  ─  ─  ─  ─  ─  ─  ┐
+//   Row 1:  │              (fill_cell = space + white fg)                │
+//   Row 2:  │              (fill_cell)                                    │
+//   Row 3:  │              (fill_cell)                                    │
+//   Row 4:  └  ─  ─  ─  ─  ─  ─  ─  ─  ┘
+//
+// Phase 1 (fill) stamps every cell in the block area with fill_cell,
+// so every cell's bytes 4..15 carry fill_cell's fg/bg/mods/reserved
+// (bytes 4..7 = 0xFF 0xFF 0xFF 0x00, bytes 8..15 all 0x00) regardless
+// of what phase 2 or phase 3 later overlay in bytes 0..4.
+//
+// Phase 2 (border) writes JUST the 4-byte symbol slot (bytes 0..4) of
+// each border cell — bytes 4..15 stay as fill from phase 1.
+//
+// Phase 3 (title) writes the low ASCII byte into bytes 0..4 of the
+// two title cells at (1, 0) and (2, 0) — bytes 1..3 land as zero via
+// the mov_d store's high 24 bits, and bytes 4..15 stay as fill.
+//
+// The 9 assertions this test issues verify the three phase-boundaries
+// together — corners for phase-2 corner writes, top-edge cell (5,0)
+// for phase-2 horizontal-edge writes, right-edge cell (9,2) for
+// phase-2 vertical-edge writes, title cells (1,0)+(2,0) for phase 3,
+// and interior cell (5,2) for phase 1 alone (never overwritten by
+// border or title).
+//
+// Every check compares word0 (bytes 0..8 as LE u64) — that captures
+// both the phase-2/3 overwrite of bytes 0..4 AND the phase-1 fill of
+// bytes 4..7 in a single cmp. word1 (bytes 8..15) is invariantly zero
+// after phase 1 and never touched by phases 2/3, so a word0-only
+// compare covers every observable outcome.
+//
+// Expected word0 values (all as LE u64s):
+//
+//   TL corner  (0,0), offset   0:  ┌ = E2 94 8C 00 -> 0x00FFFFFF008C94E2
+//   Title 'H'  (1,0), offset  16:  H = 48 00 00 00 -> 0x00FFFFFF00000048
+//   Title 'i'  (2,0), offset  32:  i = 69 00 00 00 -> 0x00FFFFFF00000069
+//   Top-edge   (5,0), offset  80:  ─ = E2 94 80 00 -> 0x00FFFFFF008094E2
+//   TR corner  (9,0), offset 144:  ┐ = E2 94 90 00 -> 0x00FFFFFF009094E2
+//   Interior   (5,2), offset 400:  space bytes    -> 0x00FFFFFF00000020
+//   Right edge (9,2), offset 464:  │ = E2 94 82 00 -> 0x00FFFFFF008294E2
+//   BL corner  (0,4), offset 640:  └ = E2 94 94 00 -> 0x00FFFFFF009494E2
+//   BR corner  (9,4), offset 784:  ┘ = E2 94 98 00 -> 0x00FFFFFF009894E2
+//
+// UTF-8 encodings (block.pdx block_glyph_plain table, verified):
+//   U+250C ┌ = E2 94 8C     U+2510 ┐ = E2 94 90
+//   U+2514 └ = E2 94 94     U+2518 ┘ = E2 94 98
+//   U+2500 ─ = E2 94 80     U+2502 │ = E2 94 82
+//
+// Little-endian u64 packing: bytes at offsets [0..8) read as one u64
+// LE gives the low byte at bit 0. For the TL corner, bytes at
+// [+0..+8) are [E2 94 8C 00 FF FF FF 00], read as LE u64 gives
+// (0x00 << 56) | (0xFF << 48) | (0xFF << 40) | (0xFF << 32) |
+// (0x00 << 24) | (0x8C << 16) | (0x94 << 8) | 0xE2 = 0x00FFFFFF008C94E2.
+//
+// =============================================================================
+// FAIL SENTINELS
+// =============================================================================
+//
+// Anchored at 0xFFFFEDA0 per design/architecture.md §7 (Fail-code
+// family table) — `test_boot_smoke` allocates the 0xFFFFEDA0..
+// 0xFFFFEDAF band. Disjoint from postui's own library error band
+// (0xFFFFEB80+) and from the kernel KIND_TUI_CANVAS band
+// (0xFFFFEB10..0xFFFFEB1F), so a smoke driver can attribute a
+// non-zero return without a full-value table lookup.
+//
+// Note: the M1-008 issue's original spec cited "0xFFFFEBC0..CF" as
+// the band; that range is actually reserved for the M2 widget-body
+// library errors per architecture.md §5, so this file follows the
+// §7 canonical assignment for test-tier fail codes.
+//
+//   0xFFFFEDA0  BBS_ERR_CORNER_TL      TL corner glyph mismatch
+//   0xFFFFEDA1  BBS_ERR_CORNER_TR      TR corner glyph mismatch
+//   0xFFFFEDA2  BBS_ERR_CORNER_BL      BL corner glyph mismatch
+//   0xFFFFEDA3  BBS_ERR_CORNER_BR      BR corner glyph mismatch
+//   0xFFFFEDA4  BBS_ERR_TITLE_H        Title byte 'H' mismatch
+//   0xFFFFEDA5  BBS_ERR_TITLE_I        Title byte 'i' mismatch
+//   0xFFFFEDA6  BBS_ERR_TOP_EDGE       Top-edge horizontal glyph mismatch
+//   0xFFFFEDA7  BBS_ERR_RIGHT_EDGE     Right-edge vertical glyph mismatch
+//   0xFFFFEDA8  BBS_ERR_INTERIOR_FILL  Interior fill_cell mismatch
+//   0xFFFFEDA9  BBS_ERR_WIDGET_DRAW_RC widget_draw returned non-zero
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BootBlockSmoke`), matches file
+//     basename `boot_block_smoke.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` or reg-reg.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears in
+//     cmp/and). The 64-bit expected values are compared reg-reg after
+//     landing in a scratch register via `mov reg, imm64` (movabs).
+//   - Every fail sentinel (0xFFFFEDA0..0xFFFFEDA9), expected word0
+//     (0x00FFFFFF00SSXXYY-shaped), packed rect literal
+//     (0x0005000A00000000), and packed kind_and_pad (0x0000000101010101)
+//     is loaded via `mov reg, imm64` (movabs, 10-byte form) — legal for
+//     mov, NOT for cmp/and. Same pattern block.pdx block_spec_init line
+//     321 uses.
+//   - No 2-op `imul reg, imm`; no imul used at all in this module.
+//   - No `and reg, imm64`; every `and` in this module is imm <= 0xFF.
+//     (Actually none — we don't need bit-masking at the test layer.)
+//   - r11 is scratch (paideia-as conformance); used only as a transit
+//     for expected-value compares, never preserved across a call.
+//   - Single-line pub let for the title byte literal ("Hi"), no
+//     multi-line quoted form (paideia-as pitfall).
+//   - Cross-module calls (`call block_spec_init`, `call widget_draw`)
+//     rely on paideia-as's flat ELF symbol namespace — same pattern
+//     WidgetKind::widget_draw uses when it `call block_draw`s across
+//     the module boundary.
+//   - SysV alignment: `push rbx` (8 B) rounds SysV entry rsp%16==8 to
+//     0, so both nested calls (block_spec_init leaf, widget_draw
+//     one-level) see rsp%16==0. rbx caches the buffer base across all
+//     9 compares; the entry-time value survives block_spec_init's
+//     execution (rbx is SysV callee-save — block_spec_init is a leaf
+//     that touches only rdi/rsi/rdx/rcx/r8/rax) and widget_draw's
+//     transitive block_draw call (block_draw preserves rbx via its
+//     5-push epilogue).
+//   - Effect row `!{mem} @{}` on boot_block_smoke — writes to the
+//     fixture buffers (transitively via block_spec_init and
+//     block_draw), reads back for compares. No sysreg (no syscall),
+//     no cap (block_draw takes a raw buf_ptr, not a canvas cap).
+//   - Labels prefixed `bbs_` per docs/design.md fingerprint discipline.
+
+module BootBlockSmoke = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDA0..0xFFFFEDAF per architecture.md §7)
+  // ==========================================================================
+  pub let BBS_ERR_CORNER_TL      : u64 = 0xFFFFEDA0
+  pub let BBS_ERR_CORNER_TR      : u64 = 0xFFFFEDA1
+  pub let BBS_ERR_CORNER_BL      : u64 = 0xFFFFEDA2
+  pub let BBS_ERR_CORNER_BR      : u64 = 0xFFFFEDA3
+  pub let BBS_ERR_TITLE_H        : u64 = 0xFFFFEDA4
+  pub let BBS_ERR_TITLE_I        : u64 = 0xFFFFEDA5
+  pub let BBS_ERR_TOP_EDGE       : u64 = 0xFFFFEDA6
+  pub let BBS_ERR_RIGHT_EDGE     : u64 = 0xFFFFEDA7
+  pub let BBS_ERR_INTERIOR_FILL  : u64 = 0xFFFFEDA8
+  pub let BBS_ERR_WIDGET_DRAW_RC : u64 = 0xFFFFEDA9
+
+  // ==========================================================================
+  // Fixture-shape constants (exported so a downstream harness can
+  // read them if it wants to replay the same geometry).
+  // ==========================================================================
+  pub let BBS_ROWS       : u64 = 5
+  pub let BBS_COLS       : u64 = 10
+  pub let BBS_TITLE_LEN  : u64 = 2
+
+  // ==========================================================================
+  // Title bytes ("Hi", 2 ASCII bytes). Single-line pub let for the
+  // string literal — paideia-as's multi-line quoted form is a pitfall
+  // per the userland encoder-pitfalls memory-note.
+  // ==========================================================================
+  pub let _bbs_title : [u8; 2] = "Hi"
+
+  // ==========================================================================
+  // BlockSpec fixture slab (48 bytes = 6 u64 slots, block.pdx
+  // BLOCK_SPEC_BYTES). @align(16) so the fill_cell at offset 32
+  // sits at a 16-byte boundary — block_draw's two 8-byte load/store
+  // pairs at [r13 + 32] / [r13 + 40] want a clean alignment.
+  // ==========================================================================
+  pub let mut _bbs_spec : [u64; 6] = uninit @align(16)
+
+  // ==========================================================================
+  // Buffer fixture slab. 5 rows × 10 cols × 16 bytes = 800 bytes =
+  // 100 u64 slots. @align(16) so every (y*cols+x)*16 offset lands
+  // on a cell boundary. Only the BACK region is used at this test
+  // tier (block_draw writes to buf_ptr + 0..N; the front region
+  // sits at [N..2N) and is not exercised — see Buffer::buffer_at
+  // and buffer.pdx §Region Layout).
+  //
+  // At M1-008 this test does NOT verify the front region. A future
+  // test_buffer landing (docs/design.md architecture §7 slot
+  // 0xFFFFED50..0xFFFFED5F) will exercise the back/front layout
+  // once the kernel-side TCC_OP_PRESENT diff path is in scope.
+  // ==========================================================================
+  pub let mut _bbs_buffer : [u64; 100] = uninit @align(16)
+
+  // ==========================================================================
+  // boot_block_smoke() -> u64
+  //
+  // Runs the test end-to-end:
+  //
+  //   Phase 1: pack the fixture BlockSpec via Block::block_spec_init
+  //            (kind=PLAIN, pad=(1,1,1,1), title="Hi").
+  //   Phase 2: invoke WidgetKind::widget_draw with WK_BLOCK to render
+  //            the block into _bbs_buffer.
+  //   Phase 3: verify 9 cells against expected word0 bytes; on any
+  //            mismatch return the corresponding 0xFFFFEDAx sentinel.
+  //
+  // Returns 0 on ALL passes. First mismatch short-circuits with a
+  // family-specific sentinel; the smoke harness can attribute the
+  // failure without a full-value table lookup.
+  //
+  // Register plan: nullary entry. 1-push (rbx) = 8 B — rsp%16 goes
+  // from entry 8 to 0, aligned for both nested calls (block_spec_init
+  // leaf, widget_draw one-level). rbx caches _bbs_buffer base across
+  // all 9 compares (SysV callee-save; block_spec_init is a leaf that
+  // touches only caller-save regs; block_draw preserves rbx via its
+  // 5-push epilogue).
+  //
+  //   rbx = _bbs_buffer base (loaded after the widget_draw call)
+  //   rax = load target for [rbx + offset] compares
+  //   r11 = expected-value scratch (movabs staging)
+  //
+  // Fixture arg-packing:
+  //   rect (rsi) = x | y<<16 | w<<32 | h<<48
+  //              = 0 | 0<<16 | 10<<32 | 5<<48 = 0x0005000A_00000000
+  //   kind_and_pad (rdx) =
+  //              border_kind | pad_top<<8 | pad_right<<16 |
+  //              pad_bottom<<24 | pad_left<<32
+  //              = 1 | 1<<8 | 1<<16 | 1<<24 | 1<<32
+  //              = 0x00000001_01010101
+  //
+  // widget_draw call packing:
+  //   rdi = kind = WK_BLOCK = 0
+  //   rsi = &_bbs_spec
+  //   rdx = &_bbs_buffer
+  //   rcx = rows = 5
+  //   r8  = cols = 10
+  //
+  // Labels prefixed `bbs_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let boot_block_smoke : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-008 (postui#8): boot_block_smoke is the first-pixel boot smoke — packs a known BlockSpec via block_spec_init, renders it via widget_draw (WK_BLOCK dispatch), then verifies 9 cells against expected LE u64 word0 bytes. 1-push (rbx = _bbs_buffer base) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for both nested calls (block_spec_init leaf, widget_draw one-level to block_draw). rbx is SysV callee-save so it survives block_spec_init's execution (which touches only rdi/rsi/rdx/rcx/r8/rax) and widget_draw's transitive block_draw call (block_draw's 5-push epilogue preserves rbx by construction). Phase 1 (spec build): lea rdi, [rip + _bbs_spec]; mov rsi, 0x0005000A00000000 (packed rect x=0/y=0/w=10/h=5, imm64 -> movabs since imm > 0x7FFFFFFF, legal for mov); mov rdx, 0x0000000101010101 (kind=PLAIN + pad=(1,1,1,1), imm64 -> movabs); lea rcx, [rip + _bbs_title]; mov r8, 2 (title_len, imm32-safe); call block_spec_init. block_spec_init is `!{mem} @{} : (u64,u64,u64,u64,u64) -> ()` — no return value in rax to check. Phase 2 (render): xor rdi, rdi (WK_BLOCK=0); lea rsi, [rip + _bbs_spec]; lea rdx, [rip + _bbs_buffer]; mov rcx, 5; mov r8, 10; call widget_draw. widget_draw returns 0 on OK (bounds check + WK_BLOCK arm forwards block_draw's own 0 return); cmp rax, 0; jne bbs_fail_wd -> return BBS_ERR_WIDGET_DRAW_RC=0xFFFFEDA9. Phase 3 (verify): lea rbx, [rip + _bbs_buffer]; nine consecutive `mov rax, [rbx + offset]; mov r11, expected; cmp rax, r11; jne bbs_fail_<name>` compares. Offsets and expected values verified against block.pdx phase docs — every border cell has bytes [0..4) = glyph (E2 94 XX 00) and bytes [4..8) = fill_cell fg (FF FF FF 00), packed LE as u64 = 0x00FFFFFF00SS94E2 (where SS is the third glyph byte); title cells have bytes [0..4) = ASCII byte + zero pad (from mov_d store's high 24 bits); interior cells are pure fill_cell word0 = 0x00FFFFFF00000020. All 9 checks touch word0 (bytes 0..8) which captures every phase-1 fill + phase-2/3 overwrite in a single cmp per cell. Every expected value is loaded via mov reg, imm64 (movabs) then reg-reg cmp — never a cmp reg, imm64 (paideia-as pitfall). Every fail sentinel is loaded via mov reg, imm64 (movabs, legal for mov). Every immediate in cmp is 0 (imm32-safe). Every immediate in the fixture pack is imm64 via mov (movabs). No test, no imul, no and reg, imm64. Cross-module calls (block_spec_init, widget_draw) resolve via paideia-as's flat ELF symbol namespace — same pattern widget_kind.pdx uses to call block_draw. Effect !{mem} — writes to fixture buffers (transitively) and reads back for compare; no sysreg (no syscall); no cap (block_draw takes raw buf_ptr, not a canvas cap). Labels prefixed bbs_ per fingerprint discipline.",
+      block: {
+        push rbx;
+
+        // ---- Phase 1: pack BlockSpec via block_spec_init ------------------
+        lea rdi, [rip + _bbs_spec];
+        mov rsi, 0x0005000A00000000;      // rect: x=0, y=0, w=10, h=5
+        mov rdx, 0x0000000101010101;      // kind=PLAIN, pad=(1,1,1,1)
+        lea rcx, [rip + _bbs_title];      // title_ptr
+        mov r8, 2;                        // title_len
+        call block_spec_init;
+
+        // ---- Phase 2: render via widget_draw(WK_BLOCK, ...) ---------------
+        xor rdi, rdi;                     // WK_BLOCK = 0
+        lea rsi, [rip + _bbs_spec];       // spec_ptr
+        lea rdx, [rip + _bbs_buffer];     // buf_ptr
+        mov rcx, 5;                       // rows
+        mov r8, 10;                       // cols
+        call widget_draw;
+
+        cmp rax, 0;
+        jne bbs_fail_wd;
+
+        // ---- Phase 3: verify cells against expected fixture bytes ---------
+        lea rbx, [rip + _bbs_buffer];
+
+        // TL corner (0, 0) at offset 0 -- glyph ┌ (E2 94 8C 00) + fill fg
+        mov rax, [rbx + 0];
+        mov r11, 0x00FFFFFF008C94E2;
+        cmp rax, r11;
+        jne bbs_fail_tl;
+
+        // Title 'H' at (1, 0), offset 16 -- ASCII 0x48 + zero pad + fill fg
+        mov rax, [rbx + 16];
+        mov r11, 0x00FFFFFF00000048;
+        cmp rax, r11;
+        jne bbs_fail_th;
+
+        // Title 'i' at (2, 0), offset 32 -- ASCII 0x69 + zero pad + fill fg
+        mov rax, [rbx + 32];
+        mov r11, 0x00FFFFFF00000069;
+        cmp rax, r11;
+        jne bbs_fail_ti;
+
+        // Top-edge ─ at (5, 0), offset 80 -- glyph (E2 94 80 00) + fill fg
+        mov rax, [rbx + 80];
+        mov r11, 0x00FFFFFF008094E2;
+        cmp rax, r11;
+        jne bbs_fail_te;
+
+        // TR corner (9, 0), offset 144 -- glyph ┐ (E2 94 90 00) + fill fg
+        mov rax, [rbx + 144];
+        mov r11, 0x00FFFFFF009094E2;
+        cmp rax, r11;
+        jne bbs_fail_tr;
+
+        // Interior fill at (5, 2), offset 400 -- pure fill_cell word0
+        mov rax, [rbx + 400];
+        mov r11, 0x00FFFFFF00000020;
+        cmp rax, r11;
+        jne bbs_fail_int;
+
+        // Right-edge │ at (9, 2), offset 464 -- glyph (E2 94 82 00) + fill fg
+        mov rax, [rbx + 464];
+        mov r11, 0x00FFFFFF008294E2;
+        cmp rax, r11;
+        jne bbs_fail_re;
+
+        // BL corner (0, 4), offset 640 -- glyph └ (E2 94 94 00) + fill fg
+        mov rax, [rbx + 640];
+        mov r11, 0x00FFFFFF009494E2;
+        cmp rax, r11;
+        jne bbs_fail_bl;
+
+        // BR corner (9, 4), offset 784 -- glyph ┘ (E2 94 98 00) + fill fg
+        mov rax, [rbx + 784];
+        mov r11, 0x00FFFFFF009894E2;
+        cmp rax, r11;
+        jne bbs_fail_br;
+
+        // All checks passed.
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      bbs_fail_wd:
+        mov rax, 0xFFFFEDA9;
+        pop rbx;
+        ret;
+
+      bbs_fail_tl:
+        mov rax, 0xFFFFEDA0;
+        pop rbx;
+        ret;
+
+      bbs_fail_tr:
+        mov rax, 0xFFFFEDA1;
+        pop rbx;
+        ret;
+
+      bbs_fail_bl:
+        mov rax, 0xFFFFEDA2;
+        pop rbx;
+        ret;
+
+      bbs_fail_br:
+        mov rax, 0xFFFFEDA3;
+        pop rbx;
+        ret;
+
+      bbs_fail_th:
+        mov rax, 0xFFFFEDA4;
+        pop rbx;
+        ret;
+
+      bbs_fail_ti:
+        mov rax, 0xFFFFEDA5;
+        pop rbx;
+        ret;
+
+      bbs_fail_te:
+        mov rax, 0xFFFFEDA6;
+        pop rbx;
+        ret;
+
+      bbs_fail_re:
+        mov rax, 0xFFFFEDA7;
+        pop rbx;
+        ret;
+
+      bbs_fail_int:
+        mov rax, 0xFFFFEDA8;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

@@ -53,10 +53,14 @@ deps:
 # Populated starting M1-008 (boot smoke: render one Block into a
 # canvas fixture and verify cell bytes). Every entry below becomes a
 # `paideia-as build --tests` target once the corresponding issue
-# lands. The list is intentionally empty at M1-001 -- test bodies land
-# with their producing feature, not with the scaffold.
+# lands. tools/build.sh already compiles tests/*.pdx into
+# build-out/tests-<basename>.o via its `if [ -d tests ]` loop, so a
+# test source landing is picked up without any build.sh change.
+#
+# Fail-code family bands per design/architecture.md §7:
+#   test_boot_smoke  0xFFFFEDA0..0xFFFFEDAF   (this entry, M1-008)
 tests:
-  # (populated starting M1-008; see docs/design.md §5.1)
+  - tests/boot_block_smoke.pdx    # M1-008: render one Block, verify cell bytes
 
 # --- Documentation targets ---------------------------------------------
 # The authoritative postui spec lives at docs/design.md and is not a
