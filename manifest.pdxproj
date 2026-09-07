@@ -51,6 +51,8 @@ sources:
   - src/widgets/gauge.pdx         # M3-002: Gauge/LineGauge + GaugeView@0.1
   - src/widgets/sparkline.pdx     # M3-003: Sparkline + SparklineView@0.1
   - src/widgets/barchart.pdx      # M3-004: BarChart + BarChartView@0.1
+  - src/widgets/chart.pdx         # M3-005: Chart/axis/dataset + ChartView@0.1
+  - src/widgets/canvas.pdx        # M3-006: Canvas (Fixed64/braille) + CanvasView@0.1
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at

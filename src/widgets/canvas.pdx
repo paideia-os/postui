@@ -1,0 +1,1608 @@
+// src/widgets/canvas.pdx -- postui.M3-006 (paideia-os/postui#25)
+//
+// Canvas widget: Fixed64 coordinate space + integer Bresenham
+// (line / rect / circle) + braille dot-grid backing + CanvasView@0.1.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M3-006)
+// =============================================================================
+//
+// Canvas is the 12th ordinal in the closed widget catalog (WK_CANVAS
+// slot inside src/widget_kind.pdx L129) and the fifth M3 widget-body
+// landing after Fixed64 (M3-001), Gauge (M3-002), Sparkline (M3-003),
+// and BarChart (M3-004). It is the first postui widget whose input
+// coordinates live in the Q32.32 Fixed64 range (src/fixed64.pdx
+// L28-47) rather than raw cell-integer space, and the first to carry
+// a sub-cell dot-grid backing (2 cols x 4 rows braille dots per cell).
+//
+// This file ships:
+//   - CanvasSpec state record (64-byte struct; see WIRE block).
+//   - CVS_DOT_MASK[8] 8-byte LUT mapping (sub_x, sub_y) -> braille
+//     dot bit under U+2800 encoding (see BRAILLE DOT MAP).
+//   - canvas_clear: zero the bit-grid backing.
+//   - cvs_set_dot: leaf helper -- integer dot coords -> byte OR + store.
+//   - canvas_dot / canvas_line / canvas_rect / canvas_circle: Fixed64
+//     coord input -> integer dot coords -> cvs_set_dot fan-out.
+//   - canvas_draw: byte -> braille U+2800 + byte glyph -> 3-byte UTF-8
+//     -> back-region cell stamp.
+//   - canvas_view_pack: pack a fixed-40-byte CanvasView@0.1 record.
+//   - CVS_ERR_BAND sentinel (defensive; unused at v1).
+//
+// =============================================================================
+// CANVASSPEC WIRE (64 bytes, CANVAS_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)    rect          u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)   x_min         u64 Fixed64 raw i64 -- left edge of coord range
+//   [+16..+24)  x_max         u64 Fixed64 raw i64 -- right edge
+//   [+24..+32)  y_min         u64 Fixed64 raw i64 -- bottom edge (of value-space;
+//                                     mapped to the visually-bottom row of the
+//                                     Rect via the y-inversion in cvs_map_y)
+//   [+32..+40)  y_max         u64 Fixed64 raw i64 -- top edge of value-space
+//                                     (mapped to visually-top row of the Rect)
+//   [+40..+48)  bitmap_ptr    u64 pointer to a bit-per-braille-dot backing
+//                                     of exactly bw*bh bytes; caller-owned; the
+//                                     draw path only writes cells derived from
+//                                     bits currently set in this buffer, so a
+//                                     caller that re-uses a stale bitmap sees
+//                                     a stale render (documented posture --
+//                                     canvas_clear zeroes it in one call)
+//   [+48..+56)  style         u64 Style-packed (fg | bg<<24 | mods<<48) for
+//                                     every non-empty braille cell in the draw
+//                                     phase; empty cells stamp U+2800 (blank
+//                                     braille) with the same style so cursor
+//                                     highlighting is uniform
+//   [+56..+64)  _reserved     u64 must be zero on init (reserved for a M4/M5
+//                                     revision that may add a per-canvas
+//                                     coordinate-clip rectangle without churning
+//                                     downstream field offsets)
+//
+// 64 bytes rather than the issue-text's aspirational "~72B" because
+// Rect is a packed u64 in this codebase (RECT_BYTES = 8, see
+// src/rect.pdx L55) -- a 16-byte Rect slot as the issue narrative
+// implies would add 8 bytes of caller-visible padding with no
+// offsetting benefit. Same deviation Sparkline (40 vs "~48B") and
+// Scrollbar (56 vs "~48B") already documented and land against.
+//
+// _reserved sits at the tail (rather than mid-struct) so a M4/M5
+// widening keeps every existing CANVAS_OFF_* offset stable; adding
+// a slot before _reserved requires only widening the CANVAS_SPEC_BYTES
+// constant, no re-index of downstream field-read arithmetic.
+//
+// =============================================================================
+// BRAILLE DOT MAP (Unicode U+2800..U+28FF)
+// =============================================================================
+//
+// The Unicode braille block encodes 256 patterns of 8 dots as
+// codepoints U+2800..U+28FF. Each cell displays 8 dots laid out as
+// 2 columns x 4 rows:
+//
+//     .-------.
+//     | 1  4  |    (dot numbers per the U+2800 spec)
+//     | 2  5  |
+//     | 3  6  |
+//     | 7  8  |
+//     '-------'
+//
+// A codepoint U+2800 + p (where p is the 8-bit dot pattern) sets the
+// dots whose bit position in `p` is 1, with the following bit map:
+//
+//     bit 0 = dot 1 (top-left)         bit 3 = dot 4 (top-right)
+//     bit 1 = dot 2 (mid-upper-left)   bit 4 = dot 5 (mid-upper-right)
+//     bit 2 = dot 3 (mid-lower-left)   bit 5 = dot 6 (mid-lower-right)
+//     bit 6 = dot 7 (bottom-left)      bit 7 = dot 8 (bottom-right)
+//
+// Given a Canvas cell of 2 cols x 4 rows of DOT positions (col in
+// [0, 1], row in [0, 3] top-down), the bit index for dot (col, row) is:
+//
+//     if row < 3:  bit = row + 3 * col        (upper 6 dots)
+//     if row == 3: bit = 6 + col              (bottom 2 dots)
+//
+// Precomputed as CVS_DOT_MASK[8], indexed by (col << 2) | row:
+//
+//     index 0 = (col=0, row=0) = dot 1 = 1 << 0 = 0x01
+//     index 1 = (col=0, row=1) = dot 2 = 1 << 1 = 0x02
+//     index 2 = (col=0, row=2) = dot 3 = 1 << 2 = 0x04
+//     index 3 = (col=0, row=3) = dot 7 = 1 << 6 = 0x40
+//     index 4 = (col=1, row=0) = dot 4 = 1 << 3 = 0x08
+//     index 5 = (col=1, row=1) = dot 5 = 1 << 4 = 0x10
+//     index 6 = (col=1, row=2) = dot 6 = 1 << 5 = 0x20
+//     index 7 = (col=1, row=3) = dot 8 = 1 << 7 = 0x80
+//
+// This LUT lets cvs_set_dot reach the correct mask via one byte-load,
+// avoiding a compare-chain per dot on the Bresenham hot path.
+//
+// =============================================================================
+// BRAILLE UTF-8 ENCODING (u32-packed cell symbol)
+// =============================================================================
+//
+// U+2800..U+28FF encodes as a 3-byte UTF-8 sequence
+// 1110xxxx 10xxxxxx 10xxxxxx. Splitting the codepoint 0x2800 + p:
+//
+//     byte0 = 0xE2                        (constant: high nibble of E)
+//     byte1 = 0xA0 + (p >> 6)             (0xA0..0xA3 as p spans 0..0xFF)
+//     byte2 = 0x80 + (p & 0x3F)           (0x80..0xBF)
+//
+// Packed little-endian as u32 [byte0, byte1, byte2, 0]:
+//
+//     glyph_u32 = 0xE2 | (byte1 << 8) | (byte2 << 16)
+//               = 0x0080A0E2 + ((p >> 6) << 8) + ((p & 0x3F) << 16)
+//
+// Base glyph (empty braille U+2800) = 0x0080A0E2 = 8_429_282. Fits
+// imm32 signed positive -- paideia-as emits the compact 5-byte
+// `mov r32, imm32` form. Every subsequent additive term (byte1_delta
+// << 8, byte2_delta << 16) is at most (3 << 8) + (0x3F << 16) =
+// 0x003F0300 = 4_129_536, well within u32 -- the final glyph fits
+// imm32 for every p in [0, 255].
+//
+// (The task text's inline "glyph_u32 = 0x0000E200 | (byte2 << 8) |
+// (byte3 << 16)" arithmetic mis-labels the byte slots; this module
+// uses the corrected form above, which reproduces every codepoint in
+// the U+2800..U+28FF range byte-for-byte against the Unicode spec.)
+//
+// =============================================================================
+// COORDINATE MAPPING (Fixed64 -> integer dot column / row)
+// =============================================================================
+//
+// Given a spec whose Rect is bw x bh cells (so the dot grid is
+// (bw * 2) columns x (bh * 4) rows) and coord range [x_min, x_max) x
+// [y_min, y_max):
+//
+//     dot_col      = (x - x_min) * (bw * 2) / (x_max - x_min)
+//     dot_row_top  = (y_max - y) * (bh * 4) / (y_max - y_min)
+//
+// y is INVERTED (larger y -> smaller row) so a caller's "up is up"
+// intuition matches the visual on-screen result. Every subtraction
+// is a plain `sub reg, reg` on the raw Fixed64 backing words (two's-
+// complement, sign-preserving); the divide is a `call fx_scale`
+// which handles sign fixup and the full 128-bit intermediate. See
+// src/fixed64.pdx L473-582 for fx_scale semantics.
+//
+// The intermediate `(x - x_min) * (bw * 2)` fits u64 iff the raw
+// diff magnitude times the scale (bw <= 4096, so bw*2 <= 8192 ~ 2^13)
+// fits: raw_diff up to ~2^50 keeps the product in i64. This is the
+// same range restriction fx_mul documents (src/fixed64.pdx L74-95)
+// and applies unchanged here. A caller charting a range with
+// |x_max - x_min| exceeding ~2^18 in integer units loses precision
+// on the dot-column projection (deterministic truncation, not a
+// fault) -- documented posture.
+//
+// Out-of-range dots (result < 0 or >= bw*2 / bh*4) are silently
+// dropped by cvs_set_dot's bounds check. This is intentional for
+// Bresenham line/circle callers that pass endpoints outside the
+// canvas range and expect the visible portion to render; the alt
+// (return an error sentinel) would double-charge every out-of-range
+// endpoint's caller with an error-check branch.
+//
+// =============================================================================
+// BRESENHAM ALGORITHMS
+// =============================================================================
+//
+// canvas_line uses the Bresenham 2 form (Ohsawa's variant) with a
+// single signed err accumulator and two branches per step:
+//
+//     dx = |x1 - x0|
+//     dy = |y1 - y0|
+//     sx = (x0 < x1) ? +1 : -1
+//     sy = (y0 < y1) ? +1 : -1
+//     err = dx - dy
+//     loop:
+//       plot(x, y)
+//       if x == x1 && y == y1: break
+//       e2 = 2 * err
+//       if e2 > -dy:  err -= dy; x += sx
+//       if e2 <  dx:  err += dx; y += sy
+//
+// canvas_circle uses the classical midpoint circle algorithm with
+// signed decision variable d and 8-way symmetric plotting:
+//
+//     x = r; y = 0; d = 1 - r
+//     while x >= y:
+//       plot 8 symmetric points
+//       y += 1
+//       if d <= 0: d += 2*y + 1
+//       else:      x -= 1; d += 2*(y - x) + 1
+//
+// Both algorithms operate entirely in signed 64-bit integer dot
+// space -- no Fixed64 arithmetic in the inner loop. Signed compare
+// (jl / jge) and the xor+sub sign-fixup idiom (matches Fixed64's
+// L347-359 discipline) replace paideia-as's un-emitted `neg`.
+//
+// canvas_rect pre-maps the 4 endpoints in a single prologue and
+// then dispatches to a shared cvs_line_dots helper 4 times -- one
+// mapping call per unique x / y coordinate (4 total) rather than
+// 8 (one per endpoint of 4 edges).
+//
+// =============================================================================
+// CANVASVIEW@0.1 WIRE (semantic-pipe record, 40 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic         u32 = 0x57565643 ("CVVW" LE: 'C' 0x43,
+//                                    'V' 0x56, 'V' 0x56, 'W' 0x57)
+//   [+4..+8)   record_len    u32 = 40 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack     u64 verbatim from CanvasSpec+0
+//   [+16..+24) x_min         u64 verbatim from CanvasSpec+8
+//   [+24..+32) y_min         u64 verbatim from CanvasSpec+24
+//   [+32..+40) style         u64 verbatim from CanvasSpec+48
+//
+// x_max and y_max are excluded from the packed record because a
+// downstream reader interested in the coordinate range's ORIGIN
+// (x_min, y_min) can derive the spans from the Rect + a fixed
+// axis-scale convention if the caller is willing to advertise it;
+// the record keeps its size at 40 bytes without churning the
+// 32-byte "small-record" convention every other M3 View packer
+// (GGVW / SPVW / BCVW) already ships. style is included because it
+// is semantically load-bearing for a downstream analyzer distinguishing
+// two overlaid canvases by color. bitmap_ptr is a process-local
+// pointer with no meaningful cross-pipe semantics -- excluded, same
+// posture Sparkline takes for values_ptr.
+//
+// A future CanvasView@0.2 that widens to 48 or 56 bytes can add
+// x_max/y_max/bitmap_bytes without breaking existing readers keyed
+// against (magic, record_len).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Canvas`), matches file basename
+//     (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` (signed
+//     zero-compares use `cmp reg, 0` + `jl`/`jge`).
+//   - No `neg` mnemonic (not emitted by paideia-as); every negation
+//     goes through the xor+sub sign-mask idiom (mask = reg sar 63;
+//     abs = (reg xor mask) - mask), same posture Fixed64 takes.
+//   - Every mov_b byte-load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension).
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFF, 0x3F, 0xC0,
+//     0, 1, 2, 3, 4, 6, 7, 8, shift counts <= 56. The error sentinel
+//     0xFFFFEBD6 and any style-word > 0x7FFFFFFF go through
+//     `mov reg, imm64` (movabs 10-byte form; legal for mov, NOT legal
+//     for cmp/and). The braille base glyph 0x0080A0E2 and the CVVW
+//     magic 0x57565643 fit imm32 signed positive so paideia-as emits
+//     the compact 5-byte `mov r32, imm32` form. The sign-fixup
+//     sentinel -1 (0xFFFFFFFFFFFFFFFF) is loaded via `mov reg, imm64`
+//     (movabs form) -- matches frame.pdx L549 precedent.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is
+//     2-op `imul reg, reg`. Multiplication by 3 (sub_x <-> bit index)
+//     folds to `shl reg, 1; add reg, reg` (no imul); multiplication
+//     by 2 / 4 / 8 folds to `shl reg, 1 / 2 / 3`; multiplication by
+//     16 (cell-address stride) folds to `shl reg, 4`.
+//   - Division uses standard `xor rdx, rdx; div reg` inline; the
+//     coord-mapping divide is delegated to fx_scale (cross-module
+//     bare call; see src/fixed64.pdx L516-582).
+//   - Cross-module calls are bare `call fx_scale` per the paragraph.
+//     pdx / tabs.pdx precedent (see paragraph.pdx L281 comment on
+//     "Cross-module call convention: bare `call line_break_positions`").
+//   - Labels prefixed `cvs_` per docs/design.md fingerprint discipline
+//     (sub-prefixes: cvs_cl_ for clear, cvs_sd_ for set_dot, cvs_ld_
+//     for line-in-dots (Bresenham inner), cvs_ln_ for canvas_line
+//     prologue/mapping, cvs_rc_ for canvas_rect edge dispatch, cvs_ci_
+//     for canvas_circle midpoint, cvs_dr_ for canvas_draw phases,
+//     cvs_bv_ for canvas_view_pack, cvs_ret_ for shared epilogue).
+//   - Non-leaf bodies push 5 SysV callee-save regs (rbx, r12, r13,
+//     r14, r15) = 40 bytes; entry rsp%16 == 8, after 5 pushes
+//     rsp%16 == 0. Every additional `sub rsp, N` uses N % 16 == 0 to
+//     preserve alignment for nested calls (fx_scale, cvs_set_dot,
+//     cvs_line_dots). Leaf helpers (cvs_set_dot, canvas_clear,
+//     canvas_view_pack) push nothing and make no nested call.
+//   - Effect `!{mem}` on every body that touches the bitmap, the
+//     back-region cells, or the caller-provided packing buffer.
+//     `!{}` only on truly-pure leaves (none in this module -- every
+//     entry touches memory).
+
+module Canvas = structure {
+
+  // ==========================================================================
+  // CanvasSpec layout (64 bytes) -- see CANVASSPEC WIRE block.
+  // ==========================================================================
+  pub let CANVAS_SPEC_BYTES         : u64 = 64
+
+  pub let CANVAS_OFF_RECT           : u64 = 0
+  pub let CANVAS_OFF_X_MIN          : u64 = 8
+  pub let CANVAS_OFF_X_MAX          : u64 = 16
+  pub let CANVAS_OFF_Y_MIN          : u64 = 24
+  pub let CANVAS_OFF_Y_MAX          : u64 = 32
+  pub let CANVAS_OFF_BITMAP_PTR     : u64 = 40
+  pub let CANVAS_OFF_STYLE          : u64 = 48
+  pub let CANVAS_OFF_RESERVED       : u64 = 56
+
+  // ==========================================================================
+  // Braille base glyph (U+2800, empty braille pattern) as u32 UTF-8
+  // packed little-endian [0xE2, 0xA0, 0x80, 0]. Every codepoint in
+  // U+2800..U+28FF derives from this base via
+  //   glyph = base + ((p >> 6) << 8) + ((p & 0x3F) << 16)
+  // (see BRAILLE UTF-8 ENCODING block above). Value < 0x80000000 so
+  // paideia-as emits the compact 5-byte `mov r32, imm32` form.
+  // ==========================================================================
+  pub let CANVAS_BRAILLE_BASE_U32   : u64 = 0x0080A0E2
+
+  // ==========================================================================
+  // CanvasView@0.1 wire constants (fixed 40 bytes; see CANVASVIEW block).
+  // CVVW magic = 0x57565643 ("W"<<24 | "V"<<16 | "V"<<8 | "C") LE
+  //   'C' = 0x43, 'V' = 0x56, 'V' = 0x56, 'W' = 0x57
+  //   -> 0x57 << 24 | 0x56 << 16 | 0x56 << 8 | 0x43 = 0x57565643
+  // Fits imm32 signed positive so `mov r32, imm32` (5 bytes).
+  // ==========================================================================
+  pub let CVVW_MAGIC                : u64 = 0x57565643
+  pub let CVVW_RECORD_LEN           : u64 = 40
+  pub let CVVW_OFF_MAGIC            : u64 = 0
+  pub let CVVW_OFF_RECORD_LEN       : u64 = 4
+  pub let CVVW_OFF_RECT             : u64 = 8
+  pub let CVVW_OFF_X_MIN            : u64 = 16
+  pub let CVVW_OFF_Y_MIN            : u64 = 24
+  pub let CVVW_OFF_STYLE            : u64 = 32
+
+  // Schema name string (NUL-terminated). Consumed by semantic_registry.pdx
+  // (M2-009) which BLAKE3-hashes the string for the wire schema-hash slot.
+  // "CanvasView@0.1" = 14 chars + 1 NUL = 15 bytes; LEN excludes the NUL.
+  pub let CVVW_SCHEMA_NAME     : [u8; 15] = "CanvasView@0.1\0"
+  pub let CVVW_SCHEMA_NAME_LEN : u64 = 14
+
+  // ==========================================================================
+  // Error sentinel. Anchored at 0xFFFFEBD6 in the M3 sub-band
+  // 0xFFFFEBD0..0xFFFFEBDF (design/architecture.md §5.1). Sits after
+  // Fixed64 (0xFFFFEBD0..1), Gauge (0xFFFFEBD2), Sparkline (0xFFFFEBD3),
+  // BarChart (0xFFFFEBD4), and Chart (0xFFFFEBD5 reserved for M3-005) --
+  // Canvas takes 0xFFFFEBD6 by ordinal position in the M3 catalog.
+  // > 0x7FFFFFFF so `mov reg, imm` emits movabs; NEVER usable in cmp/and.
+  //
+  // At v1 no canvas_* path returns this -- every widget entry accepts
+  // any spec silently (a rect of 0x0 returns 0 with no writes; a
+  // degenerate coord range (x_max <= x_min or y_max <= y_min) returns 0
+  // without plotting; an out-of-range Fixed64 endpoint is silently
+  // dropped by cvs_set_dot). The sentinel is reserved for a future
+  // revision that may want to trap e.g. a bitmap_ptr of 0 with a
+  // non-zero rect.
+  // ==========================================================================
+  pub let CVS_ERR_BAND : u64 = 0xFFFFEBD6
+
+  // ==========================================================================
+  // Dot-mask LUT (8 bytes). Indexed by (sub_x << 2) | sub_y in [0..8).
+  // See BRAILLE DOT MAP block above for the derivation.
+  //
+  //     idx 0 = (col=0, row=0) = dot 1 = 0x01
+  //     idx 1 = (col=0, row=1) = dot 2 = 0x02
+  //     idx 2 = (col=0, row=2) = dot 3 = 0x04
+  //     idx 3 = (col=0, row=3) = dot 7 = 0x40
+  //     idx 4 = (col=1, row=0) = dot 4 = 0x08
+  //     idx 5 = (col=1, row=1) = dot 5 = 0x10
+  //     idx 6 = (col=1, row=2) = dot 6 = 0x20
+  //     idx 7 = (col=1, row=3) = dot 8 = 0x80
+  //
+  // Loaded by cvs_set_dot via a single byte-read
+  // `lea r11, [rip + cvs_dot_mask]; xor rmask, rmask; mov_b rmask,
+  //  [r11 + idx]`. Table stride 1 byte -> no shift on the index.
+  // ==========================================================================
+  pub let cvs_dot_mask : [u8; 8] = "\x01\x02\x04\x40\x08\x10\x20\x80"
+
+  // ==========================================================================
+  // canvas_clear(spec_ptr) -> u64
+  //
+  // Zero exactly bw*bh bytes of the bitmap backing (each byte = one
+  // braille cell of 8 dots). Returns 0 always; an empty rect (bw==0
+  // or bh==0) writes nothing and returns 0.
+  //
+  // Register plan (pure leaf, no push/pop, no nested call):
+  //   rdi = spec_ptr (read-only)
+  //   r8  = bw       (extracted)
+  //   r9  = bh       (extracted) -> then byte_count = bw*bh
+  //   r10 = bitmap_ptr
+  //   rcx = index cursor
+  //   rdx = zero byte constant
+  //   rax = return
+  //
+  // Effect `!{mem}` (reads spec, writes bitmap).
+  // ==========================================================================
+  pub let canvas_clear : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_clear zeros the bw*bh-byte bitmap at [rdi+40]. Pure leaf: no push/pop, no callee-save touched, no nested call. Load rect from [rdi+0]; extract bw = (rect>>32)&0xFFFF into r8; extract bh = rect>>48 into r9; compute byte_count = bw*bh via 2-op imul reg,reg (paideia-as-safe; product bounded by 4096*4096 = 16M, fits u32 much less u64). Zero-count skip via cmp+je to cvs_cl_done (empty rect: return 0 without touching memory). Load bitmap_ptr = [rdi+40] into r10; xor rcx / rdx for cursor and zero byte. Loop cvs_cl_loop: cmp cursor >= byte_count -> done; else mov_b [r10 + rcx + 0], rdx (byte store using low byte of rdx = 0); add cursor, 1; jmp loop. Return rax = 0. Every immediate (0xFFFF, 0, 1, shift counts 32/48) fits imm32/imm8. No test, no imul reg,imm, no and reg,imm64. Labels prefixed cvs_cl_ per docs fingerprint discipline.",
+      block: {
+        mov rax, [rdi + 0];                 // rax = packed rect
+        mov r8, rax;
+        shr r8, 32;
+        and r8, 0xFFFF;                     // r8 = bw
+        mov r9, rax;
+        shr r9, 48;                         // r9 = bh
+        imul r8, r9;                        // r8 = bw*bh (2-op reg,reg; safe)
+        cmp r8, 0;
+        je  cvs_cl_done;
+
+        mov r10, [rdi + 40];                // r10 = bitmap_ptr
+        xor rcx, rcx;                       // cursor
+        xor rdx, rdx;                       // zero byte
+
+      cvs_cl_loop:
+        cmp rcx, r8;
+        jae cvs_cl_done;
+        mov_b [r10 + rcx + 0], rdx;
+        add rcx, 1;
+        jmp cvs_cl_loop;
+
+      cvs_cl_done:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cvs_set_dot(spec_ptr, dot_col, dot_row) -> u64
+  //
+  // Set one bit in the bitmap corresponding to the dot at (dot_col,
+  // dot_row) in the (bw*2, bh*4) dot grid. Silently drops
+  // out-of-range dots (signed dot_col < 0, >= bw*2, dot_row < 0,
+  // >= bh*4). Always returns 0.
+  //
+  // dot_col / dot_row are passed as u64 but interpreted SIGNED for
+  // the bounds check (signed jl / jge). Callers that pre-clamp to
+  // non-negative can pass unsigned freely -- the signed jl on a
+  // small positive is a jge miss, correct.
+  //
+  // Byte offset in bitmap = (dot_row >> 2) * bw + (dot_col >> 1)
+  // (one byte per braille cell, row-major).
+  //
+  // Bit index within byte:
+  //   sub_x = dot_col & 1;  sub_y = dot_row & 3
+  //   mask = cvs_dot_mask[(sub_x << 2) | sub_y]
+  //
+  // Read-modify-write pattern: xor r, r; mov_b r, [addr]; or r, mask;
+  // mov_b [addr], r. No memory-dest OR (paideia-as codebase avoids the
+  // form; matches sparkline's stage-through-scratch discipline).
+  //
+  // Register plan (pure leaf, no push/pop, no nested call):
+  //   rdi = spec_ptr           (read-only, kept through the body)
+  //   rsi = dot_col (signed)
+  //   rdx = dot_row (signed)
+  //   r8  = rect scratch / sub_y / byte-scratch
+  //   r9  = bw / bitmap_ptr    (repurposed after bounds check)
+  //   r10 = bh / mask          (repurposed after bounds check)
+  //   r11 = LUT address (lea uses r11 as internal scratch; leaing INTO
+  //                      r11 sidesteps the width.pdx L246 discipline
+  //                      concern -- see sparkline.pdx L422 lea note)
+  //   rcx = cell_col           (dot_col >> 1)
+  //   rax = sub_x / byte_offset (dot_row >> 2 * bw + cell_col) / return
+  //
+  // Effect `!{mem}` (reads spec + bitmap byte; writes bitmap byte).
+  // Labels prefixed cvs_sd_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let cvs_set_dot : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dot_col: u64) (dot_row: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): cvs_set_dot is the leaf dot-plot primitive. Signed bounds check on both coords: cmp rsi, 0 / jl (dot_col<0); mov rax, r9; shl rax, 1; cmp rsi, rax / jge (dot_col >= bw*2); cmp rdx, 0 / jl (dot_row<0); mov rax, r10; shl rax, 2; cmp rdx, rax / jge (dot_row >= bh*4). Any bounds failure jumps to cvs_sd_out (rax=0 return). Otherwise compute cell_col = dot_col >> 1 into rcx; sub_x = dot_col & 1 into rax; cell_row = dot_row >> 2 into rdx; sub_y = dot_row & 3 into r8. byte_offset = cell_row * bw + cell_col: imul rdx, r9 (2-op reg,reg, paideia-as-safe); add rdx, rcx. LUT index = (sub_x << 2) | sub_y: shl rax, 2; or rax, r8. Load mask: lea r11, [rip + cvs_dot_mask] (paideia-as's lea uses r11 internal scratch -- leaing INTO r11 sidesteps that; matches sparkline.pdx L422 discipline); xor r10, r10; mov_b r10, [r11 + rax + 0] (byte load into r10, defensive zero-extend per paideia-as pitfall #1248). Bitmap addr: mov r9, [rdi + 40]; add r9, rdx. Read-OR-write: xor r8, r8; mov_b r8, [r9 + 0]; or r8, r10; mov_b [r9 + 0], r8. Pure leaf, no push/pop, no callee-save touched, no nested call. Every immediate (0xFFFF, 1, 2, 3, 40, shift counts 1/2/32/48) fits imm32/imm8. No test. No neg. No imul reg,imm (only 2-op reg,reg). Signed jumps (jl/jge) supported by paideia-as (verified stdlib hashmap_u64_u64.pdx L119/195/257). Labels prefixed cvs_sd_ per fingerprint discipline (cvs_sd_out for the shared drop epilogue).",
+      block: {
+        // ---- Load rect, extract bw and bh --------------------------------
+        mov r8, [rdi + 0];                  // r8 = packed rect
+        mov r9, r8;
+        shr r9, 32;
+        and r9, 0xFFFF;                     // r9 = bw
+        mov r10, r8;
+        shr r10, 48;                        // r10 = bh
+
+        // ---- Signed bounds check on dot_col ------------------------------
+        cmp rsi, 0;
+        jl  cvs_sd_out;
+        mov rax, r9;
+        shl rax, 1;                         // rax = bw * 2
+        cmp rsi, rax;
+        jge cvs_sd_out;
+
+        // ---- Signed bounds check on dot_row ------------------------------
+        cmp rdx, 0;
+        jl  cvs_sd_out;
+        mov rax, r10;
+        shl rax, 2;                         // rax = bh * 4
+        cmp rdx, rax;
+        jge cvs_sd_out;
+
+        // ---- Decompose dot_col into (cell_col, sub_x) --------------------
+        mov rcx, rsi;
+        shr rcx, 1;                         // rcx = cell_col = dot_col >> 1
+        mov rax, rsi;
+        and rax, 1;                         // rax = sub_x = dot_col & 1
+
+        // ---- Decompose dot_row into (cell_row, sub_y) --------------------
+        // (mov r8 = dot_row is temporary; dot_row is still in rdx; we
+        // extract sub_y into r8 THEN shr rdx by 2 to leave cell_row in rdx.)
+        mov r8, rdx;
+        and r8, 3;                          // r8 = sub_y = dot_row & 3
+        shr rdx, 2;                         // rdx = cell_row = dot_row >> 2
+
+        // ---- byte_offset = cell_row * bw + cell_col ----------------------
+        imul rdx, r9;                       // rdx = cell_row * bw (2-op reg,reg)
+        add rdx, rcx;                       // rdx = byte_offset
+
+        // ---- LUT index = (sub_x << 2) | sub_y ---------------------------
+        shl rax, 2;
+        or  rax, r8;                        // rax = idx in [0..8)
+
+        // ---- Load braille bit mask from LUT ------------------------------
+        // paideia-as's lea uses r11 as internal scratch; leaing INTO
+        // r11 sidesteps that. See sparkline.pdx L422.
+        lea r11, [rip + cvs_dot_mask];
+        xor r10, r10;
+        mov_b r10, [r11 + rax + 0];         // r10 = 1 << bit (low byte)
+
+        // ---- Bitmap address = bitmap_ptr + byte_offset -------------------
+        mov r9, [rdi + 40];
+        add r9, rdx;                        // r9 = &bitmap[byte_offset]
+
+        // ---- Read-OR-write the byte --------------------------------------
+        xor r8, r8;
+        mov_b r8, [r9 + 0];
+        or  r8, r10;
+        mov_b [r9 + 0], r8;
+
+        xor rax, rax;
+        ret;
+
+      cvs_sd_out:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_dot(spec_ptr, x_fx, y_fx) -> u64
+  //
+  // Set one braille dot corresponding to the Fixed64 coord (x_fx, y_fx).
+  // Silently drops coords outside the canvas range (delegated to
+  // cvs_set_dot).
+  //
+  // Algorithm:
+  //   1. Load rect, extract bw (into rbx) and bh (into r12).
+  //   2. Compute x_range = spec.x_max - spec.x_min, y_range = spec.y_max -
+  //      spec.y_min. Reject non-positive range (degenerate axis) -> 0.
+  //   3. Compute x_diff = x_fx - spec.x_min; call fx_scale(x_diff, bw*2,
+  //      x_range) -> dot_col (signed i64).
+  //   4. Compute y_diff = spec.y_max - y_fx (INVERSION); call fx_scale
+  //      (y_diff, bh*4, y_range) -> dot_row (signed i64).
+  //   5. call cvs_set_dot(spec_ptr, dot_col, dot_row).
+  //
+  // Register plan (5 pushes + sub rsp, 64; entry rsp%16 == 8, +40 == 0,
+  // +64 == 0, aligned for nested calls to fx_scale and cvs_set_dot):
+  //   rbx = bw  (small, kept in low bits)
+  //   r12 = bh
+  //   r13 = spec_ptr
+  //   r14 = dot_col (survives from fx_scale return to cvs_set_dot arg)
+  //   r15 = free / temporary
+  //   Stack (64 B = 8 slots):
+  //     [rsp+0]  = x_fx (input, cached across fx_scale clobber)
+  //     [rsp+8]  = y_fx
+  //     [rsp+16] = x_min
+  //     [rsp+24] = x_max (used only for range compute)
+  //     [rsp+32] = y_max (used for y-inversion)
+  //     [rsp+40] = x_range
+  //     [rsp+48] = y_range
+  //     [rsp+56] = (spare / alignment pad)
+  //
+  // Labels prefixed cvs_do_ per fingerprint discipline.
+  // ==========================================================================
+  pub let canvas_dot : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (x_fx: u64) (y_fx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_dot is the single-point Fixed64 dot-plot. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B; entry rsp%16==8, +40==0) + sub rsp, 64 (8 slots for spec + args cache; +64 stays 0). Cache args (rsi=x_fx, rdx=y_fx) into stack BEFORE any register reuse; cache spec_ptr into r13. Load packed rect from [r13+0]; extract bw = (r>>32)&0xFFFF into rbx, bh = r>>48 into r12; early-return 0 if bw==0 or bh==0 via cvs_do_ret. Snapshot spec fields x_min ([r13+8]), x_max ([r13+16]), y_max ([r13+32]) into [rsp+16], [rsp+24], [rsp+32]. Compute x_range = x_max - x_min into rax; if rax <= 0 (cmp/jle) return 0 (degenerate axis); save at [rsp+40]. Compute y_range = y_max - y_min = [rsp+32] - [r13+24] into rax similarly, cmp jle, save at [rsp+48]. Map x: mov rdi, [rsp+0] (x_fx); sub rdi, [rsp+16] (x_min); mov rsi, rbx; shl rsi, 1 (bw*2); mov rdx, [rsp+40]; call fx_scale (bare cross-module per paragraph.pdx L281 precedent); save rax -> r14. Map y (inverted): mov rdi, [rsp+32] (y_max); sub rdi, [rsp+8] (y_fx); mov rsi, r12; shl rsi, 2 (bh*4); mov rdx, [rsp+48]; call fx_scale; result stays in rax. cvs_set_dot(r13, r14, rax): mov rdi, r13; mov rsi, r14; mov rdx, rax; call cvs_set_dot; discard return (always 0). Epilogue cvs_do_ret: xor rax, rax; add rsp, 64; pop 5; ret. Every immediate (0xFFFF, 0, 1, 2, shift counts 1/2/32/48) fits imm32/imm8. No test. No neg. No imul reg,imm. Cross-module bare calls to fx_scale and cvs_set_dot per widget_kind.pdx L216 precedent for block_draw. Effect `!{mem}` -- reads spec, calls fx_scale (pure per Fixed64 !{}) and cvs_set_dot (!{mem}). Labels prefixed cvs_do_ per fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 64;
+
+        // ---- Cache args to stack BEFORE any register reuse ---------------
+        mov [rsp + 0], rsi;                 // x_fx
+        mov [rsp + 8], rdx;                 // y_fx
+
+        // ---- Cache spec_ptr and load rect --------------------------------
+        mov r13, rdi;
+        mov rax, [r13 + 0];
+        mov rbx, rax;
+        shr rbx, 32;
+        and rbx, 0xFFFF;                    // rbx = bw
+        cmp rbx, 0;
+        je  cvs_do_ret;
+        mov r12, rax;
+        shr r12, 48;                        // r12 = bh
+        cmp r12, 0;
+        je  cvs_do_ret;
+
+        // ---- Snapshot spec fields into stack scratch ---------------------
+        mov rax, [r13 + 8];
+        mov [rsp + 16], rax;                // x_min
+        mov rax, [r13 + 16];
+        mov [rsp + 24], rax;                // x_max
+        mov rax, [r13 + 32];
+        mov [rsp + 32], rax;                // y_max
+
+        // ---- x_range = x_max - x_min; reject non-positive ----------------
+        mov rax, [rsp + 24];
+        sub rax, [rsp + 16];
+        cmp rax, 0;
+        jle cvs_do_ret;
+        mov [rsp + 40], rax;                // x_range
+
+        // ---- y_range = y_max - y_min; reject non-positive ----------------
+        mov rax, [rsp + 32];
+        sub rax, [r13 + 24];
+        cmp rax, 0;
+        jle cvs_do_ret;
+        mov [rsp + 48], rax;                // y_range
+
+        // ---- Map x: fx_scale(x_fx - x_min, bw*2, x_range) ---------------
+        mov rdi, [rsp + 0];
+        sub rdi, [rsp + 16];
+        mov rsi, rbx;
+        shl rsi, 1;                         // bw*2
+        mov rdx, [rsp + 40];
+        call fx_scale;
+        mov r14, rax;                       // r14 = dot_col (signed)
+
+        // ---- Map y: fx_scale(y_max - y_fx, bh*4, y_range) (inverted) -----
+        mov rdi, [rsp + 32];
+        sub rdi, [rsp + 8];
+        mov rsi, r12;
+        shl rsi, 2;                         // bh*4
+        mov rdx, [rsp + 48];
+        call fx_scale;
+        // rax = dot_row (signed)
+
+        // ---- cvs_set_dot(spec, dot_col, dot_row) -------------------------
+        mov rdi, r13;
+        mov rsi, r14;
+        mov rdx, rax;
+        call cvs_set_dot;
+
+      cvs_do_ret:
+        xor rax, rax;
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cvs_line_dots(spec_ptr, dx0, dy0, dx1, dy1) -> u64
+  //
+  // Bresenham line in integer dot space. Endpoints are signed i64 dot
+  // coordinates (out-of-range dots are silently dropped by cvs_set_dot).
+  // Uses the "Bresenham 2" formulation with signed err accumulator.
+  //
+  // Register plan (5 pushes + sub rsp, 48; body makes nested calls to
+  // cvs_set_dot):
+  //   rbx = spec_ptr
+  //   r12 = x (current)
+  //   r13 = y (current)
+  //   r14 = err (signed)
+  //   r15 = dx_abs (constant across the loop)
+  //   Stack (48 B = 6 slots):
+  //     [rsp+0]  = x1 (target)
+  //     [rsp+8]  = y1 (target)
+  //     [rsp+16] = sx (+1 or -1)
+  //     [rsp+24] = sy (+1 or -1)
+  //     [rsp+32] = dy_abs
+  //     [rsp+40] = (pad / alignment)
+  //
+  // Labels prefixed cvs_ld_ per fingerprint discipline.
+  // ==========================================================================
+  pub let cvs_line_dots : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dx0: u64) (dy0: u64) (dx1: u64) (dy1: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): cvs_line_dots runs Bresenham on signed integer dot coords, calling cvs_set_dot per plotted dot. 5-push (rbx/r12/r13/r14/r15 = 40 B; rsp%16==0 after) + sub rsp, 48 (mod 16 = 0). Init: rbx = spec_ptr, r12 = dx0 (x), r13 = dy0 (y); save dx1/dy1 to [rsp+0/8]. Compute sx and dx_abs: mov rax, [rsp+0]; sub rax, r12 -> raw dx_signed. sar mask idiom: mov rcx, rax; sar rcx, 63 (mask=0 or -1). abs: xor rax, rcx; sub rax, rcx -> r15 = dx_abs. sx = 1 + 2*mask (mask=0 -> sx=1, mask=-1 -> sx=-1): mov rdi, rcx; shl rdi, 1; add rdi, 1; save to [rsp+16]. Compute sy and dy_abs the same way (mov rax, [rsp+8]; sub rax, r13; sar mask; abs; sy=1+2*mask); dy_abs -> [rsp+32], sy -> [rsp+24]. err = dx_abs - dy_abs -> r14. Loop cvs_ld_top: call cvs_set_dot(rbx, r12, r13); termination check: cmp r12, [rsp+0]; jne cvs_ld_step; cmp r13, [rsp+8]; je cvs_ld_ret. cvs_ld_step: e2 = 2*err = r14 shl 1 into rax. First branch: if e2 > -dy_abs: err -= dy_abs; x += sx. Equivalent: rax > -[rsp+32] iff rax + [rsp+32] > 0 -- to avoid an intermediate negation compute -dy_abs via mov rcx, [rsp+32]; mov rdx, rcx; sar rdx, 63; xor rcx, rdx; sub rcx, rdx -- wait dy_abs is already non-negative from the abs step so its two's-complement negation is just a sub-from-zero. Simpler: mov rcx, 0; sub rcx, [rsp+32] -> rcx = -dy_abs. Then cmp rax, rcx; jle skip; sub r14, [rsp+32]; add r12, [rsp+16]. Second branch: if e2 < dx_abs: err += dx_abs; y += sy: cmp rax, r15; jge skip; add r14, r15; add r13, [rsp+24]. Jump back to cvs_ld_top. Epilogue cvs_ld_ret: xor rax, rax; add rsp, 48; pop 5; ret. Every immediate (0, 1, shift counts 1/63) fits imm32/imm8. No test. No neg (all sign work via sar+xor+sub or `mov rcx, 0; sub rcx, val`). No imul reg,imm. Signed jumps (jl/jle/jg/jge/jne/je) all supported. Cross-module bare call `call cvs_set_dot` per widget_kind.pdx precedent. Effect `!{mem}` -- calls cvs_set_dot which touches bitmap. Labels prefixed cvs_ld_ per fingerprint discipline (cvs_ld_top for the loop head; cvs_ld_step for the state-update block; cvs_ld_x_skip / cvs_ld_y_skip for the two conditional-update misses; cvs_ld_ret for the shared epilogue).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 48;
+
+        // ---- Init: cache spec, endpoints ---------------------------------
+        mov rbx, rdi;                       // spec_ptr
+        mov r12, rsi;                       // x = dx0
+        mov r13, rdx;                       // y = dy0
+        mov [rsp + 0], rcx;                 // x1
+        mov [rsp + 8], r8;                  // y1
+
+        // ---- sx, dx_abs from x1 - x --------------------------------------
+        mov rax, [rsp + 0];
+        sub rax, r12;                       // rax = x1 - x  (signed)
+        mov rcx, rax;
+        sar rcx, 63;                        // rcx = mask (0 or -1)
+        xor rax, rcx;
+        sub rax, rcx;                       // rax = |x1 - x|
+        mov r15, rax;                       // r15 = dx_abs
+        mov rdi, rcx;
+        shl rdi, 1;
+        add rdi, 1;                         // rdi = sx (1 or -1)
+        mov [rsp + 16], rdi;
+
+        // ---- sy, dy_abs from y1 - y --------------------------------------
+        mov rax, [rsp + 8];
+        sub rax, r13;
+        mov rcx, rax;
+        sar rcx, 63;
+        xor rax, rcx;
+        sub rax, rcx;                       // rax = |y1 - y|
+        mov [rsp + 32], rax;                // dy_abs
+        mov rdi, rcx;
+        shl rdi, 1;
+        add rdi, 1;                         // rdi = sy
+        mov [rsp + 24], rdi;
+
+        // ---- err = dx_abs - dy_abs ---------------------------------------
+        mov r14, r15;
+        sub r14, [rsp + 32];
+
+      cvs_ld_top:
+        // ---- Plot current dot --------------------------------------------
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call cvs_set_dot;
+
+        // ---- Termination: x == x1 && y == y1 -----------------------------
+        // (paideia-as encoder does not implement `cmp reg, [mem]`; load the
+        // memory operand into scratch first, matching sparkline / barchart
+        // discipline.)
+        mov rax, [rsp + 0];
+        cmp r12, rax;
+        jne cvs_ld_step;
+        mov rax, [rsp + 8];
+        cmp r13, rax;
+        je  cvs_ld_ret;
+
+      cvs_ld_step:
+        // ---- e2 = 2 * err (rax) ------------------------------------------
+        mov rax, r14;
+        shl rax, 1;
+
+        // ---- if e2 > -dy_abs: err -= dy_abs; x += sx --------------------
+        // -dy_abs computed as (0 - dy_abs) via mov+sub (no neg mnemonic).
+        mov rcx, 0;
+        sub rcx, [rsp + 32];                // rcx = -dy_abs
+        cmp rax, rcx;
+        jle cvs_ld_x_skip;
+        sub r14, [rsp + 32];                // err -= dy_abs
+        add r12, [rsp + 16];                // x += sx
+      cvs_ld_x_skip:
+
+        // ---- if e2 < dx_abs: err += dx_abs; y += sy ----------------------
+        cmp rax, r15;
+        jge cvs_ld_y_skip;
+        add r14, r15;                       // err += dx_abs
+        add r13, [rsp + 24];                // y += sy
+      cvs_ld_y_skip:
+
+        jmp cvs_ld_top;
+
+      cvs_ld_ret:
+        xor rax, rax;
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_line(spec_ptr, x0_fx, y0_fx, x1_fx, y1_fx) -> u64
+  //
+  // Map the two Fixed64 endpoints to integer dot coords via fx_scale
+  // (identical mapping formula as canvas_dot), then dispatch to
+  // cvs_line_dots.
+  //
+  // Register plan (5 pushes + sub rsp, 96; body makes 4 nested calls
+  // to fx_scale plus 1 call to cvs_line_dots):
+  //   rbx = spec_ptr
+  //   r12 = bw
+  //   r13 = bh
+  //   r14 = dx0  (survives to cvs_line_dots arg)
+  //   r15 = dy0
+  //   Stack (96 B = 12 slots):
+  //     [rsp+0]  = x0_fx (cached across fx_scale clobber)
+  //     [rsp+8]  = y0_fx
+  //     [rsp+16] = x1_fx
+  //     [rsp+24] = y1_fx
+  //     [rsp+32] = x_min
+  //     [rsp+40] = y_max
+  //     [rsp+48] = x_range
+  //     [rsp+56] = y_range
+  //     [rsp+64] = dx1 (mapped result)
+  //     [rsp+72] = dy1 (mapped result)
+  //     [rsp+80] = (pad)
+  //     [rsp+88] = (pad)
+  //
+  // Labels prefixed cvs_ln_ per fingerprint discipline.
+  // ==========================================================================
+  pub let canvas_line : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (x0_fx: u64) (y0_fx: u64) (x1_fx: u64) (y1_fx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_line maps 2 Fixed64 endpoints to integer dot coords via 4 fx_scale calls, then hands off to cvs_line_dots for the Bresenham dot loop. 5-push (rbx/r12/r13/r14/r15) + sub rsp, 96 (%16=0). Save input args (rsi=x0, rdx=y0, rcx=x1, r8=y1) to [rsp+0/8/16/24] BEFORE any register reuse -- fx_scale clobbers all caller-save. Cache spec_ptr into rbx; load rect; extract bw -> r12, bh -> r13; early-return 0 if bw==0 or bh==0. Snapshot x_min -> [rsp+32], y_max -> [rsp+40]. Compute x_range = x_max - x_min: mov rax, [rbx+16]; sub rax, [rbx+8]; cmp rax, 0; jle ret; store at [rsp+48]. Same for y_range at [rsp+56]. Map dx0: mov rdi, [rsp+0] (x0); sub rdi, [rsp+32] (x_min); mov rsi, r12; shl rsi, 1 (bw*2); mov rdx, [rsp+48] (x_range); call fx_scale -> r14 = dx0. Map dy0 (inverted): mov rdi, [rsp+40] (y_max); sub rdi, [rsp+8] (y0); mov rsi, r13; shl rsi, 2 (bh*4); mov rdx, [rsp+56] (y_range); call fx_scale -> r15 = dy0. Map dx1: same shape as dx0 but with x1_fx from [rsp+16]; store rax at [rsp+64]. Map dy1: same shape as dy0 but with y1_fx from [rsp+24]; store rax at [rsp+72]. Then call cvs_line_dots(rbx, r14, r15, [rsp+64], [rsp+72]): SysV places 5 args in rdi/rsi/rdx/rcx/r8 -- mov rdi, rbx; mov rsi, r14; mov rdx, r15; mov rcx, [rsp+64]; mov r8, [rsp+72]; call cvs_line_dots. Epilogue: xor rax, rax; add rsp, 96; pop 5; ret. Every immediate (0xFFFF, 0, 1, 2, 8, 16, 24, 32, 40, shift counts 1/2/32/48) fits imm32/imm8. No test. No neg. No imul reg,imm. Cross-module bare `call fx_scale` per paragraph.pdx L281 precedent; intra-module bare `call cvs_line_dots`. Effect `!{mem}` -- reads spec, calls fx_scale (pure) and cvs_line_dots (mem). Labels prefixed cvs_ln_ per fingerprint discipline (cvs_ln_ret for the shared epilogue).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 96;
+
+        // ---- Cache endpoints BEFORE register reuse -----------------------
+        mov [rsp + 0], rsi;                 // x0_fx
+        mov [rsp + 8], rdx;                 // y0_fx
+        mov [rsp + 16], rcx;                // x1_fx
+        mov [rsp + 24], r8;                 // y1_fx
+
+        // ---- Cache spec_ptr, load rect, extract bw/bh --------------------
+        mov rbx, rdi;
+        mov rax, [rbx + 0];
+        mov r12, rax;
+        shr r12, 32;
+        and r12, 0xFFFF;                    // r12 = bw
+        cmp r12, 0;
+        je  cvs_ln_ret;
+        mov r13, rax;
+        shr r13, 48;                        // r13 = bh
+        cmp r13, 0;
+        je  cvs_ln_ret;
+
+        // ---- Snapshot spec fields ----------------------------------------
+        mov rax, [rbx + 8];
+        mov [rsp + 32], rax;                // x_min
+        mov rax, [rbx + 32];
+        mov [rsp + 40], rax;                // y_max
+
+        // ---- Ranges (guard non-positive) ---------------------------------
+        mov rax, [rbx + 16];
+        sub rax, [rbx + 8];
+        cmp rax, 0;
+        jle cvs_ln_ret;
+        mov [rsp + 48], rax;                // x_range
+
+        mov rax, [rbx + 32];
+        sub rax, [rbx + 24];
+        cmp rax, 0;
+        jle cvs_ln_ret;
+        mov [rsp + 56], rax;                // y_range
+
+        // ---- Map dx0 = fx_scale(x0 - x_min, bw*2, x_range) --------------
+        mov rdi, [rsp + 0];
+        sub rdi, [rsp + 32];
+        mov rsi, r12;
+        shl rsi, 1;
+        mov rdx, [rsp + 48];
+        call fx_scale;
+        mov r14, rax;                       // r14 = dx0
+
+        // ---- Map dy0 = fx_scale(y_max - y0, bh*4, y_range) (inverted) ---
+        mov rdi, [rsp + 40];
+        sub rdi, [rsp + 8];
+        mov rsi, r13;
+        shl rsi, 2;
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov r15, rax;                       // r15 = dy0
+
+        // ---- Map dx1 -----------------------------------------------------
+        mov rdi, [rsp + 16];
+        sub rdi, [rsp + 32];
+        mov rsi, r12;
+        shl rsi, 1;
+        mov rdx, [rsp + 48];
+        call fx_scale;
+        mov [rsp + 64], rax;                // dx1
+
+        // ---- Map dy1 (inverted) ------------------------------------------
+        mov rdi, [rsp + 40];
+        sub rdi, [rsp + 24];
+        mov rsi, r13;
+        shl rsi, 2;
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov [rsp + 72], rax;                // dy1
+
+        // ---- Dispatch to cvs_line_dots(spec, dx0, dy0, dx1, dy1) --------
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, r15;
+        mov rcx, [rsp + 64];
+        mov r8,  [rsp + 72];
+        call cvs_line_dots;
+
+      cvs_ln_ret:
+        xor rax, rax;
+        add rsp, 96;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_rect(spec_ptr, x0_fx, y0_fx, x1_fx, y1_fx) -> u64
+  //
+  // Draw the axis-aligned rectangle with corners (x0, y0) and (x1, y1)
+  // as 4 straight braille lines. Maps the 4 Fixed64 coordinate values
+  // (2 unique x's + 2 unique y's) ONCE at prologue via 4 fx_scale calls,
+  // then issues 4 calls to cvs_line_dots -- a savings vs. calling
+  // canvas_line 4 times (which would remap each shared endpoint).
+  //
+  // Corner order (dot coord tuples):
+  //   top    edge: (dx0, dy0) -> (dx1, dy0)
+  //   right  edge: (dx1, dy0) -> (dx1, dy1)
+  //   bottom edge: (dx1, dy1) -> (dx0, dy1)
+  //   left   edge: (dx0, dy1) -> (dx0, dy0)
+  //
+  // A degenerate rect (x0 == x1 or y0 == y1) collapses to two overlapping
+  // lines or a single point; cvs_line_dots handles both cases correctly
+  // (dx_abs = 0 and dy_abs = 0 leaves the loop after one plot).
+  //
+  // Register plan (5 pushes + sub rsp, 96; 4 fx_scale calls + 4
+  // cvs_line_dots calls):
+  //   rbx = spec_ptr        r12 = bw        r13 = bh
+  //   r14, r15 = free       [reserved for cvs_line_dots arg staging]
+  //   Stack (96 B = 12 slots):
+  //     [rsp+0..24)  = x0_fx / y0_fx / x1_fx  (input cache)
+  //     [rsp+24..32) = y1_fx
+  //     [rsp+32..40) = x_min
+  //     [rsp+40..48) = y_max
+  //     [rsp+48..56) = x_range
+  //     [rsp+56..64) = y_range
+  //     [rsp+64..72) = dx0 (mapped)
+  //     [rsp+72..80) = dy0
+  //     [rsp+80..88) = dx1
+  //     [rsp+88..96) = dy1
+  //
+  // Labels prefixed cvs_rc_ per fingerprint discipline.
+  // ==========================================================================
+  pub let canvas_rect : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (x0_fx: u64) (y0_fx: u64) (x1_fx: u64) (y1_fx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_rect draws an axis-aligned rectangle via 4 shared cvs_line_dots calls after pre-mapping 4 Fixed64 coords. 5-push + sub rsp, 96 (%16=0 aligned for nested calls). Cache args to [rsp+0/8/16/24]. Cache spec_ptr in rbx; load rect; extract bw -> r12, bh -> r13; early-return 0 if bw==0 or bh==0. Snapshot x_min -> [rsp+32], y_max -> [rsp+40]. Ranges: x_range at [rsp+48], y_range at [rsp+56]; both guarded jle for degeneracy. Map 4 dot coords in prologue: dx0, dx1 via x-axis fx_scale; dy0, dy1 via y-axis fx_scale (inverted); results at [rsp+64/80/72/88]. Then issue 4 cvs_line_dots calls: (dx0,dy0)->(dx1,dy0) top; (dx1,dy0)->(dx1,dy1) right; (dx1,dy1)->(dx0,dy1) bottom; (dx0,dy1)->(dx0,dy0) left. For each, mov rdi, rbx; mov rsi/rdx = start; mov rcx/r8 = end; call cvs_line_dots. Epilogue: xor rax, rax; add rsp, 96; pop 5; ret. Every immediate (0xFFFF, 0, 1, 2, various offsets 0..96, shift counts 1/2/32/48) fits imm32/imm8. No test, no neg, no imul reg,imm. Cross-module bare `call fx_scale`; intra-module bare `call cvs_line_dots`. Effect `!{mem}`. Labels prefixed cvs_rc_ per fingerprint discipline (cvs_rc_ret for the shared epilogue).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 96;
+
+        // ---- Cache args BEFORE register reuse ----------------------------
+        mov [rsp + 0], rsi;                 // x0_fx
+        mov [rsp + 8], rdx;                 // y0_fx
+        mov [rsp + 16], rcx;                // x1_fx
+        mov [rsp + 24], r8;                 // y1_fx
+
+        // ---- spec_ptr, rect, bw, bh --------------------------------------
+        mov rbx, rdi;
+        mov rax, [rbx + 0];
+        mov r12, rax;
+        shr r12, 32;
+        and r12, 0xFFFF;
+        cmp r12, 0;
+        je  cvs_rc_ret;
+        mov r13, rax;
+        shr r13, 48;
+        cmp r13, 0;
+        je  cvs_rc_ret;
+
+        // ---- Snapshot fields ---------------------------------------------
+        mov rax, [rbx + 8];
+        mov [rsp + 32], rax;                // x_min
+        mov rax, [rbx + 32];
+        mov [rsp + 40], rax;                // y_max
+
+        // ---- Ranges (guard non-positive) ---------------------------------
+        mov rax, [rbx + 16];
+        sub rax, [rbx + 8];
+        cmp rax, 0;
+        jle cvs_rc_ret;
+        mov [rsp + 48], rax;                // x_range
+
+        mov rax, [rbx + 32];
+        sub rax, [rbx + 24];
+        cmp rax, 0;
+        jle cvs_rc_ret;
+        mov [rsp + 56], rax;                // y_range
+
+        // ---- Map dx0 -----------------------------------------------------
+        mov rdi, [rsp + 0];
+        sub rdi, [rsp + 32];
+        mov rsi, r12;
+        shl rsi, 1;
+        mov rdx, [rsp + 48];
+        call fx_scale;
+        mov [rsp + 64], rax;                // dx0
+
+        // ---- Map dy0 (inverted) ------------------------------------------
+        mov rdi, [rsp + 40];
+        sub rdi, [rsp + 8];
+        mov rsi, r13;
+        shl rsi, 2;
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov [rsp + 72], rax;                // dy0
+
+        // ---- Map dx1 -----------------------------------------------------
+        mov rdi, [rsp + 16];
+        sub rdi, [rsp + 32];
+        mov rsi, r12;
+        shl rsi, 1;
+        mov rdx, [rsp + 48];
+        call fx_scale;
+        mov [rsp + 80], rax;                // dx1
+
+        // ---- Map dy1 (inverted) ------------------------------------------
+        mov rdi, [rsp + 40];
+        sub rdi, [rsp + 24];
+        mov rsi, r13;
+        shl rsi, 2;
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov [rsp + 88], rax;                // dy1
+
+        // ---- Edge 1: top (dx0, dy0) -> (dx1, dy0) ------------------------
+        mov rdi, rbx;
+        mov rsi, [rsp + 64];
+        mov rdx, [rsp + 72];
+        mov rcx, [rsp + 80];
+        mov r8,  [rsp + 72];
+        call cvs_line_dots;
+
+        // ---- Edge 2: right (dx1, dy0) -> (dx1, dy1) ----------------------
+        mov rdi, rbx;
+        mov rsi, [rsp + 80];
+        mov rdx, [rsp + 72];
+        mov rcx, [rsp + 80];
+        mov r8,  [rsp + 88];
+        call cvs_line_dots;
+
+        // ---- Edge 3: bottom (dx1, dy1) -> (dx0, dy1) ---------------------
+        mov rdi, rbx;
+        mov rsi, [rsp + 80];
+        mov rdx, [rsp + 88];
+        mov rcx, [rsp + 64];
+        mov r8,  [rsp + 88];
+        call cvs_line_dots;
+
+        // ---- Edge 4: left (dx0, dy1) -> (dx0, dy0) -----------------------
+        mov rdi, rbx;
+        mov rsi, [rsp + 64];
+        mov rdx, [rsp + 88];
+        mov rcx, [rsp + 64];
+        mov r8,  [rsp + 72];
+        call cvs_line_dots;
+
+      cvs_rc_ret:
+        xor rax, rax;
+        add rsp, 96;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_circle(spec_ptr, cx_fx, cy_fx, r_fx) -> u64
+  //
+  // Draw a circle of Fixed64 radius r_fx centered at (cx_fx, cy_fx)
+  // using the classical integer midpoint circle algorithm on the
+  // (bw*2 x bh*4) dot grid.
+  //
+  // The dot-space radius is derived from the x-axis scale:
+  //   dot_r = |r_fx| * (bw * 2) / x_range
+  //
+  // (v1 documented limitation: a caller whose x and y axes have
+  // different scale factors will see the "circle" render as an ellipse
+  // in the visual output. The proper way to draw a symmetric shape is
+  // for the caller to configure y_range so that
+  // (bh * 4) / y_range == (bw * 2) / x_range. A future M4 revision may
+  // add a canvas_circle_yr variant that takes separate x/y radii.)
+  //
+  // Algorithm (signed integer midpoint circle):
+  //   x = dot_r; y = 0
+  //   d = 1 - x
+  //   while x >= y:
+  //     plot 8 symmetric points (cvs_set_dot silently drops out-of-range)
+  //     y += 1
+  //     if d <= 0: d += 2*y + 1
+  //     else:      x -= 1; d += 2*(y - x) + 1
+  //
+  // Register plan (5 pushes + sub rsp, 96; nested calls to fx_scale +
+  // many nested calls to cvs_set_dot):
+  //   rbx = spec_ptr
+  //   r12 = cx_dot   (mapped center x)
+  //   r13 = cy_dot   (mapped center y, inverted)
+  //   r14 = x (running Bresenham)
+  //   r15 = y (running Bresenham)
+  //   Stack (96 B = 12 slots):
+  //     [rsp+0]  = cx_fx (input cache)
+  //     [rsp+8]  = cy_fx
+  //     [rsp+16] = r_fx
+  //     [rsp+24] = bw
+  //     [rsp+32] = bh
+  //     [rsp+40] = x_min
+  //     [rsp+48] = y_max
+  //     [rsp+56] = x_range
+  //     [rsp+64] = y_range
+  //     [rsp+72] = dot_r
+  //     [rsp+80] = d (signed decision variable)
+  //     [rsp+88] = (pad)
+  //
+  // Labels prefixed cvs_ci_ per fingerprint discipline.
+  // ==========================================================================
+  pub let canvas_circle : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (cx_fx: u64) (cy_fx: u64) (r_fx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_circle draws an integer midpoint circle of Fixed64 radius. 5-push + sub rsp, 96 (%16=0). Cache args to [rsp+0/8/16]. Cache spec, extract bw/bh (guard zero -> ret); snapshot to [rsp+24/32]. Snapshot x_min -> [rsp+40], y_max -> [rsp+48]. Ranges guarded jle at [rsp+56/64]. Map cx: fx_scale(cx - x_min, bw*2, x_range) -> r12. Map cy (inverted): fx_scale(y_max - cy, bh*4, y_range) -> r13. Map dot_r: take |r_fx| via sar+xor+sub (r_fx negative would mirror around center trivially, but positive convention is cleaner); fx_scale(|r_fx|, bw*2, x_range) -> [rsp+72]. If dot_r == 0, still plot the center dot then exit (cvs_ci_zero_r branch). Init x = dot_r into r14; y = 0 into r15; d = 1 - x into [rsp+80] (mov rax, 1; sub rax, r14). Main loop cvs_ci_top: cmp r14, r15; jl cvs_ci_ret. Plot 8 symmetric points via cvs_set_dot calls; each call sets rdi=rbx, rsi = r12 + or - r14/r15, rdx = r13 + or - r15/r14 with appropriate signs. Increment y (add r15, 1). Update d: cmp [rsp+80], 0; jg cvs_ci_d_pos; d += 2*y + 1: mov rax, r15; shl rax, 1; add rax, 1; add [rsp+80], rax; jmp cvs_ci_top. cvs_ci_d_pos: x -= 1: sub r14, 1; d += 2*(y - x) + 1: mov rax, r15; sub rax, r14; shl rax, 1; add rax, 1; add [rsp+80], rax; jmp cvs_ci_top. Epilogue cvs_ci_ret: xor rax, rax; add rsp, 96; pop 5; ret. Every immediate (0xFFFF, 0, 1, 2, shift counts 1/2/32/48/63) fits imm32/imm8. No test. No neg (sign work via sar+xor+sub). No imul reg,imm. Cross-module bare `call fx_scale`; intra-module bare `call cvs_set_dot`. Effect `!{mem}`. Labels prefixed cvs_ci_ per fingerprint discipline (cvs_ci_top for the main loop; cvs_ci_d_pos for the else-branch of the d update; cvs_ci_zero_r for the degenerate zero-radius plot; cvs_ci_ret for the shared epilogue).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 96;
+
+        // ---- Cache args --------------------------------------------------
+        mov [rsp + 0], rsi;                 // cx_fx
+        mov [rsp + 8], rdx;                 // cy_fx
+        mov [rsp + 16], rcx;                // r_fx
+
+        // ---- spec_ptr, rect --------------------------------------------
+        mov rbx, rdi;
+        mov rax, [rbx + 0];
+        mov r8, rax;
+        shr r8, 32;
+        and r8, 0xFFFF;                     // bw
+        cmp r8, 0;
+        je  cvs_ci_ret;
+        mov [rsp + 24], r8;
+        mov r9, rax;
+        shr r9, 48;                         // bh
+        cmp r9, 0;
+        je  cvs_ci_ret;
+        mov [rsp + 32], r9;
+
+        // ---- Snapshot x_min, y_max ---------------------------------------
+        mov rax, [rbx + 8];
+        mov [rsp + 40], rax;                // x_min
+        mov rax, [rbx + 32];
+        mov [rsp + 48], rax;                // y_max
+
+        // ---- Ranges (guard non-positive) ---------------------------------
+        mov rax, [rbx + 16];
+        sub rax, [rbx + 8];
+        cmp rax, 0;
+        jle cvs_ci_ret;
+        mov [rsp + 56], rax;                // x_range
+
+        mov rax, [rbx + 32];
+        sub rax, [rbx + 24];
+        cmp rax, 0;
+        jle cvs_ci_ret;
+        mov [rsp + 64], rax;                // y_range
+
+        // ---- Map cx: fx_scale(cx - x_min, bw*2, x_range) -----------------
+        mov rdi, [rsp + 0];
+        sub rdi, [rsp + 40];
+        mov rsi, [rsp + 24];
+        shl rsi, 1;
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov r12, rax;                       // cx_dot
+
+        // ---- Map cy (inverted) -------------------------------------------
+        mov rdi, [rsp + 48];
+        sub rdi, [rsp + 8];
+        mov rsi, [rsp + 32];
+        shl rsi, 2;
+        mov rdx, [rsp + 64];
+        call fx_scale;
+        mov r13, rax;                       // cy_dot
+
+        // ---- Map |dot_r| = fx_scale(|r_fx|, bw*2, x_range) ---------------
+        // Take absolute value of r_fx via sar+xor+sub sign-mask idiom.
+        mov rax, [rsp + 16];
+        mov rcx, rax;
+        sar rcx, 63;                        // rcx = 0 or -1
+        xor rax, rcx;
+        sub rax, rcx;                       // rax = |r_fx|
+        mov rdi, rax;
+        mov rsi, [rsp + 24];
+        shl rsi, 1;                         // bw*2
+        mov rdx, [rsp + 56];
+        call fx_scale;
+        mov [rsp + 72], rax;                // dot_r
+
+        // ---- Degenerate zero-radius: plot center then exit ---------------
+        cmp rax, 0;
+        jne cvs_ci_have_r;
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call cvs_set_dot;
+        jmp cvs_ci_ret;
+
+      cvs_ci_have_r:
+        // ---- Init: x = dot_r, y = 0, d = 1 - x ---------------------------
+        mov r14, [rsp + 72];                // x = dot_r
+        xor r15, r15;                       // y = 0
+        mov rax, 1;
+        sub rax, r14;
+        mov [rsp + 80], rax;                // d = 1 - x
+
+      cvs_ci_top:
+        // ---- Termination: x < y (signed) ---------------------------------
+        cmp r14, r15;
+        jl  cvs_ci_ret;
+
+        // ---- Plot 8 symmetric points -------------------------------------
+        // (cx + x, cy + y)
+        mov rdi, rbx;
+        mov rsi, r12;
+        add rsi, r14;
+        mov rdx, r13;
+        add rdx, r15;
+        call cvs_set_dot;
+
+        // (cx - x, cy + y)
+        mov rdi, rbx;
+        mov rsi, r12;
+        sub rsi, r14;
+        mov rdx, r13;
+        add rdx, r15;
+        call cvs_set_dot;
+
+        // (cx + x, cy - y)
+        mov rdi, rbx;
+        mov rsi, r12;
+        add rsi, r14;
+        mov rdx, r13;
+        sub rdx, r15;
+        call cvs_set_dot;
+
+        // (cx - x, cy - y)
+        mov rdi, rbx;
+        mov rsi, r12;
+        sub rsi, r14;
+        mov rdx, r13;
+        sub rdx, r15;
+        call cvs_set_dot;
+
+        // (cx + y, cy + x)
+        mov rdi, rbx;
+        mov rsi, r12;
+        add rsi, r15;
+        mov rdx, r13;
+        add rdx, r14;
+        call cvs_set_dot;
+
+        // (cx - y, cy + x)
+        mov rdi, rbx;
+        mov rsi, r12;
+        sub rsi, r15;
+        mov rdx, r13;
+        add rdx, r14;
+        call cvs_set_dot;
+
+        // (cx + y, cy - x)
+        mov rdi, rbx;
+        mov rsi, r12;
+        add rsi, r15;
+        mov rdx, r13;
+        sub rdx, r14;
+        call cvs_set_dot;
+
+        // (cx - y, cy - x)
+        mov rdi, rbx;
+        mov rsi, r12;
+        sub rsi, r15;
+        mov rdx, r13;
+        sub rdx, r14;
+        call cvs_set_dot;
+
+        // ---- Increment y then update d -----------------------------------
+        add r15, 1;
+
+        // d <= 0 (signed) ? then d += 2*y + 1 : else x -= 1; d += 2*(y-x)+1
+        // Stage d through a register (paideia-as codebase avoids `cmp qword
+        // [mem], imm` -- load into scratch first, matching sparkline /
+        // barchart discipline).
+        mov rax, [rsp + 80];
+        cmp rax, 0;
+        jg  cvs_ci_d_pos;
+
+        // d += 2*y + 1 (paideia-as encodes only reg-dst add; stage via rcx)
+        mov rax, r15;
+        shl rax, 1;
+        add rax, 1;
+        mov rcx, [rsp + 80];
+        add rcx, rax;
+        mov [rsp + 80], rcx;
+        jmp cvs_ci_top;
+
+      cvs_ci_d_pos:
+        sub r14, 1;                         // x -= 1
+        mov rax, r15;
+        sub rax, r14;
+        shl rax, 1;
+        add rax, 1;
+        mov rcx, [rsp + 80];
+        add rcx, rax;
+        mov [rsp + 80], rcx;                // d += 2*(y - x) + 1
+        jmp cvs_ci_top;
+
+      cvs_ci_ret:
+        xor rax, rax;
+        add rsp, 96;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry: iterate every cell in Rect, load the
+  // matching bitmap byte, and stamp the (U+2800 + byte) braille glyph
+  // into the back-region cell. `rows` is unread (back region starts at
+  // buf_ptr+0), kept for signature uniformity with the widget_draw
+  // dispatch shape (src/widget_kind.pdx L216).
+  //
+  // Per-cell math (see BRAILLE UTF-8 ENCODING block for derivation):
+  //   b        = bitmap[cell_row * bw + cell_col]        (byte load)
+  //   glyph_u32 = 0x0080A0E2 + ((b & 0x3F) << 16)
+  //                          + ((b >> 6) << 8)
+  //   word0    = glyph_u32 | style_high    (precomputed once)
+  //   word1    = style_word1               (precomputed once)
+  //   store [buf + (y*cols + x)*16 + 0] = word0
+  //   store [buf + (y*cols + x)*16 + 8] = word1
+  //
+  // style_high = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56)
+  // style_word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16)
+  //
+  // Register plan (5 pushes + sub rsp, 64; body makes NO nested calls):
+  //   rbx = buf_ptr           r12 = cols            r13 = spec_ptr
+  //   r14 = bitmap_ptr        r15 = bw
+  //   Stack (64 B = 8 slots):
+  //     [rsp+0]  = style_high     (word0 mixin)
+  //     [rsp+8]  = style_word1    (fully-formed word1 for the cell)
+  //     [rsp+16] = bx
+  //     [rsp+24] = by
+  //     [rsp+32] = bh             (used only for the outer y bound)
+  //     [rsp+40] = (spare)
+  //     [rsp+48] = (spare)
+  //     [rsp+56] = (spare / pad)
+  //
+  // Bounds discipline: NO clipping against (rows, cols); the caller's
+  // Rect is expected to have been pre-clamped against the canvas's
+  // stamped dimensions (same posture block_draw / gauge_draw /
+  // sparkline_draw / barchart_draw take).
+  //
+  // Labels prefixed cvs_dr_ per fingerprint discipline.
+  // ==========================================================================
+  pub let canvas_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_draw is the widget_draw-shape entry for WK_CANVAS. 5-push + sub rsp, 64 (%16=0). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / gauge_draw / sparkline_draw / barchart_draw. Cache buf_ptr in rbx, cols in r12, spec_ptr in r13. Load rect from [r13+0]; extract bw -> r15 (guard 0 -> ret), bh -> r10 (guard 0 -> ret). Snapshot bx, by, bh to stack. Load bitmap_ptr -> r14. Precompute style_high and style_word1 from [r13+48] via mask/shift/or chains (same shape barchart uses in bg cell prep): style_high = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56) -> [rsp+0]; style_word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16) -> [rsp+8]. Outer y loop (rdx = cell_row from 0 to bh-1) and inner x loop (rcx = cell_col from 0 to bw-1); each iteration: byte_offset = cell_row * bw + cell_col computed via mov rax, rdx; imul rax, r15 (2-op reg,reg); add rax, rcx; then load byte: xor rax, rax; mov_b rax, [r14 + byte_offset + 0] (pattern: reuse rax for both address computation and byte load via a two-phase compute -- first compute offset in r8 via mov r8, rdx; imul r8, r15; add r8, rcx; then load: xor rax, rax; mov_b rax, [r14 + r8 + 0]). Compose glyph: mov r9, rax; and r9, 0x3F; shl r9, 16 (byte2 slot); mov r11, rax; shr r11, 6; shl r11, 8 (byte1 slot; safe -- rax was zero-extended so r11 is at most 3 here); mov rax, 0x0080A0E2 (base, fits imm32); add rax, r9; add rax, r11 (rax = glyph_u32). OR style_high: or rax, [rsp+0]. Compute cell address: dst = buf_ptr + ((by + cell_row) * cols + (bx + cell_col)) * 16. mov rdi, [rsp+24]; add rdi, rdx (y = by + cell_row); imul rdi, r12 (2-op reg,reg); mov r8, [rsp+16]; add r8, rcx (x = bx + cell_col); add rdi, r8; shl rdi, 4; add rdi, rbx (dst). Store: mov [rdi + 0], rax (word0 with glyph + style_high); mov rax, [rsp + 8]; mov [rdi + 8], rax (word1 = style_word1). Continue inner loop. Epilogue: xor rax, rax; add rsp, 64; pop 5; ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0x3F, 0, 1, 2, 3, 4, 6, 8, 16, 24, 32, 48, 56, 0x0080A0E2, shift counts) fits imm32/imm8. No test. No imul reg,imm. No neg. Effect `!{mem}`. Labels prefixed cvs_dr_ per fingerprint discipline (cvs_dr_yloop / cvs_dr_xloop / cvs_dr_ynext / cvs_dr_ret).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 64;
+
+        // ---- Cache invariants --------------------------------------------
+        mov rbx, rsi;                       // buf_ptr
+        mov r12, rcx;                       // cols
+        mov r13, rdi;                       // spec_ptr
+
+        // ---- Load rect, extract fields -----------------------------------
+        mov rax, [r13 + 0];
+        mov r15, rax;
+        shr r15, 32;
+        and r15, 0xFFFF;                    // r15 = bw
+        cmp r15, 0;
+        je  cvs_dr_ret;
+        mov r10, rax;
+        shr r10, 48;                        // r10 = bh
+        cmp r10, 0;
+        je  cvs_dr_ret;
+
+        // bx, by, bh -> stack
+        mov r8, rax;
+        and r8, 0xFFFF;
+        mov [rsp + 16], r8;                 // bx
+
+        mov r8, rax;
+        shr r8, 16;
+        and r8, 0xFFFF;
+        mov [rsp + 24], r8;                 // by
+
+        mov [rsp + 32], r10;                // bh
+
+        // ---- Cache bitmap_ptr --------------------------------------------
+        mov r14, [r13 + 40];
+
+        // ---- Precompute style_high ---------------------------------------
+        // style_high = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56)
+        mov r11, [r13 + 48];                // style
+        mov rcx, r11;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r11;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rax, rcx;
+        mov [rsp + 0], rax;                 // style_high
+
+        // ---- Precompute style_word1 --------------------------------------
+        // style_word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16)
+        mov rax, r11;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rcx, r11;
+        shr rcx, 48;
+        and rcx, 0xFF;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 8], rax;                 // style_word1
+
+        // ---- Outer y loop (rdx = cell_row from 0 to bh-1) ----------------
+        xor rdx, rdx;
+
+      cvs_dr_yloop:
+        // paideia-as encoder does not implement `cmp reg, [mem]`; stage bh.
+        mov rax, [rsp + 32];
+        cmp rdx, rax;                       // cell_row < bh?
+        jae cvs_dr_ret;
+
+        // ---- Inner x loop (rcx = cell_col from 0 to bw-1) ---------------
+        xor rcx, rcx;
+
+      cvs_dr_xloop:
+        cmp rcx, r15;                       // cell_col < bw?
+        jae cvs_dr_ynext;
+
+        // ---- byte_offset = cell_row * bw + cell_col ---------------------
+        mov r8, rdx;
+        imul r8, r15;                       // 2-op reg,reg
+        add r8, rcx;
+
+        // ---- Load byte ---------------------------------------------------
+        xor rax, rax;
+        mov_b rax, [r14 + r8 + 0];          // rax = b (0..255)
+
+        // ---- Compose glyph_u32 = 0x0080A0E2 + ((b>>6)<<8) + ((b&0x3F)<<16)
+        mov r9, rax;
+        and r9, 0x3F;
+        shl r9, 16;                         // (b & 0x3F) << 16
+
+        mov r11, rax;
+        shr r11, 6;
+        shl r11, 8;                         // (b >> 6) << 8 (r11 in [0..3]<<8)
+
+        mov rax, 0x0080A0E2;                // base glyph (imm32-fit)
+        add rax, r9;
+        add rax, r11;                       // rax = glyph_u32
+
+        // ---- word0 = glyph_u32 | style_high ------------------------------
+        or  rax, [rsp + 0];
+
+        // ---- Compute dst = buf + ((by + cell_row) * cols + (bx + cell_col)) * 16
+        mov rdi, [rsp + 24];                // by
+        add rdi, rdx;                       // y = by + cell_row
+        imul rdi, r12;                      // y * cols (2-op reg,reg)
+        mov r8, [rsp + 16];                 // bx
+        add r8, rcx;                        // x = bx + cell_col
+        add rdi, r8;
+        shl rdi, 4;
+        add rdi, rbx;                       // dst
+
+        // ---- Store cell --------------------------------------------------
+        mov [rdi + 0], rax;                 // word0
+        mov rax, [rsp + 8];                 // style_word1
+        mov [rdi + 8], rax;
+
+        add rcx, 1;
+        jmp cvs_dr_xloop;
+
+      cvs_dr_ynext:
+        add rdx, 1;
+        jmp cvs_dr_yloop;
+
+      cvs_dr_ret:
+        xor rax, rax;
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // canvas_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a CanvasView@0.1 semantic-pipe record into [dst..dst+40).
+  // record_len is fixed at 40 bytes (already 8-aligned; no padding
+  // loop needed). The actual `semantic_pipe::send_record` call is
+  // deferred to a later postui.M2-009 revision that adds
+  // SEMANTIC_SCHEMA_CVVW to src/semantic_registry.pdx.
+  //
+  // Register plan (pure leaf; no push/pop, no callee-save writes, no
+  // nested calls):
+  //   rdi = spec_ptr (read-only)
+  //   rsi = dst      (write-only until return)
+  //   rax = scratch/return
+  //
+  // Effect `!{mem}` (reads through rdi, writes through rsi).
+  // Labels prefixed cvs_bv_ per fingerprint discipline (none needed at
+  // v1 -- record is fixed-length, no branches).
+  // ==========================================================================
+  pub let canvas_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-006 (postui#25): canvas_view_pack lays a fixed-40-byte CanvasView@0.1 record at [rsi..rsi+40). Header phase writes seven scalar fields in one straight-line sequence: `mov rax, 0x57565643` then `mov_d [rsi+0], rax` stamps the 'CVVW' magic (0x57565643 = 1_465_274_435 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches every other M3 view packer's magic idiom). record_len is a hard 40 (no variable-length payload), stored via `mov rax, 40; mov_d [rsi+4], rax`. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store. x_min (u64) at [rdi+8] -> [rsi+16]; y_min (u64) at [rdi+24] -> [rsi+24]; style (u64) at [rdi+48] -> [rsi+32]. return rax = 40. Every immediate (0x57565643, 40, 0, 4, 8, 16, 24, 32, 48) fits imm32. No test. No imul. No and. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 4 qword-loads / 4 qword-stores / 1 dword-magic-store / 1 dword-record_len-store. x_max and y_max deliberately excluded from the semantic-pipe record (documented in CANVASVIEW WIRE block above); bitmap_ptr deliberately excluded (process-local pointer, no cross-pipe meaning, same posture Sparkline takes for values_ptr).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57565643;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- x_min (u64) at [rsi + 16] -------------------------------------
+        mov rax, [rdi + 8];
+        mov [rsi + 16], rax;
+
+        // ---- y_min (u64) at [rsi + 24] -------------------------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 24], rax;
+
+        // ---- style (u64) at [rsi + 32] -------------------------------------
+        mov rax, [rdi + 48];
+        mov [rsi + 32], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
