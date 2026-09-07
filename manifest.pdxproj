@@ -41,6 +41,11 @@ sources:
   - src/layout.pdx                # M2-001: Layout engine (integer constraint distribution)
   - src/width.pdx                 # M2-003: Width module (UTF-8 byte scan + EAW table)
   - src/text.pdx                  # M2-002: Text/Span/Line primitives (styled runs, wrap)
+  - src/widgets/paragraph.pdx     # M2-004: Paragraph widget + ParagraphView@0.1
+  - src/widgets/list.pdx          # M2-005: List + ListState + ListView@0.1
+  - src/widgets/table.pdx         # M2-006: Table + TableState + TableView@0.1
+  - src/widgets/tabs.pdx          # M2-007: Tabs + TabsView@0.1
+  - src/widgets/scrollbar.pdx     # M2-008: Scrollbar + ScrollbarView@0.1
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at

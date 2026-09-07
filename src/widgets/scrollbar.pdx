@@ -1,0 +1,720 @@
+// src/widgets/scrollbar.pdx -- postui.M2-008 (paideia-os/postui#17)
+//
+// Scrollbar widget: vertical or horizontal track + thumb overlay.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M2-008)
+// =============================================================================
+//
+// Scrollbar is the 12th ordinal (WK_SCROLLBAR = 12) in the closed
+// widget catalog and the third M2 widget-body landing after Layout
+// (M2-001), Text/Span/Line (M2-002), and Width (M2-003). It is the
+// first M2 widget that *renders* directly to a Buffer -- the earlier
+// M2 landings ship pure primitives that feed downstream widgets
+// (Paragraph, List, Table) rather than stamping cells themselves.
+//
+// This file ships:
+//   - The ScrollbarSpec state record (56-byte struct laid out in
+//     memory; see WIRE block below).
+//   - The two u32 track glyphs (│ vertical, ─ horizontal) and one u32
+//     thumb glyph (█), each a 3-byte UTF-8 sequence pre-packed into a
+//     dword slot so a single mov_d stamps the symbol.
+//   - scrollbar_draw: the widget_draw-shape entry that fills the Rect
+//     with track cells then overlays the thumb.
+//   - scrollbar_view_pack: pack a ScrollbarView@0.1 semantic-pipe
+//     record into caller-provided memory (M2-009 wires the actual
+//     semantic_pipe::send_record call).
+//
+// =============================================================================
+// SIGNATURE DEVIATION FROM ISSUE TEXT
+// =============================================================================
+//
+// The postui#17 issue text names scrollbar_draw as (spec_ptr,
+// buffer_ptr) -> u64. The dispatch shape every widget_draw variant
+// must satisfy (WidgetKind::widget_draw, src/widget_kind.pdx L216) is
+// (spec_ptr, buffer_ptr, rows, cols) -> u64 -- cols is required for
+// the (y*cols + x)*16 cell address formula every Buffer write uses
+// (docs/design.md §2.1). A 2-arg body would have no way to compute a
+// cell address inside its own Rect without cols. This landing takes
+// the 4-arg widget_draw signature verbatim (matches block_draw's
+// shape, src/block.pdx L516) so plugging Scrollbar into the M2+ jump
+// table at future WidgetKind revisions requires no per-widget shim.
+// The `rows` argument is unread by this body (back region starts at
+// buffer_ptr+0), kept for signature uniformity.
+//
+// =============================================================================
+// SCROLLBARSPEC WIRE (56 bytes, SCROLLBAR_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect             u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  orientation      u64  (0 = Vertical, 1 = Horizontal)
+//   [+16..+24) position         u64  scroll offset in item units
+//   [+24..+32) content_length   u64  total items (0 draws just the track)
+//   [+32..+40) viewport_length  u64  visible items (0 draws just the track)
+//   [+40..+48) style_track      u64  Style-packed (fg | bg<<24 | mods<<48)
+//   [+48..+56) style_thumb      u64  Style-packed for the thumb glyph
+//
+// 56 bytes rather than the issue-text's aspirational "~48B" because
+// every runtime metadata field is a u64 (position, content_length,
+// viewport_length can span 64-bit ranges for very long lists) and
+// rect + 6 u64 fields = 8 + 48 = 56. Packing position/etc. into
+// narrower u32 slots to hit 48 exactly would create a caller-visible
+// silent-truncation edge at ~4G items with no offsetting benefit --
+// the extra 8 bytes cost less than one extra icache miss on a modern
+// core. 56 is not cache-line-aligned but no widget-side hot path
+// crosses that line: scrollbar_draw reads every field ONCE at prologue
+// and precomputes cell words into stack scratch, then the fill/overlay
+// loops touch only the stack scratch and the packed rect.
+//
+// =============================================================================
+// GLYPH WORDS (3-byte UTF-8 packed into u32 dword slot)
+// =============================================================================
+//
+// A Cell's symbol field lives at cell bytes [+0..+4) (Cell wire, §2.1).
+// Each of our three glyphs is a 3-byte UTF-8 sequence; storing it as a
+// u32 with byte 3 = 0 means a single `mov_d [cell + 0], glyph_word`
+// stamps the symbol slot with the trailing zero cleared as a side
+// effect, guaranteeing a prior multi-byte glyph left behind by an
+// earlier writer does not bleed into byte 3 of the symbol slot.
+//
+// Little-endian u32 encoding of the byte sequence [b0, b1, b2, 0]:
+//   glyph_u32 = b0 | (b1 << 8) | (b2 << 16) | (0 << 24)
+//
+//   Vertical track   │  (U+2502)  bytes 0xE2 0x94 0x82  ->  0x008294E2
+//   Horizontal track ─  (U+2500)  bytes 0xE2 0x94 0x80  ->  0x008094E2
+//   Thumb            █  (U+2588)  bytes 0xE2 0x96 0x88  ->  0x008896E2
+//
+// All three values fit imm32 (< 0x80000000) so paideia-as emits the
+// compact 5-byte mov r32, imm32 form when loaded via `mov reg, imm`.
+//
+// =============================================================================
+// THUMB GEOMETRY
+// =============================================================================
+//
+// Given a track of length T = h (vertical) or w (horizontal), a content
+// span of length C (items), a viewport of V (visible items), and a
+// current scroll position P (items), the thumb's length L and start
+// offset S in track cells are:
+//
+//   L = max(1, V * T / C)          -- floor of the visible-fraction of T
+//                                     with a lower bound of one cell so
+//                                     the thumb never disappears entirely
+//                                     for a very-small-viewport case
+//                                     (the same posture Ratatui's own
+//                                     Scrollbar takes).
+//
+//   L' = min(L, T)                 -- clamp so the thumb never exceeds
+//                                     the track (occurs when V >= C, i.e.
+//                                     the entire content fits the viewport
+//                                     and the whole track is highlighted).
+//
+//   if C <= V:  S = 0              -- everything is visible; thumb at 0.
+//   else:       S = P * (T - L') / (C - V)
+//               S' = min(S, T - L')  -- clamp so thumb never extends past
+//                                       the track's tail.
+//
+// Div-by-zero guards:
+//   - C == 0                      -> track-only fill (no thumb).
+//   - V == 0                      -> track-only fill (no thumb).
+//   - T == 0                      -> track-only fill (no thumb; unreachable
+//                                    after the bw==0/bh==0 early return).
+//   - C == V (in the S formula)   -> the else branch is not taken (C <= V
+//                                    routes to S=0 above), so (C - V) is
+//                                    strictly positive when we reach the
+//                                    division.
+//
+// Every product is a u64 * u64 -> u64 (2-op imul reg, reg, paideia-as-
+// safe). Every division is `xor rdx, rdx; div reg` to keep the dividend
+// in rax with a clean high half.
+//
+// =============================================================================
+// SCROLLBARVIEW@0.1 WIRE (semantic-pipe record, 32 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic            u32 = 0x57564253 ("SBVW" LE)
+//   [+4..+8)   record_len       u32 = 32 (fixed, already 8-aligned)
+//   [+8..+12)  orientation      u32 (u64 spec field truncated for slot)
+//   [+12..+20) rect_pack        u64 verbatim from ScrollbarSpec+0
+//   [+20..+24) position         u32 (u64 spec field truncated to u32)
+//   [+24..+28) content_length   u32 (u64 spec field truncated to u32)
+//   [+28..+32) viewport_length  u32 (u64 spec field truncated to u32)
+//
+// style_track / style_thumb are deliberately excluded from the
+// semantic-pipe record -- they are visual attributes with no
+// semantically-meaningful value for a downstream reader (a semantic-
+// pipe consumer looking at the scrollbar's *state*, not its skin).
+// This matches BlockView@0.1's exclusion of fill_cell (block.pdx L84).
+//
+// record_len is fixed at 32 bytes and already 8-aligned, so no padding
+// loop is needed -- the header stores are exact. The u32 truncation
+// for position / content_length / viewport_length is a documented
+// caller responsibility: a scrollbar over > 4G items already lives
+// outside the design-scope taxonomy (docs/design.md §1.5 dimension
+// envelope), and any downstream reader that needs 64-bit granularity
+// should extend the wire to ScrollbarView@0.2 rather than steal bits.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Scrollbar`), matches file
+//     basename (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64). No byte
+//     loads are needed in this module -- every spec field is 8-byte
+//     aligned and read as a qword.
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 0,
+//     1, 2, shift counts <= 56. The error sentinel 0xFFFFEBCF and the
+//     glyph-word imm values are loaded via `mov reg, imm` -- the
+//     sentinel (> 0x7FFFFFFF) emits movabs (10-byte imm64 form; legal
+//     for mov, NOT legal for cmp/and), the glyph-word imms (<
+//     0x80000000) emit `mov r32, imm32` (5-byte form). No `cmp reg,
+//     imm64` and no `and reg, imm64` anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is
+//     2-op `imul reg, reg`. Division uses standard `xor rdx, rdx; div
+//     reg` -- matches layout_split's discipline (src/layout.pdx L702).
+//   - Labels prefixed `sc_` per docs/design.md fingerprint discipline
+//     (sc_gy_ for glyph select, sc_tw_ for track-word compute, sc_uw_
+//     for thumb-word compute, sc_fill_ for the fill loops, sc_tl_ for
+//     thumb-length compute, sc_ts_ for thumb-start compute, sc_ov_
+//     for the overlay loops, sc_ret_ for the shared epilogue,
+//     sc_bv_ for scrollbar_view_pack).
+//   - scrollbar_draw pushes 5 SysV callee-save regs (rbx, r12, r13,
+//     r14, r15) = 40 bytes plus `sub rsp, 32` for cell-word scratch;
+//     entry rsp%16==8, +40==48 (aligned), +32==80 (aligned). Body
+//     makes NO nested calls (all cell writes, address math, and
+//     divisions are inline). Alignment is a discipline anchor mirror-
+//     ing block_draw / layout_split, hardening against a future
+//     revision that might add one.
+//   - scrollbar_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save
+//     registers, matching block_view_pack's shape.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments). No cap / sysreg effect.
+
+module Scrollbar = structure {
+
+  // ==========================================================================
+  // Orientation ordinals (used by callers to build a ScrollbarSpec;
+  // the internal draw code reads spec+8 directly as a u64 and branches
+  // on 0/non-zero rather than switch-chaining these ordinals).
+  // ==========================================================================
+  pub let SCROLLBAR_ORIENT_VERTICAL   : u64 = 0
+  pub let SCROLLBAR_ORIENT_HORIZONTAL : u64 = 1
+
+  // ==========================================================================
+  // ScrollbarSpec layout (56 bytes)
+  // ==========================================================================
+  pub let SCROLLBAR_SPEC_BYTES         : u64 = 56
+
+  pub let SCROLLBAR_OFF_RECT           : u64 = 0
+  pub let SCROLLBAR_OFF_ORIENTATION    : u64 = 8
+  pub let SCROLLBAR_OFF_POSITION       : u64 = 16
+  pub let SCROLLBAR_OFF_CONTENT_LEN    : u64 = 24
+  pub let SCROLLBAR_OFF_VIEWPORT_LEN   : u64 = 32
+  pub let SCROLLBAR_OFF_STYLE_TRACK    : u64 = 40
+  pub let SCROLLBAR_OFF_STYLE_THUMB    : u64 = 48
+
+  // ==========================================================================
+  // Glyph u32 words (3 UTF-8 bytes + 1 zero pad, little-endian).
+  // Loaded via `mov reg, imm` at draw time; each value is < 0x80000000
+  // so paideia-as emits the compact 5-byte mov r32, imm32 form.
+  // ==========================================================================
+  pub let SCROLLBAR_GLYPH_TRACK_V : u64 = 0x008294E2
+  pub let SCROLLBAR_GLYPH_TRACK_H : u64 = 0x008094E2
+  pub let SCROLLBAR_GLYPH_THUMB   : u64 = 0x008896E2
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x4F offset = 0xFFFFEBCF, the last free slot in the M2 band
+  // (Layout owns 0xFFFFEBC0..C4; Width reserves 0xFFFFEBC5..C9; Text
+  // owns 0xFFFFEBCA..CE; Scrollbar takes 0xFFFFEBCF). Every sentinel
+  // > 0x7FFFFFFF -- movabs required for `mov reg, imm`; NEVER usable
+  // in cmp/and.
+  //
+  // At v1 no scrollbar_draw path returns this -- the body accepts any
+  // spec (a rect of 0x0 returns 0 with no cells written; a divisor of
+  // 0 short-circuits to a track-only fill). The sentinel is reserved
+  // for a future revision that may want to trap e.g. a rect that
+  // overflows the canvas (widened to a u32 return today keeps the
+  // signature stable if that trap ever lands).
+  // ==========================================================================
+  pub let SCROLLBAR_ERR_BAND : u64 = 0xFFFFEBCF
+
+  // ==========================================================================
+  // scrollbar_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (see SIGNATURE DEVIATION FROM ISSUE TEXT).
+  // `rows` is unread (back region starts at buf_ptr+0). Returns 0 (OK)
+  // in every non-trivially-empty case; returns 0 for a zero-sized
+  // rect (bw==0 || bh==0) with no cells written.
+  //
+  // Draw sequence:
+  //   1. Extract bx/by/bw/bh from packed rect; early-return 0 if
+  //      bw == 0 or bh == 0.
+  //   2. Determine track_length: bh if orientation==0 (vertical),
+  //      bw otherwise (horizontal).
+  //   3. Precompute the two cell words (word0 = symbol|fg|bg.r,
+  //      word1 = bg.g|bg.b|mods) for both the track and the thumb
+  //      into stack scratch. Both words for both cells = 4 u64 slots
+  //      = 32 bytes.
+  //   4. Fill entire rect with track cell (two 8-byte stores per cell).
+  //   5. Compute thumb_len and thumb_start with div-by-zero guards;
+  //      if content_length==0 OR viewport_length==0, skip overlay.
+  //   6. Overlay thumb cells:
+  //      Vertical:   for y in [by + S, by + S + L), for x in [bx, bx+bw)
+  //      Horizontal: for x in [bx + S, bx + S + L), for y in [by, by+bh)
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the
+  // canvas's stamped rows/cols; adding a gate here would double-charge
+  // every cell write for no marginal safety (same posture Buffer::
+  // buffer_at and block_draw take -- see block.pdx L482).
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 32; entry rsp%16==8,
+  // +40==48, +32==80, aligned):
+  //   rbx = buf_ptr        r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect    r15 = track_length
+  //   Stack scratch:
+  //     [rsp+0..8)   track_word0
+  //     [rsp+8..16)  track_word1
+  //     [rsp+16..24) thumb_word0
+  //     [rsp+24..32) thumb_word1
+  //
+  // Caller-save allocation shifts per phase:
+  //   Phase 0 (precompute): rax = accumulator, rcx = scratch for
+  //     shift/mask chains, rdx = orientation transit, r8/r9 = bw/bh
+  //     transit, r10 = style transit, r11 = glyph-select scratch.
+  //   Phase 1 (fill): r8 = bx, r9 = by, r10 = bw, r11 = bh, rsi = xe,
+  //     rdi = ye, rdx = y counter, rcx = x counter, rax = dst,
+  //     r10/r11 clobbered by cell-word transit inside the inner loop
+  //     (reload not needed -- neither bw nor bh is read again after
+  //     xe/ye are computed).
+  //   Phase 2 (thumb geometry): rax = quotient / thumb_len then
+  //     thumb_start, rcx = available, rdx = clobbered by div,
+  //     r8 = denom, r9 = position, r10 = viewport_length, r11 =
+  //     content_length, rsi = thumb_len (saved before thumb_start
+  //     compute), rdi = thumb_start (result).
+  //   Phase 3 (overlay): r8 = axis-start (V: by+S, H: bx+S),
+  //     r9 = axis-end (r8 + L), r10 = inner base (V: bx, H: by),
+  //     r11 = inner-end (V: bx+bw, H: by+bh), rdx = outer counter,
+  //     rcx = inner counter, rax = dst.
+  //
+  // Labels prefixed sc_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let scrollbar_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-008 (postui#17): scrollbar_draw is the widget_draw-shape entry for WK_SCROLLBAR (12). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 32 (cell-word scratch, keeps rsp%16==0). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / layout_split. Phase 0 (precompute): cache buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (loaded once from [r13+0]). Extract bw and bh; early-return 0 if either is 0. Load orientation from [r13+8]; if 0 (vertical) track_length = bh, else track_length = bw; stash in r15. Select track glyph u32 into rax (0x008294E2 for V, 0x008094E2 for H -- both < 0x80000000 so paideia-as emits `mov r32, imm32`). Load style_track from [r13+40] into r10; compute track_word0 = glyph | ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56) via mask/shift/or chains (immediates 0xFFFFFF, 0xFF and shift counts 24/32/56 all fit imm32/imm8); store to [rsp+0]. Compute track_word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16); store to [rsp+8]. Repeat for thumb: glyph 0x008896E2, style_thumb from [r13+48], store thumb_word0 to [rsp+16] and thumb_word1 to [rsp+24]. Phase 1 (fill entire rect with track cell): re-extract bx (r8) / by (r9) / bw (r10) / bh (r11) from r14; xe (rsi) = bx + bw, ye (rdi) = by + bh; outer y loop rdx from by to ye-1, inner x loop rcx from bx to xe-1; each iteration computes dst = buf_ptr + (y*cols + x)*16 into rax via `mov rax, rdx; imul rax, r12 (2-op reg,reg); add rax, rcx; shl rax, 4; add rax, rbx`; two 8-byte load/store pairs copy track_word0/1 from [rsp+0]/[rsp+8] into [rax+0]/[rax+8] (transit through r10 and r11, which are safe to clobber after xe/ye are computed). Phase 2 (thumb geometry with div-by-zero guards): load content_length into r11 and viewport_length into r10; if either is 0 skip overlay (jmp sc_ret_zero). Load position into r9. thumb_len = viewport_length * track_length / content_length via `mov rax, r10; imul rax, r15 (2-op reg,reg); xor rdx, rdx; div r11` -- 2-op imul truncates to 64-bit low half; xor rdx clears high half of dividend; div r11 gives quotient in rax. Clamp: if rax == 0 -> rax = 1 (thumb never disappears); if rax > r15 -> rax = r15 (thumb never exceeds track); stash into rsi. Now compute thumb_start: if r11 <= r10 (content fits viewport) -> rdi = 0. Else: available (rcx) = r15 - rsi; denom (r8) = r11 - r10; `mov rax, r9 (position); imul rax, rcx (2-op reg,reg); xor rdx, rdx; div r8`; clamp rax <= rcx; store into rdi. Phase 3 (overlay thumb cells): reload orientation from [r13+8] into r11 (spec_ptr r13 is still live). If orientation == 0 (vertical) -> extract bx (r10) and bw (rax then r11 clobber safe) then by (r8+rdi) as axis-start into r8; axis-end (r9) = r8 + rsi (thumb_len); inner range (r10=bx, r11=bx+bw); outer loop rdx from r8 to r9-1, inner loop rcx from r10 to r11-1. Else (horizontal) -> axis-start r8 = bx + rdi, axis-end r9 = r8 + rsi, inner (r10=by, r11=by+bh); outer loop rdx from r10 to r11-1 (over y), inner loop rcx from r8 to r9-1 (over x). Since horizontal and vertical differ only in axis assignment, the inner-loop shape (`dst compute + thumb_word stamp`) is shared; we build the two (outer_range, inner_range) tuples in registers and branch to a single overlay body. Actually to keep this simple I emit two full loops (one V, one H), each shape sc_ov_v_/sc_ov_h_. Each overlay cell write is the same shape as the fill: `mov rax, y; imul rax, r12; add rax, x; shl rax, 4; add rax, rbx`; two 8-byte load/store pairs from [rsp+16]/[rsp+24]. Epilogue sc_ret_zero: xor rax, rax; add rsp, 32; pop r15/r14/r13/r12/rbx (reverse); ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0, 1, 2, shift counts 4/16/24/32/48/56) fits imm32/imm8; glyph words and style masks fit imm32. 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. Effect `!{mem}` (fill + overlay cell writes + spec/stack reads). Labels prefixed sc_ per docs fingerprint discipline: sc_gy_ for orientation glyph select, sc_fill_y/x for phase 1 loops, sc_tl_ for thumb-length compute/clamp, sc_ts_ for thumb-start compute/clamp, sc_ov_v_/sc_ov_h_ for phase 3 overlay per orientation, sc_ret_zero for the shared success epilogue.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 32;
+
+        // ---- Prologue: cache invariants ----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+        mov r14, [r13 + 0];               // r14 = packed rect
+
+        // ---- Early-return on zero-sized rect -----------------------------
+        // bw = (r14 >> 32) & 0xFFFF
+        mov r8, r14;
+        shr r8, 32;
+        and r8, 0xFFFF;
+        cmp r8, 0;
+        je  sc_ret_zero;
+        // bh = r14 >> 48 (top 16 bits, no mask needed)
+        mov r9, r14;
+        shr r9, 48;
+        cmp r9, 0;
+        je  sc_ret_zero;
+
+        // ---- Determine track_length (r15) --------------------------------
+        // orientation from [r13+8]; if 0 (V) -> track = bh, else -> track = bw
+        mov rdx, [r13 + 8];
+        cmp rdx, 0;
+        jne sc_gy_horiz;
+        mov r15, r9;                      // vertical: track_length = bh
+        mov rax, 0x008294E2;              // vertical track glyph │
+        jmp sc_gy_track_done;
+      sc_gy_horiz:
+        mov r15, r8;                      // horizontal: track_length = bw
+        mov rax, 0x008094E2;              // horizontal track glyph ─
+      sc_gy_track_done:
+        // rax now holds track_glyph_u32; r15 = track_length
+
+        // ---- Precompute track_word0 --------------------------------------
+        // track_word0 = glyph | ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56)
+        mov r10, [r13 + 40];              // r10 = style_track
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;                // fg (low 24 bits of style)
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r10;
+        shr rcx, 24;
+        and rcx, 0xFF;                    // bg.r
+        shl rcx, 56;
+        or  rax, rcx;
+        mov [rsp + 0], rax;               // track_word0 into scratch slot
+
+        // ---- Precompute track_word1 --------------------------------------
+        // track_word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16)
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;                  // bg.g | bg.b in low 16 bits
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;                    // mods
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 8], rax;               // track_word1 into scratch slot
+
+        // ---- Precompute thumb_word0 --------------------------------------
+        mov rax, 0x008896E2;              // thumb glyph █
+        mov r10, [r13 + 48];              // r10 = style_thumb
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r10;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        shl rcx, 56;
+        or  rax, rcx;
+        mov [rsp + 16], rax;              // thumb_word0
+
+        // ---- Precompute thumb_word1 --------------------------------------
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 24], rax;              // thumb_word1
+
+        // =====================================================================
+        // Phase 1: fill entire rect with track cell
+        // =====================================================================
+
+        // Re-extract bx (r8), by (r9), bw (r10), bh (r11) from r14
+        mov r8, r14;
+        and r8, 0xFFFF;
+
+        mov r9, r14;
+        shr r9, 16;
+        and r9, 0xFFFF;
+
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFFFF;
+
+        mov r11, r14;
+        shr r11, 48;
+
+        // xe = bx + bw -> rsi
+        mov rsi, r8;
+        add rsi, r10;
+        // ye = by + bh -> rdi
+        mov rdi, r9;
+        add rdi, r11;
+
+        // y counter: rdx = by
+        mov rdx, r9;
+
+      sc_fill_yloop:
+        cmp rdx, rdi;
+        jae sc_fill_done;
+
+        // x counter: rcx = bx
+        mov rcx, r8;
+
+      sc_fill_xloop:
+        cmp rcx, rsi;
+        jae sc_fill_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp track_word0 / track_word1 (transit through r10, safe to clobber)
+        mov r10, [rsp + 0];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp sc_fill_xloop;
+
+      sc_fill_ynext:
+        add rdx, 1;
+        jmp sc_fill_yloop;
+
+      sc_fill_done:
+
+        // =====================================================================
+        // Phase 2: thumb geometry (div-by-zero guards + clamp chain)
+        // =====================================================================
+
+        // Load content_length (r11), viewport_length (r10), position (r9)
+        mov r11, [r13 + 24];              // content_length
+        cmp r11, 0;
+        je  sc_ret_zero;                  // C==0 -> track-only, return 0
+
+        mov r10, [r13 + 32];              // viewport_length
+        cmp r10, 0;
+        je  sc_ret_zero;                  // V==0 -> track-only
+
+        mov r9, [r13 + 16];               // position
+
+        // thumb_len = viewport_length * track_length / content_length
+        mov rax, r10;
+        imul rax, r15;                    // rax = V * T (2-op reg,reg)
+        xor rdx, rdx;
+        div r11;                          // rax = quotient = raw thumb_len
+
+        // Clamp: thumb_len >= 1
+        cmp rax, 0;
+        jne sc_tl_min_done;
+        mov rax, 1;
+      sc_tl_min_done:
+
+        // Clamp: thumb_len <= track_length
+        cmp rax, r15;
+        jbe sc_tl_max_done;
+        mov rax, r15;
+      sc_tl_max_done:
+
+        // Stash thumb_len in rsi (survives div in the thumb_start compute)
+        mov rsi, rax;
+
+        // thumb_start compute
+        // if content_length <= viewport_length -> thumb_start = 0
+        cmp r11, r10;
+        jbe sc_ts_zero;
+
+        // available (rcx) = track_length - thumb_len
+        mov rcx, r15;
+        sub rcx, rsi;
+
+        // denom (r8) = content_length - viewport_length (strictly > 0 here)
+        mov r8, r11;
+        sub r8, r10;
+
+        // start_num = position * available; thumb_start = start_num / denom
+        mov rax, r9;
+        imul rax, rcx;                    // rax = P * available (2-op reg,reg)
+        xor rdx, rdx;
+        div r8;                           // rax = quotient = thumb_start
+
+        // Clamp: thumb_start <= available
+        cmp rax, rcx;
+        jbe sc_ts_clamp_done;
+        mov rax, rcx;
+      sc_ts_clamp_done:
+
+        mov rdi, rax;                     // rdi = thumb_start
+        jmp sc_ts_ready;
+
+      sc_ts_zero:
+        xor rdi, rdi;                     // thumb_start = 0
+
+      sc_ts_ready:
+        // rsi = thumb_len, rdi = thumb_start
+
+        // =====================================================================
+        // Phase 3: overlay thumb cells (branch on orientation)
+        // =====================================================================
+
+        // Reload orientation from [r13+8] (spec_ptr still live in r13)
+        mov r11, [r13 + 8];
+
+        // Re-extract bx (r10) and by (rax), bw (rdx), bh (rcx) from r14
+        // NOTE: we need bx, by, bw, bh for both branches; put them in
+        // preserved-across-branch slots.
+        mov r10, r14;
+        and r10, 0xFFFF;                  // r10 = bx
+        mov r8,  r14;
+        shr r8,  16;
+        and r8,  0xFFFF;                  // r8 = by
+        mov r9,  r14;
+        shr r9,  32;
+        and r9,  0xFFFF;                  // r9 = bw
+        mov rax, r14;
+        shr rax, 48;                      // rax = bh
+
+        cmp r11, 0;
+        jne sc_ov_horiz;
+
+        // ---- Vertical overlay ---------------------------------------------
+        // outer counter (rdx) = y in [by + thumb_start, by + thumb_start + thumb_len)
+        // outer end     (r11) = y end
+        // inner range   (r8, r9) = [bx, bx + bw)
+        //
+        // Register state entering here (from the re-extract above):
+        //   r10 = bx, r8 = by, r9 = bw, rax = bh, rsi = thumb_len,
+        //   rdi = thumb_start, r14 = packed rect (untouched).
+        // We reassign r8/r9 to hold x-start/x-end after computing y-start/end.
+        mov rdx, r8;                      // rdx = by
+        add rdx, rdi;                     // rdx = y start = by + thumb_start
+        mov r11, rdx;
+        add r11, rsi;                     // r11 = y end = y start + thumb_len
+
+        // x-range: r9 currently = bw; add r10 (bx) to get x end.
+        add r9, r10;                      // r9 = bx + bw = x end
+        mov r8, r10;                      // r8 = bx = x start
+
+      sc_ov_v_yloop:
+        cmp rdx, r11;
+        jae sc_ret_zero;
+
+        mov rcx, r8;                      // x counter = bx
+      sc_ov_v_xloop:
+        cmp rcx, r9;
+        jae sc_ov_v_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp thumb cell
+        mov r10, [rsp + 16];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 24];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp sc_ov_v_xloop;
+
+      sc_ov_v_ynext:
+        add rdx, 1;
+        jmp sc_ov_v_yloop;
+
+      sc_ov_horiz:
+        // ---- Horizontal overlay -------------------------------------------
+        // outer_start (rdx) = by       (y iterates over full rect height)
+        // outer_end   (r11) = by + bh
+        // inner_start (r8)  = bx + thumb_start (x start)
+        // inner_end   (r9)  = inner_start + thumb_len
+        //
+        // Currently r10=bx, r8=by, r9=bw, rax=bh.
+        mov rdx, r8;                      // rdx = by (y counter)
+        mov r11, r8;
+        add r11, rax;                     // r11 = by + bh (y end)
+
+        add r10, rdi;                     // r10 = bx + thumb_start
+        // Reassign for loop clarity: r8 = x-start, r9 = x-end
+        mov r8, r10;                      // r8 = bx + thumb_start (x start)
+        mov r9, r8;
+        add r9, rsi;                      // r9 = x end (x start + thumb_len)
+
+      sc_ov_h_yloop:
+        cmp rdx, r11;
+        jae sc_ret_zero;
+
+        mov rcx, r8;                      // x counter = x start
+      sc_ov_h_xloop:
+        cmp rcx, r9;
+        jae sc_ov_h_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        mov r10, [rsp + 16];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 24];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp sc_ov_h_xloop;
+
+      sc_ov_h_ynext:
+        add rdx, 1;
+        jmp sc_ov_h_yloop;
+
+      sc_ret_zero:
+        xor rax, rax;
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // scrollbar_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a ScrollbarView@0.1 semantic-pipe record into [dst..dst+32).
+  // record_len is fixed at 32 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to postui.M2-009 -- this packer is the wire-format authority so
+  // M2-009's registry glue only has to know the schema-name string
+  // (for BLAKE3 hashing) and this packer (for the byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return, rdx = per-field transit.
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (reads through rdi, writes through rsi).
+  // Labels prefixed sc_bv_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let scrollbar_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-008 (postui#17): scrollbar_view_pack lays a fixed-32-byte ScrollbarView@0.1 record at [rsi..rsi+32). Header phase writes seven scalar fields in one straight-line sequence: `mov rax, 0x57564253` then `mov_d [rsi+0], rax` stamps the 'SBVW' magic (0x57564253 = 1_465_270_867 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches block_view_pack's BLKV magic idiom). record_len is a hard 32 (no title/tail variable data), stored via `mov rax, 32; mov_d [rsi+4], rax`. Orientation (u64 spec field) is loaded from [rdi+8] via qword mov and stored to [rsi+8] as u32 via mov_d (only low 32 bits written -- orientation is 0 or 1, no truncation). The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+12] in one qword store -- ScrollbarSpec's rect slot and ScrollbarView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. Position / content_length / viewport_length (each u64 in spec, u32 on wire) are each loaded qword and stored dword to [rsi+20]/[rsi+24]/[rsi+28] -- documented truncation for the > 4G edge case (see WIRE block header). return rax = 32. Every immediate (0x57564253, 32, 0, 4, 8, 12, 20, 24, 28) fits imm32 (0x57564253 = 1_465_270_867 < 0x7FFFFFFF; the rest are small). No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 3 qword-loads / 3 dword-stores / 1 dword-magic-store / 1 dword-record_len-store / 1 dword-orientation-store / 1 qword-rect-store. Labels prefixed sc_bv_ per docs fingerprint discipline (none needed at v1 -- record is fixed-length, no branches).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564253;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 32;
+        mov_d [rsi + 4], rax;
+
+        // ---- orientation (u32) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 8];
+        mov_d [rsi + 8], rax;
+
+        // ---- packed rect (u64) at [rsi + 12] -------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 12], rax;
+
+        // ---- position (u32) at [rsi + 20] ----------------------------------
+        mov rax, [rdi + 16];
+        mov_d [rsi + 20], rax;
+
+        // ---- content_length (u32) at [rsi + 24] ----------------------------
+        mov rax, [rdi + 24];
+        mov_d [rsi + 24], rax;
+
+        // ---- viewport_length (u32) at [rsi + 28] ---------------------------
+        mov rax, [rdi + 32];
+        mov_d [rsi + 28], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 32;
+        ret;
+      }
+    }
+
+}
