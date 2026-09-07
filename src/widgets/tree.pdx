@@ -1,0 +1,1024 @@
+// src/widgets/tree.pdx -- postui.M4-002 (paideia-os/postui#28)
+//
+// Tree widget: expand/collapse hierarchical row rendering over a closed
+// TreeNode struct + TreeView@0.1 semantic record.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog row "Tree"; §5.1 M4-002)
+// =============================================================================
+//
+// M4-002 lands the first widget that renders a HIERARCHICAL data model:
+// a rooted, ordered tree of labeled nodes with per-node expand/collapse
+// state carried in the node record itself (rather than in a caller-owned
+// side channel like List's ListState.selected). The three deliverables
+// of this landing are:
+//
+//   1. TreeNode (32 B) -- the immutable-shape node record. Four u64
+//      fields: label_ptr, label_len (UTF-8 label span), children_ptr
+//      (array of child TreeNode records, 32-byte stride), and one
+//      packed u64 holding the expanded flag in bit 63 and the child
+//      count in bits 0..62. The packed variant is chosen over the
+//      alternative (split child_count u32 + expanded u32) because the
+//      resulting node record is 32 bytes exactly -- one cache-half
+//      line -- and the toggle_expand operation compiles to a single
+//      xor-with-mask against the packed word; the split variant would
+//      force two 4-byte stores at toggle time and would not reduce the
+//      node size (the 32-byte cache-half boundary is the natural stop).
+//      Documented low-bit-count encoding: bits 0..62 hold an unsigned
+//      count 0..2^63-1. A tree with more than 2^63-1 children per node
+//      exists nowhere in the paideia-os threat model, so the reserved
+//      one-bit high is a strict pareto win.
+//
+//   2. TreeSpec (64 B) -- the immutable per-frame render descriptor
+//      (rect, root_ptr, selected_ptr, state_ptr, style_line,
+//      style_selected, 16 bytes reserved). Highlight is keyed by
+//      pointer identity (selected_ptr == node_ptr) rather than by
+//      index into a flat visible-nodes array; a tree's flat index
+//      changes as siblings expand/collapse, but node identity is
+//      stable across frames as long as the caller's TreeNode array
+//      backing store is stable, so pointer-identity is the natural
+//      key. A selected_ptr of 0 means "no selection" (no row is
+//      highlighted for this frame).
+//
+//   3. TreeState (24 B) -- the mutable state slot: scroll offset only.
+//      Selection is tracked in TreeSpec.selected_ptr (see above), not
+//      here, so this slot holds only the topmost visible ROW index
+//      (in DFS emission order) plus two reserved u64 slots for future
+//      revisions (e.g. cursor position, focus-follows-selection flag).
+//      Kept at 24 bytes for symmetry with ListState / TableState so a
+//      caller that switches a widget slot from List to Tree does not
+//      have to resize its state allocation.
+//
+//   4. tree_toggle_expand -- flips bit 63 of the packed field. Return
+//      value is the NEW expanded state (0 or 1), so an input handler
+//      can chain the toggle result into a downstream refresh gate.
+//
+//   5. tree_draw + tree_view_pack: the widget_draw entry (WK_TREE arm
+//      hook lands at a later PR bumping widget_kind.pdx) and the
+//      semantic-pipe TreeView@0.1 packer. Both follow list.pdx's shape
+//      verbatim so a downstream reader trained on list_draw / list_view_pack
+//      reads this file as a delta rather than a new idiom.
+//
+// =============================================================================
+// TREENODE WIRE (32 bytes, TREE_NODE_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   label_ptr        u64 pointer to UTF-8 label bytes
+//   [+ 8..+16)   label_len        u64 label byte count (NOT codepoint count)
+//   [+16..+24)   children_ptr     u64 base of TreeNode array (stride 32 B)
+//   [+24..+32)   packed_flags     u64 bit 63 = expanded flag,
+//                                  bits 0..62 = child_count.
+//
+// The packed field is read at every visit:
+//   child_count = (packed << 1) >> 1        (clear bit 63; imm8 shifts)
+//   expanded    = packed >> 63              (bit 63 alone)
+//
+// The alternative split layout (child_count u32 at [+24..+28), expanded
+// u32 at [+28..+32)) would keep the 32-byte record size and avoid the
+// shift-pair on every read, at the cost of a 4-byte-store toggle and a
+// slightly odd non-8-byte-aligned "expanded" field. The packed variant
+// is what the task text picks first and what this module lands.
+//
+// Bit 63 was chosen (rather than bit 0) for two reasons: (1) the low
+// bits carry the count -- keeping the flag in bit 63 leaves the count
+// as a natural non-negative integer readable via `shl 1; shr 1` (both
+// imm8, paideia-as-safe); (2) `shr rax, 63` extracts the flag directly
+// into 0/1 without a mask, matching the shape a future selected-bit or
+// dirty-bit could reuse in the same high-byte slot.
+//
+// =============================================================================
+// TREESPEC WIRE (64 bytes, TREE_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect             u64 packed Rect (x/y/w/h per Rect wire)
+//   [+ 8..+16)   root_ptr         u64 pointer to root TreeNode (0 = empty)
+//   [+16..+24)   selected_ptr     u64 pointer to selected TreeNode
+//                                  (0 = no selection this frame)
+//   [+24..+32)   state_ptr        u64 pointer to TreeState (24 B) or 0
+//                                  for a stateless render (offset = 0)
+//   [+32..+40)   style_line       u64 packed Style for non-selected rows
+//   [+40..+48)   style_selected   u64 packed Style for the selected row
+//   [+48..+56)   _reserved_a      zero on the wire; future
+//                                  border-glyph / prefix-style word
+//                                  can extend here.
+//   [+56..+64)   _reserved_b      zero on the wire; future
+//                                  cursor-glyph / focus-mode ordinal
+//                                  can extend here.
+//
+// 64 bytes matches an x86_64 cache line and keeps rect + rect-meta in
+// the first 16 bytes (mirroring the ListSpec shape). The two reserved
+// tail slots leave 16 bytes of headroom for the M5 styling pass that
+// unifies per-widget glyph tables (see docs/design.md §5.1 M5).
+//
+// =============================================================================
+// TREESTATE WIRE (24 bytes, TREE_STATE_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   offset       u64 topmost visible ROW index (in DFS
+//                              pre-order emission order, NOT in tree
+//                              child-index space -- a row is one visible
+//                              node after applying expand/collapse
+//                              filtering).
+//   [+ 8..+16)   _reserved_a  zero on the wire; future cursor slot
+//   [+16..+24)   _reserved_b  zero on the wire; future mode-flags slot
+//
+// Selection is intentionally NOT stored here (it lives in
+// TreeSpec.selected_ptr). Reason: selection is caller-owned identity
+// state that survives across frames only as long as the caller keeps
+// the pointer live; storing it in TreeState would duplicate the
+// authority. Scroll offset, by contrast, is a display-derived value
+// (which visible ROW is at the top of the viewport) that is naturally
+// per-widget and per-frame-persistent.
+//
+// A stateless render (state_ptr == 0) decodes as offset = 0 -- the
+// caller gets the top of the tree with no scroll.
+//
+// =============================================================================
+// TREEVIEW@0.1 WIRE (semantic-pipe record; docs/design.md §2.3)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic          u32 = 0x57565254 ("TRVW" LE)
+//   [+ 4..+ 8)   record_len     u32 fixed = TRVW_HEADER_BYTES = 40
+//   [+ 8..+16)   rect           u64 verbatim from TreeSpec+0 (packed Rect)
+//   [+16..+24)   offset         u64 from state_ptr (or 0 if state_ptr == 0)
+//   [+24..+32)   selected_ptr   u64 verbatim from TreeSpec+16
+//   [+32..+40)   root_ptr       u64 verbatim from TreeSpec+8
+//
+// MAGIC = 0x57565254 ("TRVW" LE). Derivation: ASCII bytes T R V W are
+// 0x54 0x52 0x56 0x57; laid little-endian into a u32 the word reads
+// back as 0x57565254 (byte 0 = 0x54 'T', byte 1 = 0x52 'R', byte 2 =
+// 0x56 'V', byte 3 = 0x57 'W'). Matches the LSVW / BLKV / TBVW pattern
+// verbatim. Fits imm32 as a positive value, so the packer uses the
+// compact mov r32, imm32 store path -- no movabs required.
+//
+// record_len is FIXED at 40 bytes at v1 (no variable-length trailer;
+// the tree topology itself is walked via root_ptr by the receiver, so
+// no in-record serialization of children is needed). A future revision
+// that inlines a flattened depth-first byte log can extend the record
+// shape and bump the schema string to "TreeView@0.2". No zero-pad step
+// is needed since 40 is already 8-byte aligned.
+//
+// =============================================================================
+// ERROR BAND (0xFFFFEBE2..0xFFFFEBE3)
+// =============================================================================
+//
+// The M4 slice anchors at 0xFFFFEBE0..0xFFFFEBEF (design/architecture.md
+// §5.1); Tree owns 0xFFFFEBE2..0xFFFFEBE3 exactly (the two slots the
+// prompt allocates to this landing).
+//
+//   TREE_ERR_BAND     = 0xFFFFEBE2   -- generic tree spec-error sentinel;
+//                                        v1 does not return it (tree_draw
+//                                        is total under every documented
+//                                        input: null root, zero rect.w,
+//                                        zero rect.h, offset past visible
+//                                        count all draw NOTHING and return
+//                                        0). Declared so a future revision
+//                                        that grows hard validation can
+//                                        wire the return without a header
+//                                        edit.
+//
+//   TREE_ERR_TOO_DEEP = 0xFFFFEBE3   -- returned by tree_draw when the
+//                                        DFS stack would exceed
+//                                        TREE_MAX_DEPTH (= 32). The
+//                                        caller's buffer holds whatever
+//                                        rows were rendered before the
+//                                        overflow -- partial output is
+//                                        acceptable (the alternative,
+//                                        wiping the buffer, would waste
+//                                        cycles on a caller error path).
+//
+// Both sentinels > 0x7FFFFFFF -- `mov reg, imm` emits movabs; NEVER used
+// in cmp/and.
+//
+// =============================================================================
+// DFS TRAVERSAL STRATEGY
+// =============================================================================
+//
+// tree_draw walks the tree DEPTH-FIRST PRE-ORDER, ITERATIVELY, with a
+// bounded explicit stack of at most TREE_MAX_DEPTH frames living in
+// tree_draw's own stack scratch. The alternative (bounded recursion via
+// nested calls) is rejected because:
+//
+//   * A recursive body would use one x86_64 SysV stack frame per
+//     level (~56 bytes minimum for the callee-save spill + return
+//     address + local scratch), turning TREE_MAX_DEPTH into a
+//     ~1.8KB stack budget on top of paideia-as's own callee-save
+//     bracketing. The iterative variant is 32 * 32 = 1024 bytes for
+//     the frame array, with a fixed prologue -- more predictable.
+//
+//   * Paideia-as's r11-scratch discipline plus the widget-draw SysV
+//     bracket already forces every leaf body to be `sub rsp, N` +
+//     linear -- the iterative variant lets tree_draw share ONE
+//     epilogue rather than N return paths.
+//
+// Each frame is 32 bytes (stride-32 = shl 5, cheaper than imul-by-24):
+//   [+ 0..+ 8)   node_ptr           the TreeNode at this level
+//   [+ 8..+16)   depth              0-based depth (root = 0)
+//   [+16..+24)   next_child_idx     index of next unvisited child; the
+//                                    frame is popped when this hits
+//                                    child_count or the node is not
+//                                    expanded.
+//   [+24..+32)   _pad               kept for 32-byte stride alignment
+//
+// Frame array occupies [rsp+0..1024) inside the tree_draw prologue's
+// `sub rsp, 1152` allocation (see PROLOGUE STACK LAYOUT below).
+//
+// TREE_MAX_DEPTH = 32. A depth of 32 covers every realistic tree the
+// TUI ships would render (a filesystem view rarely exceeds ~12 levels;
+// a JSON inspector rarely exceeds ~20; a code-scope inspector rarely
+// exceeds ~15). Overflow returns TREE_ERR_TOO_DEEP verbatim.
+//
+// Emission gating:
+//   * emit_count counts nodes visited so far (0-indexed).
+//   * If emit_count < offset, skip drawing this row (increment and
+//     continue) -- this implements viewport scroll.
+//   * Else if rendered < bh, draw the row at (bx, by + rendered),
+//     increment rendered and emit_count.
+//   * The outer DFS loop also checks rendered >= bh at every step and
+//     terminates early once the viewport is full (no wasted DFS
+//     traversal past the visible window).
+//
+// =============================================================================
+// PREFIX-GLYPH RENDERING
+// =============================================================================
+//
+// The task text pins the three prefix cases:
+//   * ▶ U+25B6 (BLACK RIGHT-POINTING TRIANGLE) -- COLLAPSED (has
+//                                                  children, expanded == 0)
+//   * ▼ U+25BC (BLACK DOWN-POINTING TRIANGLE)  -- EXPANDED (has
+//                                                  children, expanded == 1)
+//   * space (0x20)                             -- LEAF (child_count == 0)
+//
+// UTF-8 encodings:
+//   ▶ 0xE2 0x96 0xB6      -- stored as a u32 = 0x00B696E2 (LE)
+//   ▼ 0xE2 0x96 0xBC      -- stored as a u32 = 0x00BC96E2 (LE)
+//
+// The prefix occupies ONE terminal cell. Its 3 UTF-8 bytes are written
+// as ONE dword store into the cell's 4-byte symbol slot -- the fill
+// phase's chosen_style stays intact (the mov_d overwrites only the low
+// 4 bytes = the sym slot). Both codepoint u32 values fit imm32 (a
+// positive value under 0x1000000), so the `mov r32, imm32` form is
+// used -- no movabs. This is a deliberate departure from the list_draw
+// "one byte per cell" byte-overlay -- for the prefix, a single-cell
+// glyph is the right visual result; for the label bytes, the same
+// one-byte-per-cell shortcut list_draw uses IS applied here so a
+// downstream reader trained on list_draw reads the label loop as a
+// delta rather than a new idiom.
+//
+// Row layout for depth d and a non-leaf expanded node with label "hello":
+//
+//    <2*d spaces> <▼> <space> h e l l o <space-fill to bw>
+//     indent      1   1       ...label bytes at 1 byte per cell...
+//
+// Two spaces per depth level match the Ratatui default. A leaf node
+// skips the prefix glyph write entirely -- the fill phase's space
+// already occupies the prefix cell, so the column cursor just advances.
+//
+// Truncation: label bytes stop when col_pos reaches bw. Rows past the
+// item tail (DFS exhaustion) are not painted (fill+prefix+label is
+// per-row, so an early DFS end leaves the caller's prior-frame content
+// intact -- same posture list_draw takes and documents).
+//
+// =============================================================================
+// PROLOGUE STACK LAYOUT
+// =============================================================================
+//
+// tree_draw pushes 5 callee-save regs (rbx / r12 / r13 / r14 / r15 =
+// 40 B) then `sub rsp, 1152` (16-aligned; entry rsp%16 == 8, after 40 +
+// 1152 = 1192 rsp%16 == 0). Stack layout below the callee-save regs:
+//
+//   [rsp+   0.. 1024)   dfs_frames[32]   32 frames * 32 bytes each
+//   [rsp+1024..1032)    bx               rect.x
+//   [rsp+1032..1040)    by               rect.y
+//   [rsp+1040..1048)    bw               rect.w
+//   [rsp+1048..1056)    bh               rect.h
+//   [rsp+1056..1064)    top_depth        current stack depth (0..32)
+//   [rsp+1064..1072)    offset           scroll offset (from state)
+//   [rsp+1072..1080)    emit_count       nodes visited so far
+//   [rsp+1080..1088)    rendered         rows drawn so far
+//   [rsp+1088..1096)    col_pos          per-row column cursor
+//   [rsp+1096..1104)    current_style    per-row chosen style
+//   [rsp+1104..1112)    row_y            per-row absolute y = by + rendered
+//   [rsp+1112..1152)    pad              (kept 16-aligned)
+//
+// Callee-save assignments (survive whole body):
+//   rbx = buf_ptr
+//   r12 = cols
+//   r13 = spec_ptr
+//   r14 = selected_ptr (loaded once from [r13+16])
+//   r15 = alignment-only push (never read/written; leaves headroom
+//          for a future revision to promote another persistent state
+//          value without reshaping the frame)
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Tree`) -- matches file basename
+//     `tree`; paideia-as basename resolution ignores the src/widgets/
+//     prefix.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The widest immediate
+//     that reaches cmp/and is 0xFFFFFF (24-bit mask on the packed
+//     style-word tail).
+//   - Every sentinel > 0x7FFFFFFF (TREE_ERR_BAND, TREE_ERR_TOO_DEEP)
+//     is loaded via `mov reg, imm` (movabs); NEVER used in cmp/and.
+//   - The bit-63 toggle mask 0x8000000000000000 is composed via
+//     `mov rcx, 1; shl rcx, 63` (both imm8 operands), not by movabs of
+//     the imm64 literal -- avoids the imm64 cmp/and pitfall in case a
+//     future revision wants to reuse the mask in a compare arm.
+//   - No `and reg, imm64`. The bit-63 clear on the packed field uses
+//     `shl 1; shr 1` (both imm8), not a mask.
+//   - 2-op `imul reg, reg` only. The DFS stack has 32-byte frames so
+//     the frame-address math uses `shl 5` (imm8); the child-array
+//     stride is also 32 bytes so `shl 5` is used there too -- no
+//     imul in the address paths. The one imul that survives is
+//     `imul rax, r12` (row_y * cols) which is always reg,reg.
+//   - `pub let X : type = value` is single-line for every constant.
+//   - Every mov_b load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension).
+//   - r11 discipline: no `lea` in this module (frame addresses are
+//     computed via `shl` + `add`), so r11 stays freely available as
+//     scratch across every non-`lea` phase. Every RIP-relative
+//     address resolves via bare `mov [ptr + off]` chains.
+//   - SysV push/pop parity:
+//       * tree_toggle_expand / tree_view_pack are pure leafs (no
+//         push/pop, no nested call).
+//       * tree_draw pushes 5 callee-save regs (40 B) + `sub rsp, 1152`;
+//         entry rsp%16 == 8, +40 == 0, +1152 == 0. Aligned for any
+//         nested call this module may add in a future revision (v1 has
+//         no cross-module calls in tree_draw).
+//   - Labels prefixed `tr_` per docs/design.md fingerprint discipline:
+//       tr_te_    tree_toggle_expand
+//       tr_dr_    tree_draw
+//       tr_vp_    tree_view_pack
+
+module Tree = structure {
+
+  // ==========================================================================
+  // Sizing constants (locked at M4-002 landing).
+  // ==========================================================================
+  pub let TREE_NODE_BYTES  : u64 = 32
+  pub let TREE_SPEC_BYTES  : u64 = 64
+  pub let TREE_STATE_BYTES : u64 = 24
+  pub let TREE_MAX_DEPTH   : u64 = 32
+
+  // DFS frame stride (see DFS TRAVERSAL STRATEGY block above). Chosen
+  // at 32 bytes so the frame-address multiply compiles to a single
+  // `shl 5` rather than an imul-by-24 stage.
+  pub let TREE_FRAME_BYTES : u64 = 32
+
+  // ==========================================================================
+  // TreeNode field offsets (see TREENODE WIRE in the module header).
+  // ==========================================================================
+  pub let TREE_NODE_OFF_LABEL_PTR    : u64 = 0
+  pub let TREE_NODE_OFF_LABEL_LEN    : u64 = 8
+  pub let TREE_NODE_OFF_CHILDREN_PTR : u64 = 16
+  pub let TREE_NODE_OFF_PACKED_FLAGS : u64 = 24
+
+  // ==========================================================================
+  // TreeSpec field offsets (see TREESPEC WIRE in the module header).
+  // ==========================================================================
+  pub let TREE_OFF_RECT           : u64 = 0
+  pub let TREE_OFF_ROOT_PTR       : u64 = 8
+  pub let TREE_OFF_SELECTED_PTR   : u64 = 16
+  pub let TREE_OFF_STATE_PTR      : u64 = 24
+  pub let TREE_OFF_STYLE_LINE     : u64 = 32
+  pub let TREE_OFF_STYLE_SELECTED : u64 = 40
+  pub let TREE_OFF_RESERVED_A     : u64 = 48
+  pub let TREE_OFF_RESERVED_B     : u64 = 56
+
+  // ==========================================================================
+  // TreeState field offsets (see TREESTATE WIRE in the module header).
+  // ==========================================================================
+  pub let TREE_STATE_OFF_OFFSET     : u64 = 0
+  pub let TREE_STATE_OFF_RESERVED_A : u64 = 8
+  pub let TREE_STATE_OFF_RESERVED_B : u64 = 16
+
+  // ==========================================================================
+  // Error sentinels. See ERROR BAND in the module header.
+  //
+  // Both sentinels > 0x7FFFFFFF -- mov reg,imm emits movabs; NEVER used
+  // in cmp/and.
+  // ==========================================================================
+  pub let TREE_ERR_BAND     : u64 = 0xFFFFEBE2
+  pub let TREE_ERR_TOO_DEEP : u64 = 0xFFFFEBE3
+
+  // ==========================================================================
+  // TreeView@0.1 semantic-pipe wire (docs/design.md §2.3 example).
+  //
+  // MAGIC 0x57565254 = "TRVW" little-endian (byte 0 = 0x54 'T', byte 1 =
+  // 0x52 'R', byte 2 = 0x56 'V', byte 3 = 0x57 'W'). Same pattern the
+  // LSVW / BLKV / TBVW magic words use. Fits imm32 as a positive value;
+  // the packer uses the compact mov r32, imm32 store path.
+  // ==========================================================================
+  pub let TRVW_MAGIC             : u64 = 0x57565254
+  pub let TRVW_HEADER_BYTES      : u64 = 40
+  pub let TRVW_OFF_MAGIC         : u64 = 0
+  pub let TRVW_OFF_RECORD_LEN    : u64 = 4
+  pub let TRVW_OFF_RECT          : u64 = 8
+  pub let TRVW_OFF_OFFSET        : u64 = 16
+  pub let TRVW_OFF_SELECTED_PTR  : u64 = 24
+  pub let TRVW_OFF_ROOT_PTR      : u64 = 32
+
+  // Schema name ("TreeView@0.1", NUL-terminated). Kept here as the
+  // authoritative source so the M2-009 BLAKE3-based schema-hash landing
+  // has exactly one string to hash and there is no risk of a
+  // byte-for-byte drift between the packer and the hash computation.
+  pub let TRVW_SCHEMA_NAME     : [u8; 13] = "TreeView@0.1\0"
+  pub let TRVW_SCHEMA_NAME_LEN : u64 = 12
+
+  // ==========================================================================
+  // Prefix glyph codepoint u32 values (see PREFIX-GLYPH RENDERING in the
+  // module header). Both are UTF-8 encodings of a single grapheme,
+  // packed into a u32 in little-endian byte order so a single mov_d
+  // store into the cell's 4-byte sym slot renders the glyph. The high
+  // byte (byte 3 of the sym slot) stays zero, which the terminal-side
+  // renderer treats as end-of-symbol -- matches the docs/design.md §2.4
+  // Cell wire's "symbol is a length-prefixed UTF-8 byte run capped at
+  // 4 bytes; a NUL byte terminates".
+  //
+  // Both values fit imm32 as positive (well under 0x7FFFFFFF), so
+  // `mov r32, imm32` is the store idiom -- no movabs needed.
+  // ==========================================================================
+  pub let TREE_GLYPH_COLLAPSED : u64 = 0x00B696E2
+  pub let TREE_GLYPH_EXPANDED  : u64 = 0x00BC96E2
+
+  // ==========================================================================
+  // tree_toggle_expand(node_ptr) -> u64
+  //
+  // Flip bit 63 of the packed_flags word at [node_ptr + 24]. Returns
+  // the NEW expanded state (0 or 1) so an input handler can chain the
+  // toggle result into a downstream refresh gate ("did I just expand?
+  // then invalidate cached row heights").
+  //
+  // Register plan: rdi = node_ptr. rax = load/return scratch;
+  // rcx = mask scratch. Pure leaf: no callee-save touched, no push/pop,
+  // no nested call. Effect `!{mem}` (one 8-byte load + one 8-byte store).
+  //
+  // The bit-63 mask 0x8000000000000000 is composed via
+  //   mov rcx, 1
+  //   shl rcx, 63
+  // (both imm8 operands) rather than a movabs of the imm64 literal. This
+  // keeps the mask expressible in a form a future revision could reuse
+  // inside `and` / `cmp` without hitting the paideia-as imm64 restriction
+  // on those mnemonics (imm64 is fine for mov, forbidden for and/cmp).
+  //
+  // Return: the new expanded state alone (shr rax, 63 after the xor)
+  // rather than the whole packed word; the caller can re-read the whole
+  // word via a plain load if it needs child_count too.
+  //
+  // Labels prefixed tr_te_ per docs fingerprint discipline (no branches
+  // in this body, so no labels are actually emitted -- the prefix is
+  // reserved so any future revision that adds an early-return arm
+  // stays consistent).
+  // ==========================================================================
+  pub let tree_toggle_expand : (u64) -> u64 !{mem} @{} =
+    fn (node_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-002 (postui#28): tree_toggle_expand flips bit 63 of the packed_flags word at [rdi+24] and returns the new expanded state (0 or 1). Compose the bit-63 mask 0x8000000000000000 via `mov rcx, 1; shl rcx, 63` (both imm8 operands, staying inside the paideia-as imm8 shift ceiling and avoiding a movabs of the imm64 mask literal -- kept out of movabs so a future revision that reuses the mask in cmp/and does not hit paideia-as's imm64-cmp/and forbidance). Load packed = [rdi+24] into rax, xor rax, rcx (flip bit 63), store rax back to [rdi+24]. Return the new expanded bit alone via `shr rax, 63` -- the shift count 63 fits imm8. The caller receives 0 (now collapsed) or 1 (now expanded) in rax. Pure leaf: no callee-save touched, no push/pop, no nested call. Every immediate that reaches cmp/and: none (no cmp in this body). Every mov_b load: none (no byte loads in this body). No `test`, no `imul`, no `and reg,imm64`, no `lea`. Effect `!{mem}` (one 8-byte load + one 8-byte store through rdi). Labels prefixed tr_te_ per docs fingerprint discipline (this body has no branches so no labels are actually emitted; the prefix is reserved for future revision consistency).",
+      block: {
+        mov rcx, 1;
+        shl rcx, 63;
+        mov rax, [rdi + 24];
+        xor rax, rcx;
+        mov [rdi + 24], rax;
+        shr rax, 63;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tree_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature -- a later WidgetKind edit routes
+  // WK_TREE to this function via the same shape block_draw uses. `rows`
+  // is not read by this body (row indexing is via the TreeSpec's rect,
+  // not the canvas dims), kept for signature uniformity so the compare-
+  // chain dispatch does not have to reshape args per widget.
+  //
+  // See DFS TRAVERSAL STRATEGY and PREFIX-GLYPH RENDERING in the module
+  // header for the render algorithm.
+  //
+  // Return codes:
+  //   0                   -- OK (v1 total for well-formed inputs)
+  //   TREE_ERR_TOO_DEEP   -- DFS attempted to push past TREE_MAX_DEPTH.
+  //                          Partial output remains in the buffer.
+  //
+  // See PROLOGUE STACK LAYOUT in the module header for the full stack
+  // slot table.
+  //
+  // Labels prefixed tr_dr_ per docs fingerprint discipline:
+  //   tr_dr_no_state          state_ptr == 0 (default offset = 0)
+  //   tr_dr_state_ok          state loaded
+  //   tr_dr_emit_common       shared emit-or-skip entry from both the
+  //                            initial root push and every descend push
+  //   tr_dr_do_draw           emit_count passed offset, draw this row
+  //   tr_dr_style_default     row is not selected
+  //   tr_dr_style_done        style chosen
+  //   tr_dr_fill_top/done     row-fill loop
+  //   tr_dr_row_done          row rendering complete (skip or drawn)
+  //   tr_dr_prefix_leaf       child_count == 0 (no glyph write)
+  //   tr_dr_prefix_collapsed  has children, not expanded (▶)
+  //   tr_dr_prefix_write      write chosen 3-byte glyph dword
+  //   tr_dr_after_prefix      advance past separator space
+  //   tr_dr_label_top         label byte loop
+  //   tr_dr_loop_top          DFS peek / descend / pop dispatch
+  //   tr_dr_pop               pop top frame and continue
+  //   tr_dr_ret_ok            xor rax, rax; jmp epilogue
+  //   tr_dr_ret_too_deep      mov rax, TREE_ERR_TOO_DEEP; jmp epilogue
+  //   tr_dr_epilogue          add rsp; pop; ret
+  // ==========================================================================
+  pub let tree_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-002 (postui#28): tree_draw renders a DFS pre-order slice of the tree rooted at spec.root_ptr into the canvas back-region. Push rbx/r12/r13/r14/r15 (5 pushes = 40 B, rsp entry %16 == 8, after pushes == 0), then sub rsp, 1152 (16-aligned; 40 + 1152 = 1192, rsp%16 == 0 for any nested call). Cache buf_ptr in rbx, cols in r12, spec_ptr in r13, selected_ptr from [r13+16] into r14. Prologue: decode packed Rect from [r13+0] via mov/and 0xFFFF and mov/shr/and 0xFFFF pattern -- store bx/by/bw/bh into [rsp+1024..1056]. Zero-dim bail: if bw == 0 or bh == 0, jump to epilogue with rax = 0 (no writes). Load state: read state_ptr from [r13+24]; if 0, offset = 0 (compose via xor rax, rax), else offset = [state+0]; store into [rsp+1064]. Load root_ptr from [r13+8]; if 0, jump to ret_ok (empty tree). Initialize DFS: store (root, depth=0, next_child_idx=0, pad=0) into frame 0 at [rsp+0..32], set top_depth = 1 at [rsp+1056], emit_count = 0 at [rsp+1072], rendered = 0 at [rsp+1080]. Fall into tr_dr_emit_common to process the root.\n\nDFS EMIT PHASE (tr_dr_emit_common): Read emit_count and offset; if emit_count < offset, increment emit_count and jump back to loop_top (row hidden by scroll). Otherwise fall into tr_dr_do_draw. Read top frame at rsp + (top_depth-1)*32 (shl 5 stride, no imul): node into r10, depth into r11. Choose style: if r10 == r14 (selected), current_style = [r13+40] (style_selected), else [r13+32] (style_line); store to [rsp+1096]. Compute row_y = by + rendered into [rsp+1104]. FILL LOOP: col_pos = 0 in [rsp+1088]; while col_pos < bw: compute dst = buf + (row_y * cols + bx + col_pos) * 16 via mov + imul reg,reg (r12 = cols) + add + add + shl 4 + add; write cell as (word0 = 0x20 | (style << 32), word1 = (style >> 32) & 0xFFFFFF). Cell wire mapping: Style bits [0..32) land at Cell word0 bits [32..64); Style bits [32..56) land at Cell word1 bits [0..24); pad byte at Style bit [56..64) stays zero, so Cell reserved bytes 11..15 stay zero. col_pos++. After fill: indent = depth * 2 (shl 1, imm8 shift); if indent >= bw, jump straight to row_done (indent overwrites viewport width). Set col_pos = indent. PREFIX PHASE: read packed = [r10+24]; child_count = (packed << 1) >> 1 (imm8 shl/shr pair, clears bit 63 without imm64 mask); expanded = packed >> 63 (imm8 shr). If child_count == 0, jump prefix_leaf (advance col_pos by 1, no glyph write, fill's space remains). Else if expanded == 0, r9 = 0x00B696E2 (▶ collapsed, fits imm32 as positive); else r9 = 0x00BC96E2 (▼ expanded). Bounds gate: if col_pos >= bw, jump row_done. Compute dst for the prefix cell, `mov_d [dst+0], r9` overlays only the sym dword (fg/bg/mods bytes 4..11 stay from fill). col_pos++. Fall into after_prefix: advance col_pos by 1 for the separator space (already filled). LABEL PHASE: r8 = [r10+0] (label_ptr), r9 = [r10+8] (label_len), rcx = 0 (i). Loop: if rcx >= r9 or col_pos >= bw, jump row_done. xor rdx, rdx; mov_b rdx, [r8 + rcx + 0] (paideia-as pitfall #1248: zero-extend before mov_b). Compute dst, `mov_d [dst+0], rdx` overlays sym only. col_pos++, i++. After row_done: rendered++, emit_count++, jump loop_top.\n\nDFS LOOP PHASE (tr_dr_loop_top): Termination: if top_depth == 0 or rendered >= bh, jump ret_ok. Peek top frame: rax = (top_depth-1)*32 + rsp; r10 = [rax+0] (node), r11 = [rax+8] (depth), r8 = [rax+16] (next_child_idx). Read packed = [r10+24]; expanded = packed >> 63. If expanded == 0, jump pop. child_count = (packed << 1) >> 1 (imm8 shl+shr). If r8 >= child_count, jump pop. DESCEND: advance next_child_idx: mov [rax+16], (r8+1). children_ptr = [r10+16]; child = children_ptr + r8 * 32 (shl 5, imm8). Depth bound: if top_depth >= 32, jump ret_too_deep (compose sentinel via movabs, imm > 0x7FFFFFFF, mov-only). Push child frame at rsp + top_depth * 32: [+0] = child, [+8] = r11 + 1 (new depth), [+16] = 0 (next_child_idx), [+24] = 0 (pad). top_depth++. Jump tr_dr_emit_common. POP: top_depth--; jump loop_top. Epilogue: xor rax, rax at ret_ok; mov rax, 0xFFFFEBE3 (movabs) at ret_too_deep; add rsp, 1152; pop r15/r14/r13/r12/rbx; ret.\n\nEncoder conformance: no `test` mnemonic anywhere -- every zero-check uses cmp reg, 0. Every immediate in cmp/and fits imm32: 0 (imm8), 1 (imm8), 32 (imm8), 0xFFFF (imm32), 0xFFFFFF (imm32). Shift counts (1, 4, 5, 16, 32, 48, 63) all fit imm8. Sentinels 0xFFFFEBE3 (and the unreachable 0xFFFFEBE2) are loaded via mov reg, imm (movabs); NEVER used in cmp/and. No 2-op imul r,imm: the one imul is `imul rax, r12` (row_y * cols, reg,reg). Every mov_b load is preceded by `xor reg, reg`. No `and reg, imm64` -- the bit-63 clear on the packed field uses `shl 1; shr 1` (imm8 pair), not a mask. No `lea` in the body -- frame addresses go through `shl` + `add` chains, so r11 stays freely available as scratch. r15 is pushed as an alignment placeholder and never touched in the body. Cross-module calls: NONE at v1 (a future revision might call line_display_width for grapheme-accurate label fit; today the byte-per-cell shortcut inherits list_draw's documented over/under-fill by one cell per multi-byte codepoint). Effect `!{mem}` (fill + prefix + label stores; DFS reads through r13/r14 and stack frames). Labels prefixed tr_dr_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 1152;
+
+        // ---- Prologue: cache invariants ------------------------------------
+        mov rbx, rsi;                    // rbx = buf_ptr
+        mov r12, rcx;                    // r12 = cols
+        mov r13, rdi;                    // r13 = spec_ptr
+        mov r14, [r13 + 16];             // r14 = selected_ptr
+
+        // ---- Extract rect fields --------------------------------------------
+        mov r8, [r13 + 0];               // r8 = packed rect
+
+        mov rax, r8;
+        and rax, 0xFFFF;
+        mov [rsp + 1024], rax;           // bx
+
+        mov rax, r8;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 1032], rax;           // by
+
+        mov rax, r8;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 1040], rax;           // bw
+
+        mov rax, r8;
+        shr rax, 48;
+        mov [rsp + 1048], rax;           // bh
+
+        // Zero-dim bail: bw == 0 || bh == 0 -> success, no writes.
+        mov rax, [rsp + 1040];
+        cmp rax, 0;
+        je  tr_dr_ret_ok;
+        mov rax, [rsp + 1048];
+        cmp rax, 0;
+        je  tr_dr_ret_ok;
+
+        // ---- Load state (offset only) --------------------------------------
+        mov rdi, [r13 + 24];             // state_ptr (transient)
+        cmp rdi, 0;
+        je  tr_dr_no_state;
+
+        mov rax, [rdi + 0];
+        mov [rsp + 1064], rax;           // offset
+        jmp tr_dr_state_ok;
+
+      tr_dr_no_state:
+        xor rax, rax;
+        mov [rsp + 1064], rax;           // offset = 0
+
+      tr_dr_state_ok:
+        // ---- Init counters --------------------------------------------------
+        xor rax, rax;
+        mov [rsp + 1072], rax;           // emit_count = 0
+        mov [rsp + 1080], rax;           // rendered = 0
+
+        // ---- Load root_ptr and short-circuit if empty ----------------------
+        mov r9, [r13 + 8];               // r9 = root_ptr
+        cmp r9, 0;
+        je  tr_dr_ret_ok;
+
+        // ---- Push root frame at slot 0 -------------------------------------
+        mov [rsp + 0],  r9;              // node = root
+        xor rax, rax;
+        mov [rsp + 8],  rax;             // depth = 0
+        mov [rsp + 16], rax;             // next_child_idx = 0
+        mov [rsp + 24], rax;             // pad
+
+        mov rax, 1;
+        mov [rsp + 1056], rax;           // top_depth = 1
+
+        // Fall through to emit the root.
+        jmp tr_dr_emit_common;
+
+        // ====================================================================
+        // DFS main loop
+        // ====================================================================
+      tr_dr_loop_top:
+        // Termination: empty stack or viewport full.
+        mov rax, [rsp + 1056];           // top_depth
+        cmp rax, 0;
+        je  tr_dr_ret_ok;
+
+        mov rax, [rsp + 1080];           // rendered
+        mov rcx, [rsp + 1048];           // bh
+        cmp rax, rcx;
+        jae tr_dr_ret_ok;
+
+        // Peek top frame: rax = &top_frame = rsp + (top_depth-1)*32
+        mov rax, [rsp + 1056];
+        sub rax, 1;
+        shl rax, 5;                      // * 32
+        add rax, rsp;
+
+        mov r10, [rax + 0];              // node
+        mov r11, [rax + 8];              // depth
+        mov r8,  [rax + 16];             // next_child_idx
+
+        // Load packed_flags.
+        mov r9, [r10 + 24];
+
+        // expanded = packed >> 63
+        mov rdx, r9;
+        shr rdx, 63;
+        cmp rdx, 0;
+        je  tr_dr_pop;
+
+        // child_count = (packed << 1) >> 1  (clears bit 63)
+        mov rcx, r9;
+        shl rcx, 1;
+        shr rcx, 1;
+
+        // next_child_idx >= child_count?
+        cmp r8, rcx;
+        jae tr_dr_pop;
+
+        // ---- Descend into next unvisited child ----------------------------
+        // Advance parent's next_child_idx.
+        mov rcx, r8;
+        add rcx, 1;
+        mov [rax + 16], rcx;
+
+        // child = [node+16] + next_child_idx * 32
+        mov rdi, [r10 + 16];             // children_ptr
+        mov rax, r8;                     // idx
+        shl rax, 5;                      // * 32
+        add rax, rdi;
+        // rax = child_ptr
+
+        // Depth bound: top_depth is already the frame count; pushing at
+        // slot top_depth == 32 would overflow. Bail here.
+        mov rcx, [rsp + 1056];
+        cmp rcx, 32;
+        jae tr_dr_ret_too_deep;
+
+        // Push new frame at slot top_depth (address = rsp + top_depth*32).
+        mov rdi, rcx;
+        shl rdi, 5;                      // * 32
+        add rdi, rsp;                    // &new_frame
+
+        mov [rdi + 0], rax;              // node = child
+
+        mov rdx, r11;                    // parent depth
+        add rdx, 1;
+        mov [rdi + 8], rdx;              // depth = parent + 1
+
+        xor rdx, rdx;
+        mov [rdi + 16], rdx;             // next_child_idx = 0
+        mov [rdi + 24], rdx;             // pad
+
+        // top_depth++
+        mov rdx, [rsp + 1056];
+        add rdx, 1;
+        mov [rsp + 1056], rdx;
+
+        // Emit the newly pushed child (falls into shared emit path).
+        jmp tr_dr_emit_common;
+
+      tr_dr_pop:
+        mov rax, [rsp + 1056];
+        sub rax, 1;
+        mov [rsp + 1056], rax;
+        jmp tr_dr_loop_top;
+
+        // ====================================================================
+        // Shared emit-or-skip entry
+        //
+        // Enters with the top frame already populated for the node to
+        // emit. Reads emit_count vs offset to decide skip-or-draw, then
+        // rejoins the main loop.
+        // ====================================================================
+      tr_dr_emit_common:
+        // If emit_count < offset: skip drawing (scroll hides row).
+        mov rax, [rsp + 1072];           // emit_count
+        mov rcx, [rsp + 1064];           // offset
+        cmp rax, rcx;
+        jae tr_dr_do_draw;
+
+        add rax, 1;
+        mov [rsp + 1072], rax;           // emit_count++
+        jmp tr_dr_loop_top;
+
+      tr_dr_do_draw:
+        // If rendered >= bh, skip drawing but still count and loop
+        // (the outer loop's rendered/bh check will terminate on the
+        // next iteration; this guard defends against a single-row
+        // race across the emit-and-continue path).
+        mov rax, [rsp + 1080];           // rendered
+        mov rcx, [rsp + 1048];           // bh
+        cmp rax, rcx;
+        jae tr_dr_loop_top;
+
+        // Read top frame: node into r10, depth into r11.
+        mov rax, [rsp + 1056];
+        sub rax, 1;
+        shl rax, 5;
+        add rax, rsp;
+        mov r10, [rax + 0];              // node
+        mov r11, [rax + 8];              // depth
+
+        // Choose current_style: highlight if node == selected_ptr.
+        cmp r10, r14;
+        jne tr_dr_style_default;
+        mov rax, [r13 + 40];             // style_selected
+        jmp tr_dr_style_done;
+      tr_dr_style_default:
+        mov rax, [r13 + 32];             // style_line
+      tr_dr_style_done:
+        mov [rsp + 1096], rax;           // current_style
+
+        // row_y = by + rendered
+        mov rax, [rsp + 1032];           // by
+        mov rcx, [rsp + 1080];           // rendered
+        add rax, rcx;
+        mov [rsp + 1104], rax;           // row_y
+
+        // ---- Fill row [bx, bx+bw) at row_y with (space, style) -----------
+        xor rax, rax;
+        mov [rsp + 1088], rax;           // col_pos = 0
+
+      tr_dr_fill_top:
+        mov rax, [rsp + 1088];
+        mov rcx, [rsp + 1040];           // bw
+        cmp rax, rcx;
+        jae tr_dr_fill_done;
+
+        // dst = buf + (row_y * cols + bx + col_pos) * 16
+        mov rax, [rsp + 1104];           // row_y
+        imul rax, r12;                   // * cols (2-op reg,reg)
+        mov rcx, [rsp + 1024];           // bx
+        add rax, rcx;
+        mov rcx, [rsp + 1088];           // col_pos
+        add rax, rcx;
+        shl rax, 4;                      // * 16
+        add rax, rbx;                    // + buf_ptr
+
+        // word0 = 0x20 | (style << 32)
+        mov rcx, [rsp + 1096];           // current_style
+        shl rcx, 32;
+        or  rcx, 0x20;
+        mov [rax + 0], rcx;
+
+        // word1 = (style >> 32) & 0xFFFFFF
+        mov rcx, [rsp + 1096];
+        shr rcx, 32;
+        and rcx, 0xFFFFFF;
+        mov [rax + 8], rcx;
+
+        mov rax, [rsp + 1088];
+        add rax, 1;
+        mov [rsp + 1088], rax;           // col_pos++
+        jmp tr_dr_fill_top;
+
+      tr_dr_fill_done:
+        // ---- Compute indent = depth * 2 (imm8 shift) --------------------
+        mov rax, r11;
+        shl rax, 1;                      // indent
+
+        // If indent >= bw: no prefix, no label -- row is fully filled.
+        mov rcx, [rsp + 1040];           // bw
+        cmp rax, rcx;
+        jae tr_dr_row_done;
+
+        mov [rsp + 1088], rax;           // col_pos = indent
+
+        // ---- Prefix glyph -----------------------------------------------
+        // Read packed flags again (r10 = node still live).
+        mov r8, [r10 + 24];              // packed
+
+        // child_count = (packed << 1) >> 1
+        mov rcx, r8;
+        shl rcx, 1;
+        shr rcx, 1;
+
+        // expanded = packed >> 63
+        mov rdx, r8;
+        shr rdx, 63;
+
+        // Leaf?  (child_count == 0)
+        cmp rcx, 0;
+        je  tr_dr_prefix_leaf;
+
+        // Has children: expanded or collapsed?
+        cmp rdx, 0;
+        je  tr_dr_prefix_collapsed;
+
+        // Expanded: ▼
+        mov r9, 0x00BC96E2;              // TREE_GLYPH_EXPANDED
+        jmp tr_dr_prefix_write;
+
+      tr_dr_prefix_collapsed:
+        // Collapsed: ▶
+        mov r9, 0x00B696E2;              // TREE_GLYPH_COLLAPSED
+        jmp tr_dr_prefix_write;
+
+      tr_dr_prefix_leaf:
+        // Leaf: fill's space already occupies the prefix cell. Just
+        // advance col_pos by 1 and fall through to the separator step.
+        mov rax, [rsp + 1088];
+        add rax, 1;
+        mov [rsp + 1088], rax;
+        jmp tr_dr_after_prefix;
+
+      tr_dr_prefix_write:
+        // Bounds gate: col_pos < bw?
+        mov rax, [rsp + 1088];
+        mov rcx, [rsp + 1040];           // bw
+        cmp rax, rcx;
+        jae tr_dr_row_done;
+
+        // dst = buf + (row_y * cols + bx + col_pos) * 16
+        mov rax, [rsp + 1104];
+        imul rax, r12;
+        mov rcx, [rsp + 1024];
+        add rax, rcx;
+        mov rcx, [rsp + 1088];
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Overlay the 3-byte glyph in one dword store (sym slot only).
+        // Fg/bg/mods bytes 4..11 stay from the fill phase.
+        mov_d [rax + 0], r9;
+
+        mov rax, [rsp + 1088];
+        add rax, 1;
+        mov [rsp + 1088], rax;           // col_pos++
+
+      tr_dr_after_prefix:
+        // Separator space (already filled by the fill phase).
+        mov rax, [rsp + 1088];
+        add rax, 1;
+        mov [rsp + 1088], rax;
+
+        // ---- Label bytes ------------------------------------------------
+        // r10 = node still live from the emit prologue.
+        mov r8, [r10 + 0];               // label_ptr
+        mov r9, [r10 + 8];               // label_len
+        xor rcx, rcx;                    // i = 0
+
+      tr_dr_label_top:
+        // i < label_len ?
+        cmp rcx, r9;
+        jae tr_dr_row_done;
+
+        // col_pos < bw ?
+        mov rax, [rsp + 1088];
+        mov rdx, [rsp + 1040];           // bw
+        cmp rax, rdx;
+        jae tr_dr_row_done;
+
+        // Load byte (zero-extend defensively).
+        xor rdx, rdx;
+        mov_b rdx, [r8 + rcx + 0];
+
+        // dst = buf + (row_y * cols + bx + col_pos) * 16
+        mov rax, [rsp + 1104];
+        imul rax, r12;
+        mov rdi, [rsp + 1024];           // bx (temp scratch)
+        add rax, rdi;
+        mov rdi, [rsp + 1088];           // col_pos
+        add rax, rdi;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Overlay the byte in one dword store; sym high 3 bytes cleared
+        // (rdx was zero-extended). Fg/bg/mods bytes 4..11 stay from fill.
+        mov_d [rax + 0], rdx;
+
+        // i++
+        add rcx, 1;
+        // col_pos++
+        mov rax, [rsp + 1088];
+        add rax, 1;
+        mov [rsp + 1088], rax;
+        jmp tr_dr_label_top;
+
+      tr_dr_row_done:
+        // Bump counters and loop.
+        mov rax, [rsp + 1080];
+        add rax, 1;
+        mov [rsp + 1080], rax;           // rendered++
+
+        mov rax, [rsp + 1072];
+        add rax, 1;
+        mov [rsp + 1072], rax;           // emit_count++
+        jmp tr_dr_loop_top;
+
+        // ====================================================================
+        // Return paths
+        // ====================================================================
+      tr_dr_ret_ok:
+        xor rax, rax;
+        jmp tr_dr_epilogue;
+
+      tr_dr_ret_too_deep:
+        // TREE_ERR_TOO_DEEP = 0xFFFFEBE3 (> 0x7FFFFFFF; movabs, mov-only).
+        mov rax, 0xFFFFEBE3;
+        jmp tr_dr_epilogue;
+
+      tr_dr_epilogue:
+        add rsp, 1152;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tree_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a TreeView@0.1 semantic-pipe record into [dst..dst+40). The
+  // record shape is fixed (no variable-length trailer) at v1, so
+  // record_len is always TRVW_HEADER_BYTES = 40 and no zero-pad step
+  // is needed (40 is already 8-byte aligned).
+  //
+  // The actual `semantic_pipe::send_record` call is deferred to
+  // postui.M2-009 (see list_view_pack's module header for the same
+  // deferral rationale). This packer is the wire-format authority so
+  // the M2-009 registry glue only has to know:
+  //   - the schema name string TRVW_SCHEMA_NAME (for BLAKE3 hashing)
+  //   - tree_view_pack (for the byte payload)
+  // and does not have to re-derive the offset table.
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return, rcx = state_ptr scratch,
+  // rdx = offset scratch. Pure leaf: no callee-save touched, no
+  // push/pop, no nested call. Effect `!{mem}` (reads through rdi,
+  // writes through rsi).
+  //
+  // Labels prefixed tr_vp_ per docs fingerprint discipline:
+  //   tr_vp_no_state    state_ptr == 0 (offset = 0 default)
+  //   tr_vp_state_ok    state loaded
+  // ==========================================================================
+  pub let tree_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M4-002 (postui#28): tree_view_pack lays a TreeView@0.1 record at [rsi..rsi+40). Header phase: `mov rax, 0x57565254; mov_d [rsi+0], rax` stamps the TRVW magic (0x57565254 = 1_465_800_276 fits imm32 as a positive value so paideia-as emits the compact 5-byte mov r32, imm32 form, not the 10-byte movabs). record_len is fixed at 40: `mov rax, 40; mov_d [rsi+4], rax` (imm32-safe). The packed Rect at [rdi+0] copies verbatim to [rsi+8] (same wire as any other TreeView/ListView/BlockView rect_pack). Load state_ptr from [rdi+24]; if 0, offset = 0 (via xor rdx, rdx), else offset = [state+0]. Store offset at [rsi+16]. Copy selected_ptr from [rdi+16] to [rsi+24] verbatim, and root_ptr from [rdi+8] to [rsi+32] verbatim. Return 40 in rax. Every immediate (0, 4, 8, 16, 24, 32, 40, 0x57565254) fits imm32. No `test`, no `imul`, no `and reg,imm64`, no `lea`. No mov_b (no byte loads). Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (reads through rdi and optionally state_ptr, writes through rsi). Labels prefixed tr_vp_ per docs fingerprint discipline.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57565254;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] --------------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (8 bytes) at [rsi + 8] ---------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- offset (u64) at [rsi + 16] -----------------------------------
+        mov rcx, [rdi + 24];             // state_ptr
+        cmp rcx, 0;
+        je  tr_vp_no_state;
+
+        mov rdx, [rcx + 0];              // offset
+        jmp tr_vp_state_ok;
+
+      tr_vp_no_state:
+        xor rdx, rdx;                    // offset = 0
+
+      tr_vp_state_ok:
+        mov [rsi + 16], rdx;
+
+        // ---- selected_ptr (u64) at [rsi + 24] -----------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 24], rax;
+
+        // ---- root_ptr (u64) at [rsi + 32] ---------------------------------
+        mov rax, [rdi + 8];
+        mov [rsi + 32], rax;
+
+        // ---- record_len return -------------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
