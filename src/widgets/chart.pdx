@@ -1,0 +1,884 @@
+// src/widgets/chart.pdx -- postui.M3-005 (paideia-os/postui#24)
+//
+// Chart widget: N datasets over a shared axis, each dataset rendered
+// as a Bresenham line (kind = 0) or scattered markers (kind = 1), with
+// axis mapping done in Q32.32 Fixed64 arithmetic via fx_sub/fx_scale.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M3-005)
+// =============================================================================
+//
+// Chart is the 9th ordinal (WK_CHART = 8, see src/widget_kind.pdx L130)
+// and the fifth widget-body landing in the M3 batch after Fixed64 (M3-
+// 001), Gauge (M3-002), Sparkline (M3-003), and BarChart (M3-004). It
+// is the first M3 widget that composes with the Fixed64 module -- the
+// axis mapping is a two-step Q32.32 scale (delta, then multiply by the
+// axis pixel span, then divide by the domain range) and is the reason
+// docs/design.md §1.4 selected Q32.32 as the postui fixed-point wire
+// in the first place.
+//
+// This file ships:
+//   - The Dataset state record (32-byte struct laid out in memory; see
+//     WIRE block below).
+//   - The ChartSpec state record (72 bytes = rect + 8 u64 slots).
+//   - The line glyph (full block █) and default scatter marker (·)
+//     as u32 UTF-8-packed constants.
+//   - chart_draw: the widget_draw-shape entry that iterates datasets,
+//     scales each point through Fixed64, and stamps cells (Bresenham
+//     for lines, single-cell stamp for scatter markers).
+//   - chart_view_pack: pack a ChartView@0.1 semantic-pipe record into
+//     caller-provided memory (M2-009 / M5 wires the actual send_record).
+//
+// =============================================================================
+// DATASET WIRE (32 bytes, CHART_DATASET_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   points_ptr    u64 pointer to point array (Fixed64 x/y pairs;
+//                                stride 16 bytes: (x u64, y u64) per point)
+//   [+8..+16)  point_count   u64 number of points in the array
+//   [+16..+24) kind          u64 dataset kind (0 = Line, 1 = Scatter)
+//   [+24..+32) marker        u64 packed u32 UTF-8 char for Scatter dots
+//                                (0 selects the default '·' 0x0000B7C2)
+//
+// 32 bytes fits exactly half a cache line and makes dataset_cursor
+// stride a simple `add cursor, 32` per outer iteration.
+//
+// =============================================================================
+// CHARTSPEC WIRE (72 bytes, CHART_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect             u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  datasets_ptr     u64 pointer to Dataset[dataset_count]
+//   [+16..+24) dataset_count    u64
+//   [+24..+32) x_min            u64 Fixed64 (Q32.32 raw) x-axis lower bound
+//   [+32..+40) x_max            u64 Fixed64 x-axis upper bound
+//   [+40..+48) y_min            u64 Fixed64 y-axis lower bound
+//   [+48..+56) y_max            u64 Fixed64 y-axis upper bound
+//   [+56..+64) style_line       u64 Style-packed (fg | bg<<24 | mods<<48)
+//                                    -- used for line cells AND scatter marker
+//                                    cells at v1 (a separate style_marker slot
+//                                    is a documented ChartSpec@0.2 extension)
+//   [+64..+72) style_axis       u64 Style-packed (reserved at v1; the axis
+//                                    render itself lands in the postui.M3-007
+//                                    axis-render follow-up; the slot is
+//                                    reserved so ChartSpec's wire is stable
+//                                    across M3-005..M3-007)
+//
+// 72 bytes rather than the issue text's aspirational "~96B" because
+// postui's Rect is a packed u64 (RECT_BYTES = 8, see src/rect.pdx L55),
+// same posture Sparkline / BarChart take when the issue text quoted a
+// 16-byte Rect. Every u64 slot sits on a natural 8-byte boundary and the
+// draw path loads each with a single qword mov.
+//
+// =============================================================================
+// AXIS MAPPING (Fixed64 → integer cell coordinate)
+// =============================================================================
+//
+// Given a point (x_fx, y_fx) in Fixed64 domain coordinates, target Rect
+// with (bx, by, bw, bh) integer bounds, and axis bounds (x_min, x_max,
+// y_min, y_max) in Fixed64:
+//
+//   delta_x = x_fx - x_min                    (Fixed64 subtract)
+//   range_x = x_max - x_min                   (Fixed64 subtract; if 0 skip)
+//   sx      = (delta_x * bw) / range_x        (integer column offset in [0, bw))
+//   x_cell  = bx + sx                          (absolute canvas column)
+//
+//   delta_y = y_fx - y_min
+//   range_y = y_max - y_min                   (if 0 skip)
+//   sy_col  = (delta_y * bh) / range_y        (integer row offset in [0, bh))
+//   sy      = bh - 1 - sy_col                 (invert -- terminal y grows down)
+//   y_cell  = by + sy
+//
+// The (delta * pixel_span) / range compute is done via Fixed64::fx_scale,
+// which is exactly the (fx * num / den) shape the module was designed
+// for. That gives us:
+//
+//   fx_scale(delta_x_fx, bw, range_x_fx)
+//     = (delta_x_raw * bw) / range_x_raw
+//     = (delta_x * 2^32) * bw / (range_x * 2^32)
+//     = delta_x * bw / range_x                (integer column offset)
+//
+// The Q32.32 raw representation of both delta and range have the same
+// 2^32 factor, which cancels in the division. The intermediate
+// (delta_x_raw * bw) uses paideia-as's 2-op `imul reg, reg` (low 64 bits
+// only); for typical chart domains (|delta_x| bounded by |range_x|,
+// which is bounded by ~2^15 as an integer for realistic axes) the
+// intermediate product magnitude is ~2^47 * 2^16 = 2^63, comfortably
+// inside u64. For chart data with much larger integer parts (e.g.
+// timestamps in nanoseconds), the caller should pre-scale to smaller
+// units before passing to Chart, matching the guidance every fixed-
+// point terminal chart module gives.
+//
+// fx_scale returns the sentinel FX_ERR_SCALE_BAD_DEN (0xFFFFEBD1) if
+// den == 0; that value is ~4.29 GB as an unsigned integer, so the
+// `cmp sx, bw; jae skip` bounds check naturally treats it as
+// out-of-bounds and skips the point. The chart_draw prologue also
+// early-returns 0 if range_x == 0 OR range_y == 0, so the sentinel path
+// is defensive not primary.
+//
+// Bounds: `cmp sx, bw; jae skip` is an UNSIGNED compare. A negative
+// signed sx (e.g. x_fx < x_min gives a negative fx_scale result) becomes
+// a huge unsigned value that also fails the jae -- one compare catches
+// both "below the domain minimum" and "above the domain maximum".
+//
+// =============================================================================
+// BRESENHAM (integer, sign-mask-idiom absolute values)
+// =============================================================================
+//
+// For Line datasets the draw path connects consecutive points via
+// Bresenham's line algorithm in the (adx, -ady) form (Bresenham, 1965;
+// Foley, van Dam, Feiner, Hughes 1990, §3.2.2). This avoids any signed
+// multiply and works with paideia-as's `sar reg, imm` sign-mask idiom
+// for absolute value:
+//
+//   adx     = |cx - px|     (via `mov m,dx; sar m,63; xor dx,m; sub dx,m`)
+//   ady     = |cy - py|     (same idiom)
+//   neg_ady = 0 - ady       (compute-negate; no `neg` mnemonic; matches
+//                            scroll_axis_ingest_raw's discipline at
+//                            src/user/input_server/scroll_axis.pdx L725-739)
+//   step_x  = sign(cx - px) in {-1, 0, +1}
+//   step_y  = sign(cy - py)
+//   err     = adx - ady
+//
+//   loop:
+//     stamp cell at (x_cur, y_cur) with (line_word0, line_word1)
+//     if x_cur == cx && y_cur == cy: break
+//     e2 = err << 1
+//     if e2 > neg_ady: err += neg_ady; x_cur += step_x    (i.e. err -= ady)
+//     if e2 <  adx   : err += adx    ; y_cur += step_y
+//
+// The e2/neg_ady/adx compares are SIGNED (jg / jl). Since paideia-as
+// emits all standard conditional jumps (verified across the postui
+// codebase -- jae, jbe, jne, ja, jle patterns; jg/jl land here for the
+// first time, matching the x86_64 assembler's standard mnemonic set),
+// this is safe.
+//
+// Both endpoints are ALREADY inside the Rect (the per-point bounds
+// check ran before Bresenham stores prev_sx/prev_sy), so Bresenham's
+// interpolated cells stay inside too -- no clipping is needed inside the
+// loop. If a point in a Line dataset is skipped by the bounds check
+// (out-of-domain), has_prev is reset to 0 so the next in-bounds point
+// starts a fresh segment; we do NOT draw a straight line across a
+// domain gap that would falsely imply continuity.
+//
+// =============================================================================
+// STEP-SIGN COMPUTE (paideia-as-safe -1 load)
+// =============================================================================
+//
+// paideia-as's `mov reg, imm` accepts a small negative imm ONLY via a
+// sign-extending imm32 encoding, and the encoder audit surfaced at
+// src/kernel/boot/kernel_main.pdx does not consistently emit that path;
+// the safe compile-time-known "-1" idiom is `xor reg, reg; sub reg, 1`
+// which produces exactly 0xFFFFFFFFFFFFFFFF (= -1 signed). Two-insn
+// cost, one branch per direction. The chart_draw body uses this idiom
+// for both step_x and step_y sign selection.
+//
+// =============================================================================
+// CHARTVIEW@0.1 WIRE (semantic-pipe record, 40 bytes fixed)
+// =============================================================================
+//
+//   [+0..+4)   magic          u32 = 0x57564843 ("CHVW" LE:
+//                                    'C' 0x43, 'H' 0x48, 'V' 0x56, 'W' 0x57)
+//   [+4..+8)   record_len     u32 = 40 (fixed, already 8-aligned)
+//   [+8..+16)  rect           u64 verbatim from ChartSpec+0
+//   [+16..+24) dataset_count  u64 verbatim from ChartSpec+16
+//   [+24..+32) x_min          u64 Fixed64 verbatim from ChartSpec+24
+//   [+32..+40) y_min          u64 Fixed64 verbatim from ChartSpec+40
+//
+// x_max / y_max / datasets_ptr / style_line / style_axis are excluded:
+// - datasets_ptr is process-local (not portable across the pipe).
+// - x_max / y_max are omitted to keep the record compact; a downstream
+//   reader inferring axis SCALE has to walk the datasets anyway (the
+//   dataset points ARE the shape). x_min / y_min are retained because
+//   they anchor the domain origin, which most semantic-pipe consumers
+//   want to display alongside the plot.
+// - style_line / style_axis are visual-only skin, matching every prior
+//   *View@0.1 record's exclusion of style fields.
+//
+// record_len is fixed at 40 bytes (already 8-aligned) so no padding
+// loop is needed. If a future ChartView@0.2 adds x_max / y_max slots
+// it grows to 56 bytes; readers keying against magic + record_len
+// self-describe the extension.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Chart`), matches file basename
+//     (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 0,
+//     1, 2, 8, 16, 32, 40, 48, 56, 64, shift counts <= 63. The error
+//     sentinel CHT_ERR_BAND (0xFFFFEBD5), the CHVW magic (0x57564843),
+//     the line glyph (0x008896E2), and the default marker (0x0000B7C2)
+//     all fit imm32 signed positive so paideia-as emits the compact
+//     5-byte `mov r32, imm32` form. No `cmp reg, imm64` and no
+//     `and reg, imm64` anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is 2-op
+//     `imul reg, reg`. All *16 cell-address scaling folds to `shl reg, 4`.
+//   - No `neg` mnemonic anywhere -- absolute values via the
+//     `mov m,r; sar m,63; xor r,m; sub r,m` idiom, negate via
+//     `xor r,r; sub r, other` (yields -other).
+//   - Cross-module bare `call fx_sub` / `call fx_scale` per the
+//     Text::line_break_positions precedent (src/widgets/paragraph.pdx
+//     L606) -- paideia-as's linker resolves module-exported symbols by
+//     bare name, no need to qualify.
+//   - chart_draw pushes 5 SysV callee-save regs (rbx, r12, r13, r14, r15)
+//     = 40 bytes plus `sub rsp, 192` for state scratch. Entry rsp%16==8,
+//     +40==48 (aligned), +192==240 (aligned). Body issues several nested
+//     `call fx_*` invocations; the aligned rsp at each is a hard
+//     requirement of SysV and is preserved by the fixed-size stack frame.
+//     fx_* are pure leaves that promise `!{} @{}`, but per SysV every
+//     caller-save register (rax, rcx, rdx, rsi, rdi, r8..r11) is treated
+//     as clobbered across the call boundary -- state that must survive
+//     lives in callee-save regs (rbx, r12, r13, r14, r15) or on stack.
+//   - chart_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save regs,
+//     matching every earlier *_view_pack shape.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments; chart_draw additionally reads the
+//     Dataset and points arrays through the outer/inner loops). No cap /
+//     sysreg effect.
+//   - Labels prefixed `ch_` per docs/design.md fingerprint discipline
+//     (ch_ret_ok / ch_ret_zero epilogues; ch_ds_ for the outer dataset
+//     loop; ch_pt_ for the inner point loop; ch_br_ for the Bresenham
+//     block; ch_sx_ / ch_sy_ for the step-sign compute; ch_bv_ reserved
+//     for the view packer).
+
+module Chart = structure {
+
+  // ==========================================================================
+  // Dataset layout (32 bytes)
+  // ==========================================================================
+  pub let CHART_DATASET_BYTES     : u64 = 32
+
+  pub let CHART_DS_OFF_POINTS_PTR : u64 = 0
+  pub let CHART_DS_OFF_POINT_CNT  : u64 = 8
+  pub let CHART_DS_OFF_KIND       : u64 = 16
+  pub let CHART_DS_OFF_MARKER     : u64 = 24
+
+  pub let CHART_DS_KIND_LINE      : u64 = 0
+  pub let CHART_DS_KIND_SCATTER   : u64 = 1
+
+  // Point stride: (x u64, y u64) = 16 bytes.
+  pub let CHART_POINT_BYTES       : u64 = 16
+
+  // ==========================================================================
+  // ChartSpec layout (72 bytes)
+  // ==========================================================================
+  pub let CHART_SPEC_BYTES        : u64 = 72
+
+  pub let CHART_OFF_RECT          : u64 = 0
+  pub let CHART_OFF_DATASETS_PTR  : u64 = 8
+  pub let CHART_OFF_DATASET_CNT   : u64 = 16
+  pub let CHART_OFF_X_MIN         : u64 = 24
+  pub let CHART_OFF_X_MAX         : u64 = 32
+  pub let CHART_OFF_Y_MIN         : u64 = 40
+  pub let CHART_OFF_Y_MAX         : u64 = 48
+  pub let CHART_OFF_STYLE_LINE    : u64 = 56
+  pub let CHART_OFF_STYLE_AXIS    : u64 = 64
+
+  // ==========================================================================
+  // Glyph constants (3-byte UTF-8 packed into u32 dword slot for the
+  // full block, 2-byte UTF-8 for the default middle-dot marker).
+  // Both fit imm32 (< 0x80000000) so paideia-as emits `mov r32, imm32`.
+  // ==========================================================================
+  //
+  // Line glyph:      █  (U+2588)  bytes 0xE2 0x96 0x88  ->  0x008896E2
+  // Default marker:  ·  (U+00B7)  bytes 0xC2 0xB7        ->  0x0000B7C2
+  //
+  // The default marker is a 2-byte UTF-8 sequence (not 3-byte), so
+  // bytes [2..4) of the symbol slot are zero -- the cell-write path
+  // stores a full u64 word so the trailing zero pad clears any stale
+  // multi-byte residue in the symbol slot.
+  pub let CHART_GLYPH_LINE        : u64 = 0x008896E2
+  pub let CHART_MARKER_DEFAULT    : u64 = 0x0000B7C2
+
+  // ==========================================================================
+  // ChartView@0.1 semantic-pipe wire (see WIRE block above)
+  //
+  // MAGIC 0x57564843 = "CHVW" LE (byte 0 = 'C' 0x43, byte 1 = 'H' 0x48,
+  // byte 2 = 'V' 0x56, byte 3 = 'W' 0x57). Fits imm32 signed positive.
+  // ==========================================================================
+  pub let CHVW_MAGIC              : u64 = 0x57564843
+  pub let CHVW_RECORD_LEN         : u64 = 40
+  pub let CHVW_OFF_MAGIC          : u64 = 0
+  pub let CHVW_OFF_RECORD_LEN     : u64 = 4
+  pub let CHVW_OFF_RECT           : u64 = 8
+  pub let CHVW_OFF_DATASET_CNT    : u64 = 16
+  pub let CHVW_OFF_X_MIN          : u64 = 24
+  pub let CHVW_OFF_Y_MIN          : u64 = 32
+
+  // Schema name string (18 bytes including trailing null). Matches the
+  // BarChartView@0.1 / SparklineView@0.1 pattern. Consumed by a future
+  // semantic_registry.pdx revision that BLAKE3-hashes the string for
+  // the wire schema-hash slot.
+  pub let CHVW_SCHEMA_NAME        : [u8; 14] = "ChartView@0.1\0"
+  pub let CHVW_SCHEMA_NAME_LEN    : u64 = 13
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x55 offset = 0xFFFFEBD5, within the M3 sub-band 0xFFFFEBD0..
+  // 0xFFFFEBDF. Sits after Fixed64 (0xFFFFEBD0..1), Gauge (0xFFFFEBD2),
+  // Sparkline (0xFFFFEBD3), BarChart (0xFFFFEBD4) -- Chart takes
+  // 0xFFFFEBD5 by ordinal position in the M3 catalog. > 0x7FFFFFFF so
+  // `mov reg, imm` emits movabs (10-byte imm64); NEVER usable in cmp/and.
+  //
+  // At v1 no chart_draw path returns this -- the body accepts any spec
+  // (a rect of 0x0 returns 0 with no cells written; range_x == 0 or
+  // range_y == 0 short-circuits to an empty draw; dataset_count == 0
+  // and point_count == 0 short-circuit similarly). The sentinel is
+  // reserved for a future revision that may want to trap e.g. a rect
+  // that overflows the canvas.
+  // ==========================================================================
+  pub let CHT_ERR_BAND : u64 = 0xFFFFEBD5
+
+  // ==========================================================================
+  // chart_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (matches WidgetKind::widget_draw dispatch,
+  // src/widget_kind.pdx L216). `rows` is unread (back region starts at
+  // buf_ptr+0). Returns 0 (OK) in every non-trivially-empty case.
+  //
+  // Draw sequence:
+  //   Phase 0 (prologue): cache invariants (rbx=buf_ptr, r12=cols,
+  //     r13=spec_ptr); extract rect fields (bx/by/bw/bh) into stack;
+  //     early-return 0 if bw==0 or bh==0.
+  //   Phase 1 (axis precompute): load x_min / y_min into stack; compute
+  //     x_range = fx_sub(x_max, x_min) and y_range = fx_sub(y_max, y_min)
+  //     via cross-module calls; early-return 0 if either range is 0.
+  //     Precompute line_word0 = CHART_GLYPH_LINE | style_high and
+  //     line_word1 = style_high2 (the two Cell wire halves).
+  //   Phase 2 (dataset loop): iterate datasets [0..dataset_count):
+  //     load points_ptr, point_count, kind, marker; precompute
+  //     scatter_word0 = marker_or_default | style_high; reset has_prev.
+  //     Inner point loop:
+  //       - Compute point address = points_ptr + point_idx * 16.
+  //       - Load x_fx, y_fx from point.
+  //       - Compute sx via delta_x = fx_sub(x_fx, x_min) then
+  //         sx = fx_scale(delta_x, bw, x_range). Bounds check: `cmp sx, bw;
+  //         jae skip` catches both negative and >= bw (unsigned compare
+  //         collapses both cases).
+  //       - Compute sy_col via the y-axis analog, then invert:
+  //         sy = bh - 1 - sy_col.
+  //       - Compute cur_sx_abs = bx + sx, cur_sy_abs = by + sy.
+  //       - Dispatch on kind: Scatter -> stamp single cell with
+  //         (scatter_word0, line_word1); Line -> if has_prev, Bresenham
+  //         from (prev_sx, prev_sy) to (cur_sx_abs, cur_sy_abs); else
+  //         stamp single cell. Update prev_sx/prev_sy/has_prev.
+  //       - On skip, reset has_prev = 0 (do not connect across gaps).
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 192; entry rsp%16==8,
+  // +40==48 aligned, +192==240 aligned -- ready for the fx_* nested
+  // calls whose SysV contract requires rsp%16==0 at the call insn):
+  //   rbx = buf_ptr (preserved across fx_* calls)
+  //   r12 = cols
+  //   r13 = spec_ptr (referenced through the dataset/point loops for
+  //                    field loads; kept live for the whole body)
+  //   r14 = repurposed scratch (unused across fx_* boundaries in the
+  //          outer-loop path)
+  //   r15 = repurposed scratch
+  //   Stack scratch (192 bytes = 24 slots x 8 B):
+  //     [rsp+  0] bx                 [rsp+  8] by
+  //     [rsp+ 16] bw                 [rsp+ 24] bh
+  //     [rsp+ 32] x_min (fx)         [rsp+ 40] x_range (fx)
+  //     [rsp+ 48] y_min (fx)         [rsp+ 56] y_range (fx)
+  //     [rsp+ 64] dataset_count      [rsp+ 72] dataset_idx
+  //     [rsp+ 80] points_ptr         [rsp+ 88] point_count
+  //     [rsp+ 96] point_idx          [rsp+104] kind
+  //     [rsp+112] line_word0         [rsp+120] line_word1
+  //     [rsp+128] scatter_word0      [rsp+136] prev_sx (Line)
+  //     [rsp+144] prev_sy            [rsp+152] has_prev
+  //     [rsp+160] cur_sx_abs         [rsp+168] cur_sy_abs
+  //     [rsp+176] bres_step_x        [rsp+184] bres_step_y
+  //
+  // Labels prefixed ch_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let chart_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-005 (postui#24): chart_draw is the widget_draw-shape entry for WK_CHART (8). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 192 (24 x 8 slots of chart / axis / dataset / point / bresenham scratch; keeps rsp%16==0 for the nested fx_* calls). Phase 0: cache buf_ptr in rbx, cols in r12, spec_ptr in r13; load [r13+0] (packed rect) once, extract bx (and rax, 0xFFFF), by (shr 16 + and 0xFFFF), bw (shr 32 + and 0xFFFF), bh (shr 48) into [rsp+0..24]; early-return 0 (xor rax + unwind) if bw==0 or bh==0. Phase 1: load x_min from [r13+24] into [rsp+32]; load x_max, call fx_sub(x_max, x_min) (rdi=x_max, rsi=x_min per SysV), store result to [rsp+40] (x_range); load y_min from [r13+40] into [rsp+48]; load y_max, call fx_sub, store to [rsp+56] (y_range). Early-return if x_range==0 or y_range==0 (degenerate axis). Load style_line from [r13+56]; compute style_high = ((s & 0xFFFFFF) << 32) | (((s >> 24) & 0xFF) << 56) via mask/shift/or chain (immediates 0xFFFFFF, 0xFF and shift counts 24/32/56 all fit imm32/imm8); word1 = ((s >> 32) & 0xFFFF) | (((s >> 48) & 0xFF) << 16). Bake line_word0 = 0x008896E2 | style_high into [rsp+112], line_word1 into [rsp+120]. Cache dataset_count from [r13+16] into [rsp+64], initialize dataset_idx = 0 in [rsp+72]. Phase 2 (dataset loop ch_ds_loop): if dataset_idx >= dataset_count -> jmp ch_ret_ok. Compute dataset address = [r13+8] + dataset_idx * 32 (into a scratch reg via mov + shl 5 or via `imul rax, 32` staged in another reg -- avoided imm-imul: use `mov r8, dataset_idx; shl r8, 5; add r8, [r13+8]`). Load points_ptr from [ds+0] into [rsp+80]; point_count from [ds+8] into [rsp+88]; kind from [ds+16] into [rsp+104]; marker from [ds+24]; if marker == 0 -> use CHART_MARKER_DEFAULT (0x0000B7C2); bake scatter_word0 = marker | style_high into [rsp+128]. Reset has_prev = 0 in [rsp+152] and point_idx = 0 in [rsp+96]. Phase 3 (point loop ch_pt_loop): if point_idx >= point_count -> advance dataset (add [rsp+72], 1; jmp ch_ds_loop after the point loop closes). Load point address = points_ptr + point_idx * 16 via `mov r8, point_idx; shl r8, 4; add r8, points_ptr`; load x_fx = [pt+0] into r9; y_fx = [pt+8] into r10. Compute sx: call fx_sub(x_fx, x_min) -> delta_x in rax; call fx_scale(delta_x, bw, x_range) -> sx (as raw signed integer) in rax. Bounds check `cmp rax, [rsp+16]; jae ch_pt_skip` (unsigned compare -- catches negative-signed-as-huge AND >= bw AND the FX_ERR_SCALE_BAD_DEN sentinel 0xFFFFEBD1); store rax to [rsp+160]. Reload point address (points_ptr and point_idx are on stack, both preserved across fx_* calls; y_fx must be re-loaded from [pt+8]). Compute sy_col: call fx_sub(y_fx, y_min) -> delta_y; call fx_scale(delta_y, bh, y_range) -> sy_col. Bounds check `cmp rax, [rsp+24]; jae ch_pt_skip`. Invert: `mov r8, [rsp+24]; sub r8, 1; sub r8, rax`; store into [rsp+168] (sy = bh - 1 - sy_col). Compute cur_sx_abs = bx + sx, cur_sy_abs = by + sy: `mov r9, [rsp+0]; add r9, [rsp+160]; mov [rsp+160], r9` (repurpose the cur_sx slot to hold absolute coord); same for cur_sy_abs into [rsp+168]. Dispatch on kind: cmp [rsp+104], 1; je ch_pt_scatter. Line path: cmp [rsp+152], 0; je ch_pt_line_first; call inline Bresenham from (prev_sx, prev_sy) to (cur_sx_abs, cur_sy_abs). Bresenham inline (ch_br_ labels): load endpoints, compute adx/ady via sign-mask (mov m,r; sar m,63; xor r,m; sub r,m); compute step_x / step_y via cmp/jg/jl chain with the paideia-as-safe `xor r,r; sub r,1` idiom for -1; err = adx - ady; neg_ady = 0 - ady (xor + sub); loop: stamp cell at (rcx, rdx) with (line_word0, line_word1) via `mov rax, rdx; imul rax, r12; add rax, rcx; shl rax, 4; add rax, rbx; mov r11, [rsp+112]; mov [rax+0], r11; mov r11, [rsp+120]; mov [rax+8], r11`; endpoint check `cmp rcx, [rsp+160]; jne ch_br_step; cmp rdx, [rsp+168]; je ch_br_done`; step compute e2 = err << 1 via `mov rax, r8; shl rax, 1`; if e2 > neg_ady: err += neg_ady (add r8, r9); x_cur += step_x (add rcx, [rsp+176]); if e2 < adx: err += adx (add r8, rsi); y_cur += step_y (add rdx, [rsp+184]); loop. After Bresenham: update prev_sx/prev_sy from cur, set has_prev = 1. ch_pt_line_first: stamp single cell at (cur_sx_abs, cur_sy_abs) using line_word0/line_word1; set prev_sx/prev_sy/has_prev. ch_pt_scatter: stamp single cell using scatter_word0/line_word1; do NOT set has_prev (scatter datasets have no line continuity). ch_pt_skip: reset has_prev = 0 (do not connect across skipped points). Advance point_idx; jmp ch_pt_loop. Epilogue ch_ret_ok: xor rax, rax; add rsp, 192; pop r15/r14/r13/r12/rbx (reverse); ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0, 1, 2, 4, 5, 8, 16, 32, 40, 48, 56, 63) fits imm32/imm8; the four large constants (CHT_ERR_BAND 0xFFFFEBD5 loaded only as sentinel-if-needed, CHVW magic 0x57564843, line glyph 0x008896E2, default marker 0x0000B7C2) all fit imm32 signed positive so `mov r32, imm32` (compact 5-byte form) suffices. 2-op imul is only ever reg,reg (never reg,imm). No `test`, no `neg`, no `cmp reg, imm64`, no `and reg, imm64`. Cross-module bare `call fx_sub` / `call fx_scale` per the Text::line_break_positions precedent (src/widgets/paragraph.pdx L606). SysV: rsp%16==0 at each call (5 pushes + 192 keeps invariant; caller-save regs treated as clobbered across every call boundary; every value we need to survive lives in callee-save regs or stack). Effect `!{mem}` (dataset + point + spec + stack reads; cell writes to the buffer). Labels prefixed ch_ per docs fingerprint discipline (ch_ret_ok epilogue; ch_ds_loop / ch_ds_next outer dataset iteration; ch_pt_loop / ch_pt_skip / ch_pt_scatter / ch_pt_line_first / ch_pt_next inner point iteration; ch_sx_pos / ch_sx_neg / ch_sx_done / ch_sy_pos / ch_sy_neg / ch_sy_done step-sign compute; ch_br_loop / ch_br_step / ch_br_no_x / ch_br_no_y / ch_br_done Bresenham block; ch_mk_default marker-defaulting).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 192;
+
+        // ---- Prologue: cache invariants ----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+
+        // ---- Extract bx/by/bw/bh from packed rect at [r13+0] -------------
+        mov r14, [r13 + 0];               // r14 = packed rect (scratch)
+
+        mov rax, r14;
+        and rax, 0xFFFF;
+        mov [rsp + 0], rax;               // bx
+
+        mov rax, r14;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 8], rax;               // by
+
+        mov rax, r14;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 16], rax;              // bw
+
+        mov rax, r14;
+        shr rax, 48;
+        mov [rsp + 24], rax;              // bh
+
+        // ---- Early-return on zero-sized rect -----------------------------
+        cmp rax, 0;
+        je  ch_ret_ok;
+        mov rax, [rsp + 16];
+        cmp rax, 0;
+        je  ch_ret_ok;
+
+        // =====================================================================
+        // Phase 1: axis precompute (x_min, x_range, y_min, y_range)
+        // =====================================================================
+
+        // ---- x_min ----
+        mov rax, [r13 + 24];
+        mov [rsp + 32], rax;
+
+        // ---- x_range = fx_sub(x_max, x_min) ----
+        mov rdi, [r13 + 32];              // rdi = x_max
+        mov rsi, [rsp + 32];              // rsi = x_min
+        call fx_sub;
+        mov [rsp + 40], rax;              // x_range
+
+        // Guard: x_range == 0 -> degenerate x-axis, empty draw
+        cmp rax, 0;
+        je  ch_ret_ok;
+
+        // ---- y_min ----
+        mov rax, [r13 + 40];
+        mov [rsp + 48], rax;
+
+        // ---- y_range = fx_sub(y_max, y_min) ----
+        mov rdi, [r13 + 48];              // rdi = y_max
+        mov rsi, [rsp + 48];              // rsi = y_min
+        call fx_sub;
+        mov [rsp + 56], rax;              // y_range
+
+        cmp rax, 0;
+        je  ch_ret_ok;
+
+        // ---- Precompute line_word0 / line_word1 from style_line ----------
+        // style_high = ((s & 0xFFFFFF) << 32) | (((s >> 24) & 0xFF) << 56)
+        mov r10, [r13 + 56];              // r10 = style_line
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r10;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rcx, rax;                     // rcx = style_high (kept live)
+
+        // line_word0 = CHART_GLYPH_LINE | style_high
+        mov rax, 0x008896E2;
+        or  rax, rcx;
+        mov [rsp + 112], rax;
+
+        // line_word1 = ((s >> 32) & 0xFFFF) | (((s >> 48) & 0xFF) << 16)
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rdx, r10;
+        shr rdx, 48;
+        and rdx, 0xFF;
+        shl rdx, 16;
+        or  rax, rdx;
+        mov [rsp + 120], rax;
+
+        // Stash style_high in [rsp+128] temporarily; the scatter_word0
+        // slot is (re)written per-dataset from this at the top of every
+        // dataset loop iteration. This lets us pre-bake the shared
+        // style_high once and re-use it per dataset without recomputing
+        // it from the raw style word each time.
+        mov [rsp + 128], rcx;             // style_high (transient)
+
+        // ---- Cache dataset_count and initialize dataset_idx --------------
+        mov rax, [r13 + 16];              // dataset_count
+        mov [rsp + 64], rax;
+
+        xor rax, rax;
+        mov [rsp + 72], rax;              // dataset_idx = 0
+
+        // =====================================================================
+        // Phase 2: dataset loop
+        // =====================================================================
+      ch_ds_loop:
+        mov rax, [rsp + 72];              // dataset_idx
+        mov rdx, [rsp + 64];              // dataset_count
+        cmp rax, rdx;
+        jae ch_ret_ok;
+
+        // ds_addr = [r13+8] + dataset_idx * 32
+        mov r8, rax;
+        shl r8, 5;                        // dataset_idx * 32
+        add r8, [r13 + 8];                // r8 = ds_addr
+
+        // Load dataset fields into stack.
+        mov r9, [r8 + 0];                 // points_ptr
+        mov [rsp + 80], r9;
+        mov r9, [r8 + 8];                 // point_count
+        mov [rsp + 88], r9;
+        mov r9, [r8 + 16];                // kind
+        mov [rsp + 104], r9;
+        mov r9, [r8 + 24];                // marker (u64; low 32 = u32 UTF-8)
+
+        // If marker == 0, use CHART_MARKER_DEFAULT.
+        cmp r9, 0;
+        jne ch_mk_ok;
+        mov r9, 0x0000B7C2;
+      ch_mk_ok:
+
+        // scatter_word0 = marker | style_high (style_high still in
+        // [rsp+128] from Phase 1; reload, OR, store back).
+        mov rax, [rsp + 128];             // style_high
+        or  rax, r9;                      // rax = scatter_word0
+        mov [rsp + 128], rax;             // now holds scatter_word0
+
+        // Reset has_prev and point_idx.
+        xor rax, rax;
+        mov [rsp + 152], rax;             // has_prev = 0
+        mov [rsp + 96], rax;              // point_idx = 0
+
+        // =====================================================================
+        // Phase 3: inner point loop
+        // =====================================================================
+      ch_pt_loop:
+        mov rax, [rsp + 96];              // point_idx
+        mov rdx, [rsp + 88];              // point_count
+        cmp rax, rdx;
+        jae ch_ds_next;
+
+        // pt_addr = points_ptr + point_idx * 16
+        mov r8, rax;
+        shl r8, 4;                        // point_idx * 16
+        add r8, [rsp + 80];               // r8 = pt_addr
+
+        // ---- Load x_fx into rdi, prepare fx_sub(x_fx, x_min) call --------
+        mov rdi, [r8 + 0];                // x_fx
+        mov rsi, [rsp + 32];              // x_min
+        call fx_sub;
+        // rax = delta_x_fx
+
+        // sx = fx_scale(delta_x_fx, bw, x_range)
+        mov rdi, rax;
+        mov rsi, [rsp + 16];              // bw
+        mov rdx, [rsp + 40];              // x_range
+        call fx_scale;
+        // rax = sx (signed integer as u64)
+
+        // Bounds check: 0 <= sx < bw (unsigned compare catches both
+        // negative-as-huge AND >= bw, as well as the FX_ERR sentinel).
+        // paideia-as: no `cmp reg, [mem]` — stage through r9.
+        mov r9, [rsp + 16];
+        cmp rax, r9;
+        jae ch_pt_skip;
+        mov [rsp + 160], rax;             // stash sx
+
+        // ---- Re-derive pt_addr and load y_fx (fx_* calls clobbered r8) --
+        mov r8, [rsp + 96];               // point_idx
+        shl r8, 4;
+        add r8, [rsp + 80];               // pt_addr
+        mov rdi, [r8 + 8];                // y_fx
+        mov rsi, [rsp + 48];              // y_min
+        call fx_sub;
+        // rax = delta_y_fx
+
+        // sy_col = fx_scale(delta_y_fx, bh, y_range)
+        mov rdi, rax;
+        mov rsi, [rsp + 24];              // bh
+        mov rdx, [rsp + 56];              // y_range
+        call fx_scale;
+        // rax = sy_col
+
+        // Bounds check (stage bh through r9 per encoder rules)
+        mov r9, [rsp + 24];
+        cmp rax, r9;
+        jae ch_pt_skip;
+
+        // sy = bh - 1 - sy_col
+        mov r8, [rsp + 24];               // bh
+        sub r8, 1;
+        sub r8, rax;
+        mov [rsp + 168], r8;              // sy (stash)
+
+        // cur_sx_abs = bx + sx
+        mov r9, [rsp + 0];                // bx
+        add r9, [rsp + 160];              // + sx
+        mov [rsp + 160], r9;              // repurpose slot -> cur_sx_abs
+
+        // cur_sy_abs = by + sy
+        mov r10, [rsp + 8];               // by
+        add r10, [rsp + 168];             // + sy
+        mov [rsp + 168], r10;             // repurpose slot -> cur_sy_abs
+
+        // ---- Dispatch on kind ---------------------------------------------
+        mov r8, [rsp + 104];
+        cmp r8, 1;
+        je  ch_pt_scatter;
+
+        // ---- Line path ----------------------------------------------------
+        mov r8, [rsp + 152];              // has_prev
+        cmp r8, 0;
+        je  ch_pt_line_first;
+
+        // ===================================================================
+        // Bresenham inline: (prev_sx, prev_sy) -> (cur_sx_abs, cur_sy_abs)
+        // ===================================================================
+        // Load running (x_cur, y_cur) from prev_sx/prev_sy.
+        mov rcx, [rsp + 136];             // x_cur = prev_sx
+        mov rdx, [rsp + 144];             // y_cur = prev_sy
+
+        // dx_signed = cx - px
+        mov r8, [rsp + 160];              // cur_sx_abs
+        sub r8, rcx;
+
+        // adx = |dx_signed| via sign-mask idiom -> rsi
+        mov rax, r8;
+        sar rax, 63;                      // rax = mask_x
+        mov rsi, r8;
+        xor rsi, rax;
+        sub rsi, rax;                     // rsi = adx (>= 0)
+
+        // step_x from sign(dx_signed) -> r11 -> [rsp+176]
+        xor r11, r11;
+        cmp r8, 0;
+        je  ch_sx_done;
+        mov r11, 1;
+        jg  ch_sx_done;
+        xor r11, r11;
+        sub r11, 1;                       // r11 = -1
+      ch_sx_done:
+        mov [rsp + 176], r11;             // bres_step_x
+
+        // dy_signed = cy - py
+        mov r9, [rsp + 168];              // cur_sy_abs
+        sub r9, rdx;
+
+        // ady = |dy_signed| via sign-mask idiom -> rdi
+        mov rax, r9;
+        sar rax, 63;
+        mov rdi, r9;
+        xor rdi, rax;
+        sub rdi, rax;                     // rdi = ady (>= 0)
+
+        // step_y from sign(dy_signed) -> r11 -> [rsp+184]
+        xor r11, r11;
+        cmp r9, 0;
+        je  ch_sy_done;
+        mov r11, 1;
+        jg  ch_sy_done;
+        xor r11, r11;
+        sub r11, 1;
+      ch_sy_done:
+        mov [rsp + 184], r11;             // bres_step_y
+
+        // err = adx - ady
+        mov r8, rsi;
+        sub r8, rdi;                      // r8 = err (signed)
+
+        // neg_ady = 0 - ady
+        xor r9, r9;
+        sub r9, rdi;                      // r9 = neg_ady
+
+        // Loop registers now:
+        //   rcx = x_cur, rdx = y_cur
+        //   rsi = adx,   rdi = ady
+        //   r8  = err,   r9  = neg_ady
+        //   rax, r10, r11 = scratch
+
+      ch_br_loop:
+        // Stamp cell at (rcx, rdx) with (line_word0, line_word1).
+        mov rax, rdx;
+        imul rax, r12;                    // y * cols  (2-op reg,reg)
+        add rax, rcx;                     // + x
+        shl rax, 4;                       // * 16 (Cell bytes)
+        add rax, rbx;                     // + buf_ptr
+
+        mov r11, [rsp + 112];             // line_word0
+        mov [rax + 0], r11;
+        mov r11, [rsp + 120];             // line_word1
+        mov [rax + 8], r11;
+
+        // Endpoint check: x_cur == x_end AND y_cur == y_end.
+        // Stage stack slots through rax (dead after cell stamp above).
+        mov rax, [rsp + 160];
+        cmp rcx, rax;
+        jne ch_br_step;
+        mov rax, [rsp + 168];
+        cmp rdx, rax;
+        je  ch_br_done;
+
+      ch_br_step:
+        // e2 = err << 1
+        mov rax, r8;
+        shl rax, 1;
+
+        // if e2 > neg_ady: err += neg_ady (err -= ady); x_cur += step_x
+        cmp rax, r9;
+        jle ch_br_no_x;
+        add r8, r9;
+        add rcx, [rsp + 176];
+      ch_br_no_x:
+
+        // if e2 < adx: err += adx; y_cur += step_y
+        cmp rax, rsi;
+        jge ch_br_no_y;
+        add r8, rsi;
+        add rdx, [rsp + 184];
+      ch_br_no_y:
+
+        jmp ch_br_loop;
+
+      ch_br_done:
+        // Fall through to update prev.
+        jmp ch_pt_update_prev;
+
+        // ---- Single-cell stamp variants -----------------------------------
+      ch_pt_line_first:
+        // Stamp cell at (cur_sx_abs, cur_sy_abs) with line_word0/word1.
+        mov rax, [rsp + 168];             // y = cur_sy_abs
+        imul rax, r12;
+        add rax, [rsp + 160];             // + x
+        shl rax, 4;
+        add rax, rbx;
+
+        mov r11, [rsp + 112];
+        mov [rax + 0], r11;
+        mov r11, [rsp + 120];
+        mov [rax + 8], r11;
+        jmp ch_pt_update_prev;
+
+      ch_pt_scatter:
+        // Stamp cell at (cur_sx_abs, cur_sy_abs) with
+        // scatter_word0/word1. Scatter datasets have no line continuity
+        // -- do NOT touch has_prev (a subsequent Line dataset should
+        // still start fresh from its own first point; has_prev is reset
+        // at the top of every dataset iteration).
+        mov rax, [rsp + 168];
+        imul rax, r12;
+        add rax, [rsp + 160];
+        shl rax, 4;
+        add rax, rbx;
+
+        mov r11, [rsp + 128];             // scatter_word0
+        mov [rax + 0], r11;
+        mov r11, [rsp + 120];             // line_word1 (shared)
+        mov [rax + 8], r11;
+        jmp ch_pt_next;
+
+      ch_pt_update_prev:
+        // prev_sx = cur_sx_abs, prev_sy = cur_sy_abs, has_prev = 1
+        mov rax, [rsp + 160];
+        mov [rsp + 136], rax;
+        mov rax, [rsp + 168];
+        mov [rsp + 144], rax;
+        mov rax, 1;
+        mov [rsp + 152], rax;
+        jmp ch_pt_next;
+
+      ch_pt_skip:
+        // Reset has_prev so a subsequent in-bounds point starts fresh
+        // (do NOT connect a line across a domain-gap point).
+        xor rax, rax;
+        mov [rsp + 152], rax;
+
+      ch_pt_next:
+        mov rax, [rsp + 96];
+        add rax, 1;
+        mov [rsp + 96], rax;
+        jmp ch_pt_loop;
+
+      ch_ds_next:
+        mov rax, [rsp + 72];
+        add rax, 1;
+        mov [rsp + 72], rax;
+        jmp ch_ds_loop;
+
+      ch_ret_ok:
+        xor rax, rax;
+        add rsp, 192;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // chart_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a ChartView@0.1 semantic-pipe record into [dst..dst+40).
+  // record_len is fixed at 40 bytes (already 8-aligned, no pad loop
+  // needed). The actual semantic_pipe::send_record wiring is deferred to
+  // the M2-009/M5 registry glue -- this packer is the wire-format
+  // authority so that landing only has to know CHVW_SCHEMA_NAME (for
+  // BLAKE3 hashing) and this packer (for the byte payload).
+  //
+  // Wire order (see CHARTVIEW@0.1 WIRE block above):
+  //   [rsi+ 0..+ 4)  magic         u32 = 0x57564843
+  //   [rsi+ 4..+ 8)  record_len    u32 = 40
+  //   [rsi+ 8..+16)  rect          u64 <- [rdi+ 0]
+  //   [rsi+16..+24)  dataset_count u64 <- [rdi+16]
+  //   [rsi+24..+32)  x_min         u64 <- [rdi+24]
+  //   [rsi+32..+40)  y_min         u64 <- [rdi+40]
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only),
+  // rax = scratch/return. Pure leaf: no callee-save touched, no
+  // push/pop, no nested call. Effect `!{mem}` (reads through rdi,
+  // writes through rsi).
+  // Labels prefixed ch_bv_ per docs fingerprint discipline (none needed
+  // at v1 -- record is fixed-length, no branches).
+  // ==========================================================================
+  pub let chart_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-005 (postui#24): chart_view_pack lays a fixed-40-byte ChartView@0.1 record at [rsi..rsi+40). Header: `mov rax, 0x57564843; mov_d [rsi+0], rax` stamps the 'CHVW' magic (0x57564843 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, matches BCVW / SPVW / SBVW idioms). `mov rax, 40; mov_d [rsi+4], rax` stamps record_len. Payload: 4 qword loads / 4 qword stores copy the four state fields verbatim (rect from spec+0 to view+8, dataset_count from spec+16 to view+16, x_min from spec+24 to view+24, y_min from spec+40 to view+32). x_max / y_max are omitted from the wire to keep the record compact (see WIRE block header rationale). return rax = 40. Every immediate (0x57564843, 40, 0, 4, 8, 16, 24, 32) fits imm32 (the magic and length are both < 0x7FFFFFFF, the offsets are small imm8). No `test`, no `imul`, no `and`, no `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 4 qword-loads / 4 qword-stores / 1 dword-magic-store / 1 dword-record_len-store.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564843;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- rect (u64) at [rsi + 8] ---------------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- dataset_count (u64) at [rsi + 16] -----------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 16], rax;
+
+        // ---- x_min (u64) at [rsi + 24] -------------------------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 24], rax;
+
+        // ---- y_min (u64) at [rsi + 32] -------------------------------------
+        mov rax, [rdi + 40];
+        mov [rsi + 32], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
