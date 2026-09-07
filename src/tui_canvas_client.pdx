@@ -87,4 +87,237 @@ module TuiCanvasClient = structure {
   pub let TCC_ERR_BAD_RIGHTS      : u64 = 0xFFFFEB19
   pub let TCC_ERR_REVOKE_ALREADY  : u64 = 0xFFFFEB18
 
+  // ==========================================================================
+  // SC+ sysno mirror -- sys_cap_invoke = 4 (design/user/syscall-table.md
+  // row 4, paideia-os). Held here as a named constant so the eight
+  // wrappers below name the SysV/SYSCALL entrance in exactly one place,
+  // matching syscall.pdx's SYS_* discipline in shell/src/syscall.pdx and
+  // syscall_shim.pdx's own naming of SC+ IDs.
+  // ==========================================================================
+
+  pub let TCC_SYS_CAP_INVOKE : u64 = 4
+
+  // ==========================================================================
+  // KIND_TUI_CANVAS OP WRAPPERS
+  //
+  // Contract: each wrapper below issues sys_cap_invoke(canvas_cap,
+  // op_ordinal) directly and returns the kernel's u64 verbatim -- 0 (or
+  // an op-specific u64 payload for QUERY ops) on success, one of the
+  // TCC_ERR_* codes above on refusal (or the reserved
+  // INVOKE_RESULT_INVALID_HANDLE = 0xFFFFFFFFFFFFFFFE if canvas_cap does
+  // not name a live KIND_TUI_CANVAS row -- src/kernel/core/cap/invoke.pdx
+  // cap_invoke's own out-of-range gate). No errno translation is
+  // performed here: postui's higher layers (Frame at M1-005) already
+  // read TCC_ERR_* directly for their own dispatch, matching the same
+  // "raw kernel u64 through" convention shell/src/syscall.pdx applies.
+  //
+  // Per-wrapper calling convention. The kernel's sys_cap_invoke
+  // (syscall_shim.pdx line 63) is a two-arg SysV wrapper -- rdi=slot,
+  // rsi=op_arg -- and cap_handler_tui_canvas (R89.M1-002) currently
+  // dispatches on op_arg treated as an 8-bit op ordinal directly (a full
+  // u64 cmp against 0..7; any non-zero upper bits fall through to
+  // TUI_BAD_SLOT). PRESENT/QUERY_ROWS/QUERY_COLS/QUERY_ID/QUERY_TTY_ID
+  // are all NULLARY ops and land there today; RESIZE/CLEAR/DEBUG_PRINT
+  // are RIGHTS-CHECKED STUBS RETURNING 0 on the paideia-os side at this
+  // landing (R89.M1-002 line 154-168 / 170-182). Their real bodies land
+  // at paideia-os R89.M1-004 (canvas_damage.pdx per docs/design.md
+  // §5.1's cross-repo table -- see also design/kernel/kind-tui-canvas.md
+  // §Ops); that landing will extend the sys_cap_invoke handler to plumb
+  // additional syscall registers (rdx/r10/r8) through to the handler,
+  // and this file's arity-3 wrappers already pass those exact registers
+  // via the standard Linux SYSCALL shuffle (see syscall.pdx sys_wait4 for
+  // the rcx->r10 pattern), so no client change is required when the
+  // kernel-side landing arrives -- the wrappers are wire-compatible
+  // today (returning 0 stub-success on RESIZE/CLEAR/DEBUG_PRINT) and
+  // become real when the kernel-side handler decodes those arg slots.
+  //
+  // Mint is DEFERRED. KIND_TUI_CANVAS_MINT is a KIND_CAP_TABLE-level
+  // mint op (paideia-os R89.M1-001 kind_tui_canvas_mint_body, invoked
+  // via cap_mint_write against a KIND_MEMORY parent + KIND_TTY tty_slot
+  // -- see kind_tui_canvas.pdx lines 506-619). That path is the SHELL /
+  // TOOL CALLER's responsibility, mediated by the caller's own libpdx-
+  // cap linkage; postui only invokes ops on an already-minted canvas cap
+  // handed to Frame (M1-005). This is the same posture shell/src/
+  // session.pdx takes for KIND_IPC_ENDPOINT: the shell mints, higher
+  // layers only invoke.
+  //
+  // Encoder pitfalls avoided:
+  //   - All immediates fit imm32 (0..7 for op ordinals, 4 for SC+ ID);
+  //     no imm64 staging via r11 needed.
+  //   - r11 is left untouched (paideia-as reserves it; and SYSCALL
+  //     clobbers it as return-address slot on the CPU side, which is
+  //     harmless because no caller relies on r11 across a SYSCALL).
+  //   - No `test` mnemonic; no zero-checks in these bodies (the caller
+  //     inspects the return value against TCC_OK / TCC_ERR_*).
+  //   - Every wrapper is a LEAF -- no push/pop, no local frame, no
+  //     nested call -- so rsp%16 stays whatever the caller entered with;
+  //     mirrors syscall_shim.pdx / syscall.pdx exactly.
+  //   - Reserved labels: none (bodies are linear, no jumps).
+  // ==========================================================================
+
+  // tcc_present(canvas_cap) -> u64
+  //
+  // TUI_OP_PRESENT = 0. Rights: R_TUI_PRESENT (TCC_R_TUI_PRESENT =
+  // 0x002). Nullary. Flushes the mapped back buffer through the kernel's
+  // back-vs-front diff, emits the resulting ANSI cursor/SGR/glyph bytes
+  // to the bound TTY sink, and commits back->front for the emitted rows.
+  // Returns 0 on success or a TCC_ERR_BAD_* sentinel from the 0xFFFFEB1x
+  // band (TUI_BAD_SLOT for a dead/out-of-range row, TUI_BAD_RIGHTS for a
+  // rights-checked refusal). See cap_handler_tui_canvas.pdx tuih_op_
+  // present + core/tui/canvas_present.pdx tui_present_body (paideia-os
+  // R89.M1-003).
+  pub let tcc_present : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_PRESENT (0) wrapper. SysV rdi=canvas_cap passes through as SYSCALL rdi=slot. rsi is loaded with the op ordinal 0 (TCC_OP_PRESENT); rax is loaded with SC+ ID 4 (TCC_SYS_CAP_INVOKE, sys_cap_invoke per design/user/syscall-table.md row 4, paideia-os). No arg shuffle (arity 2 < 4). Leaf: syscall clobbers rcx/r11 (both SysV caller-save, harmless). Effect/capability set matches syscall_shim.pdx sys_cap_invoke exactly: !{sysreg} @{cap} -- the kernel-side transitive widening ({mem,sysreg,PortIo} @{cap,paideia.port_io} for the PRESENT path in particular) belongs to cap_handler_tui_canvas.pdx, not this userspace wrapper. Kernel body reachable through this call: cap_handler_tui_canvas.pdx tuih_op_present -> tui_present_body (paideia-os R89.M1-003).",
+      block: {
+        mov rsi, 0;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_query_rows(canvas_cap) -> u64
+  //
+  // TUI_OP_QUERY_ROWS = 1. Rights: R_TUI_INVOKE (0x008). Returns rows
+  // the canvas was minted with (kind_tui_canvas.pdx row+32[63:32]).
+  pub let tcc_query_rows : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_QUERY_ROWS (1) wrapper. SysV rdi=canvas_cap passes through as SYSCALL rdi=slot; rsi=1; rax=4. No shuffle (arity 2 < 4). Kernel returns the rows field decoded from the canvas row's packed rowcols word (cap_handler_tui_canvas.pdx tuih_op_qrows: shr rax,32). Leaf.",
+      block: {
+        mov rsi, 1;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_query_cols(canvas_cap) -> u64
+  //
+  // TUI_OP_QUERY_COLS = 2. Rights: R_TUI_INVOKE. Returns cols
+  // (kind_tui_canvas.pdx row+32[31:0]).
+  pub let tcc_query_cols : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_QUERY_COLS (2) wrapper. SysV rdi=canvas_cap passes through; rsi=2; rax=4. Kernel masks the packed rowcols word by 0xFFFFFFFF (cap_handler_tui_canvas.pdx tuih_op_qcols). Leaf.",
+      block: {
+        mov rsi, 2;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_query_id(canvas_cap) -> u64
+  //
+  // TUI_OP_QUERY_ID = 3. Rights: R_TUI_INVOKE. Returns canvas_id, the
+  // kernel-assigned monotonic id from tui_next_canvas_id (never 0 for a
+  // successfully minted canvas; see kind_tui_canvas.pdx row+8).
+  pub let tcc_query_id : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_QUERY_ID (3) wrapper. SysV rdi=canvas_cap passes through; rsi=3; rax=4. Kernel returns the row's canvas_id word directly (cap_handler_tui_canvas.pdx tuih_op_qid). Leaf.",
+      block: {
+        mov rsi, 3;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_query_tty_id(canvas_cap) -> u64
+  //
+  // TUI_OP_QUERY_TTY_ID = 4. Rights: R_TUI_INVOKE. Returns the bound
+  // TTY's row_id via kind_tty.pdx tty_row_id (cap_handler_tui_canvas.pdx
+  // tuih_op_qttyid reads the row's tty_slot and forwards).
+  pub let tcc_query_tty_id : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_QUERY_TTY_ID (4) wrapper. SysV rdi=canvas_cap passes through; rsi=4; rax=4. Kernel forwards the row's tty_slot into kind_tty.pdx tty_row_id and returns that (cap_handler_tui_canvas.pdx tuih_op_qttyid). Leaf.",
+      block: {
+        mov rsi, 4;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_resize(canvas_cap, rows, cols) -> u64
+  //
+  // TUI_OP_RESIZE = 5. Rights: R_TUI_RESIZE (0x010). Re-derives
+  // rows/cols on a terminal resize event; re-maps the backing region
+  // (a fresh mint under the hood, old row revoked -- see design/kernel/
+  // kind-tui-canvas.md §Ops row 5). SysV arity 3 -> SYSCALL arity 4:
+  // rows lands in SYSCALL rdx, cols lands in SYSCALL r10 (the standard
+  // Linux rcx->r10 shuffle -- syscall.pdx sys_wait4 uses the identical
+  // pattern). Current paideia-os dispatch (R89.M1-002 cap_handler_tui_
+  // canvas.pdx tuih_op_resize) is a RIGHTS-CHECKED STUB returning 0
+  // without reading rdx/r10; R89.M1-004 (canvas_damage.pdx) will
+  // consume those registers -- this wrapper is wire-compatible with
+  // both landings, no client change required when the real body ships.
+  pub let tcc_resize : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_RESIZE (5) wrapper. SysV rdi=canvas_cap, rsi=rows, rdx=cols. SYSCALL wants rdi=slot, rsi=op_arg=5, rdx=rows, r10=cols. Three-move shuffle (all safe, all register-to-register, order matters): (1) mov r10, rdx: cols to SYSCALL arg3 slot; (2) mov rdx, rsi: rows to SYSCALL arg2 slot; (3) mov rsi, 5: op ordinal into SYSCALL arg1. Then mov rax, 4; syscall; ret. rcx is left untouched (SYSCALL clobbers rcx on the CPU side; SysV caller-save so harmless). Register plan verified: after step (1) rdx still holds the original cols (we then overwrite it in step 2), rsi still holds rows (overwritten in step 3), rdi still holds cap. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_resize is a rights-checked stub returning 0 (paideia-os R89.M1-002 lines 154-160); R89.M1-004 canvas_damage.pdx will consume rdx/r10 for the real body. Leaf.",
+      block: {
+        mov r10, rdx;
+        mov rdx, rsi;
+        mov rsi, 5;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_clear(canvas_cap, cell_hi, cell_lo) -> u64
+  //
+  // TUI_OP_CLEAR = 6. Rights: R_TUI_RESIZE (shared with RESIZE per
+  // design/kernel/kind-tui-canvas.md §Rights -- both are backing-store
+  // mutators). Fills both back and front regions with the given Cell,
+  // encoded as its two-u64 wire form (cell.pdx word0/word1: word0 is
+  // symbol|fg.rgb|bg.r, word1 is bg.gb|mods|reserved). cell_hi is
+  // word0 (cell[+0..+8)), cell_lo is word1 (cell[+8..+16)) -- naming
+  // follows the convention `_hi` = higher-addressed word, matching the
+  // wire's [+0..+16) byte layout. Same SysV->SYSCALL shuffle as
+  // tcc_resize; same stub-vs-real-body posture (rights-checked stub
+  // today, canvas_damage.pdx real body at R89.M1-004).
+  pub let tcc_clear : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) (cell_hi: u64) (cell_lo: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_CLEAR (6) wrapper. SysV rdi=canvas_cap, rsi=cell_hi (cell wire word0), rdx=cell_lo (cell wire word1). SYSCALL wants rdi=slot, rsi=op_arg=6, rdx=cell_hi, r10=cell_lo. Same three-move shuffle as tcc_resize: mov r10, rdx; mov rdx, rsi; mov rsi, 6; mov rax, 4; syscall; ret. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_clear is a rights-checked stub returning 0 (paideia-os R89.M1-002 lines 162-168); R89.M1-004 canvas_damage.pdx will consume rdx/r10 for the real body that stamps every cell in both regions. Leaf.",
+      block: {
+        mov r10, rdx;
+        mov rdx, rsi;
+        mov rsi, 6;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // tcc_debug_print(canvas_cap, msg_ptr, msg_len) -> u64
+  //
+  // TUI_OP_DEBUG_PRINT = 7. Rights: R_TUI_OBSERVE (0x400). Debug hook,
+  // mirrors TTY_OP_DEBUG_PRINT (no user-observable side effect beyond
+  // the klog emission). Current kernel path emits klog_s1_x1 keyed on
+  // the canvas row_id only (msg_ptr/msg_len are NOT consulted at
+  // R89.M1-002 -- cap_handler_tui_canvas.pdx tuih_op_dbg lines 170-182);
+  // the extended body that echoes msg_ptr/msg_len into the klog record
+  // is future work. This wrapper is wire-compatible with both.
+  pub let tcc_debug_print : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) (msg_ptr: u64) (msg_len: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "postui.M1-004 (postui#4): TUI_OP_DEBUG_PRINT (7) wrapper. SysV rdi=canvas_cap, rsi=msg_ptr, rdx=msg_len. SYSCALL wants rdi=slot, rsi=op_arg=7, rdx=msg_ptr, r10=msg_len. Same three-move shuffle as tcc_resize/tcc_clear: mov r10, rdx; mov rdx, rsi; mov rsi, 7; mov rax, 4; syscall; ret. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_dbg emits klog_s1_x1(LEVEL_INFO, SUBSYS_CAP_, tuih_dbg_msg, tuih_k_slot, row_id) and returns 0 -- msg_ptr/msg_len ride in rdx/r10 for future consumption but are not read today. Leaf.",
+      block: {
+        mov r10, rdx;
+        mov rdx, rsi;
+        mov rsi, 7;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
 }
