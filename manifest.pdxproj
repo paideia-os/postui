@@ -8,18 +8,23 @@
 # frame). It is linked into ring-3 consumers such as postui-top,
 # postui-hex, postui-dmesg (docs/design.md §3), plus any future TUI
 # app the org ships. paideia-as v0.34+ is the required toolchain
-# floor. Individual source files are compiled by tools/build.sh into
-# loose ELF64 objects under build-out/; downstream packaging steps
-# assemble those into consumers' link lines. This manifest is
-# metadata: it enumerates the source set, dependencies, and compliance
-# discipline for humans and tooling that walk the repo, mirroring the
-# shape shell/manifest.pdxproj established in the paideia-os
-# monorepo satellites.
+# floor. The M3-001 fixed-point path (src/fixed64.pdx fx_mul /
+# fx_scale, widened per postui#43) requires the 1-operand `mul reg64`
+# mnemonic introduced in paideia-as v0.33.2 (commit 1bf149b, closes
+# paideia-as#1398); the v0.34+ floor above already satisfies this.
+# Individual source files are compiled by tools/build.sh into loose
+# ELF64 objects under build-out/; downstream packaging steps assemble
+# those into consumers' link lines. This manifest is metadata: it
+# enumerates the source set, dependencies, and compliance discipline
+# for humans and tooling that walk the repo, mirroring the shape
+# shell/manifest.pdxproj established in the paideia-os monorepo
+# satellites.
 
-name        = postui
-version     = 0.1.0-pre
-kind        = library
-caps_decl   = caps.decl
+name                   = postui
+version                = 0.1.0-pre
+kind                   = library
+caps_decl              = caps.decl
+min_paideia_as_version = 0.33.2
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). Every file
