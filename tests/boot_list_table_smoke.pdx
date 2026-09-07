@@ -1,0 +1,819 @@
+// tests/boot_list_table_smoke.pdx -- postui.M2-010 (paideia-os/postui#19)
+//
+// BootListTableSmoke: second-wave boot smoke -- witness render of the
+// List and Table widgets into an in-memory Buffer, PLUS a round-trip
+// through the semantic-pipe registry: pack a ListView@0.1 / TableView@0.1
+// record via <w>_view_pack, dispatch it through a Binding, and verify a
+// subscriber callback fires and returns a non-zero rax.
+//
+// =============================================================================
+// SCOPE (docs/design.md §5.1 M2-010, design/architecture.md §7)
+// =============================================================================
+//
+// M2-010 lands the SECOND tests/*.pdx module in postui (after M1-008
+// tests/boot_block_smoke.pdx) and is the first test to exercise:
+//
+//   - A widget whose spec references caller-owned mutable state
+//     (ListState, TableState).
+//   - A widget that internally invokes Layout::layout_split
+//     (Table -- see src/widgets/table.pdx L462).
+//   - The semantic-pipe front (view-pack -> Binding -> dispatch ->
+//     callback) end-to-end, without the (still-absent) kernel
+//     sys_semantic_send hop: semantic_send is a stub at v1
+//     (semantic_registry.pdx L230-239), so this smoke wires the
+//     userspace half only -- exactly the seam M2-009 landed.
+//
+// Structure follows the tests/boot_block_smoke.pdx precedent verbatim:
+//
+//   1. Reserve fixture-sized .bss slabs (buffer, per-widget slots,
+//      per-schema semantic-view slots, per-binding subscriber counters).
+//   2. Init each widget's data records (span_init, line_init,
+//      list_state_init, direct-store ListSpec; span_init x4,
+//      table_state_init, direct-store TableRows / TableSpec /
+//      Constraints via layout_length).
+//   3. Render each widget by calling its <w>_draw entry directly
+//      (widget_kind_dispatch would layer nothing over the direct call
+//      for this test; the M1-008 template already exercised that
+//      dispatch through WK_BLOCK).
+//   4. Verify a small set of cells byte-for-byte:
+//        List row 0 & row 2 -> default_style overlay (word0 == 'i')
+//        List row 1         -> highlight_style overlay
+//                                 (word0 == 0x00000001_00000069)
+//        Table cells        -> per-span style=0, word0 == byte value
+//   5. Pack ListView@0.1 into a 40-byte scratch, semantic_binding_init a
+//      Binding with schema = SEMANTIC_SCHEMA_LSVW and a test callback,
+//      semantic_binding_dispatch, verify rax == 1 (callback's return)
+//      and the counter incremented to 1. Same for TBVW.
+//   6. Return 0 on all-pass. First mismatch short-circuits with a
+//      family-specific 0xFFFFEDBx sentinel so a smoke harness can
+//      attribute the failure without a full-value table lookup.
+//
+// The M1-008 precedent's rationale carries through: postui is a userspace
+// LIBRARY (design/architecture.md §2, no _start, no boot log), so this
+// "boot smoke" is a TEST module, not a witness-in-a-boot-log the way a
+// paideia-os kernel smoke would be. A downstream harness (postui-top,
+// postui-hex, postui-dmesg or a future dedicated postui-smoke) invokes
+// boot_list_table_smoke() as one entry in its smoke suite.
+//
+// =============================================================================
+// FIXTURE
+// =============================================================================
+//
+// Buffer: 20 cols x 10 rows x 16 bytes = 3200 bytes = 400 u64 slots,
+//         .bss-allocated at 16-byte alignment. Buffer's BACK region only
+//         (front-region diff/present testing lives with test_buffer at
+//         design/architecture.md §7 slot 0xFFFFED50..5F, deferred).
+//
+// List:
+//   Rect: (x=0, y=0, w=5, h=3)
+//   Items: 3 Lines, each with 1 Span:
+//     line 0 -> "item0"  (5 ASCII bytes)
+//     line 1 -> "item1"
+//     line 2 -> "item2"
+//   ListState: selected=1, offset=0.
+//   ListSpec:
+//     highlight_style = 1  (packed Style bit 0 -- lands as byte 4 of
+//                            cell word0 after style<<32 fill)
+//     default_style   = 0
+//
+// Table:
+//   Rect: (x=0, y=4, w=6, h=2)  -- non-overlapping with List rect
+//   Rows: 2 x 2 columns:
+//     row 0 cells: "A", "B"     (1 ASCII byte each)
+//     row 1 cells: "C", "D"
+//   Constraints: [Length(3), Length(3)]  via layout_length(3)
+//   TableState: selected_row = 0xFFFFFFFFFFFFFFFF (no highlight),
+//               offset = 0.
+//   TableSpec:
+//     header_ptr      = 0      (no header row)
+//     highlight_style = 0      (unused; state.selected doesn't match)
+//     default_style   = 0      (unused; no header)
+//
+// Semantic pipe (per widget schema):
+//   ListView@0.1 (LSVW):
+//     out_slot   = 40 B scratch (5 u64) in .bss
+//     binding    = 24 B (schema=SEMANTIC_SCHEMA_LSVW=0x5756534C,
+//                        callback=_bls_cb_lsvw)
+//     counter    = 1 u64, zeroed at test entry, incremented once
+//                        per dispatch hit
+//     callback   = increments counter, returns 1
+//
+//   TableView@0.1 (TBVW):
+//     out_slot   = 40 B scratch
+//     binding    = 24 B (schema=SEMANTIC_SCHEMA_TBVW=0x57564254,
+//                        callback=_bls_cb_tbvw)
+//     counter    = 1 u64, zeroed at test entry
+//     callback   = increments counter, returns 1
+//
+// =============================================================================
+// EXPECTED CELL BYTES (verified against list.pdx / table.pdx phase docs)
+// =============================================================================
+//
+// Cell wire (docs/design.md §2.1): 16 bytes -- word0 (LE u64) = symbol
+// bytes 0..4 | style-low-32 << 32; word1 = style-high-24-only. Both
+// list_draw and table_draw follow the same two-phase pattern:
+//
+//   Phase F (fill): every cell in the rect gets word0 = 0x20 |
+//     (style << 32), word1 = (style >> 32) & 0xFFFFFF.
+//   Phase O (overlay): each byte of each span's UTF-8 run overwrites
+//     the destination cell's 4-byte symbol slot via `mov_d [dst+0],
+//     byte_reg` (bytes 1..3 land as zero via the mov_d high 24 bits,
+//     bytes 4..15 stay from Phase F).
+//
+// Given default_style = 0 and highlight_style = 1, and every character
+// under test being a single ASCII byte (i = 0x69, A/B/C/D = 0x41..0x44):
+//
+//   For a default_style row: word0 = byte | (0 << 32) = byte
+//     (bytes: byte, 00, 00, 00, 00, 00, 00, 00 -> LE u64 = byte value)
+//
+//   For the highlight_style=1 row:
+//     Phase F word0 = 0x20 | (1 << 32) = 0x0000_0001_0000_0020
+//     Phase O overwrites bytes 0..3 -> 0x69, 0, 0, 0. Bytes 4..7 stay
+//                as 0x01, 0x00, 0x00, 0x00.
+//     word0 (LE u64) = 0x00_00_00_01_00_00_00_69 = 0x0000_0001_0000_0069
+//
+// List cells (rect x=0, y=0, w=5, h=3, cols=20 -> stride 20*16=320 B/row):
+//
+//   Row 0, col 0 (item "item0", default_style=0):
+//     offset = (0*20 + 0)*16 = 0
+//     word0 = 0x0000_0000_0000_0069  (== 0x69 as u64)
+//   Row 1, col 0 (item "item1", highlight_style=1, selected==1):
+//     offset = (1*20 + 0)*16 = 320
+//     word0 = 0x0000_0001_0000_0069
+//   Row 2, col 0 (item "item2", default_style=0):
+//     offset = (2*20 + 0)*16 = 640
+//     word0 = 0x0000_0000_0000_0069
+//
+// Table cells (rect x=0, y=4, w=6, h=2, cols=20; layout_split of
+// horizontal split with [Length(3), Length(3)] -> col 0 at x=0 w=3,
+// col 1 at x=3 w=3):
+//
+//   Row 0, col 0 (cell "A"): offset = (4*20 + 0)*16 = 1280
+//     word0 = 0x41
+//   Row 0, col 1 (cell "B"): offset = (4*20 + 3)*16 = 1328
+//     word0 = 0x42
+//   Row 1, col 0 (cell "C"): offset = (5*20 + 0)*16 = 1600
+//     word0 = 0x43
+//   Row 1, col 1 (cell "D"): offset = (5*20 + 3)*16 = 1648
+//     word0 = 0x44
+//
+// Every check reads word0 only -- for a single-byte ASCII overlay onto
+// a zero-style default fill, word0 fully captures the cell's observable
+// content (word1 is invariantly zero throughout when style bits [32..56)
+// are zero, which holds for both default_style=0 and highlight_style=1).
+//
+// =============================================================================
+// FAIL SENTINELS (band 0xFFFFEDB0..0xFFFFEDBF)
+// =============================================================================
+//
+// Anchored per architecture.md §7 (Fail-code family table). The M1-008
+// test_boot_smoke slot owns 0xFFFFEDA0..0xFFFFEDAF; this landing takes
+// the next 16-slot band 0xFFFFEDB0..0xFFFFEDBF for the M2 boot smoke.
+// Disjoint from the postui M2 library error band 0xFFFFEBC0..0xFFFFEBCF
+// (Layout / Text / List / Table / Tabs / Scrollbar) and from the kernel
+// KIND_TUI_CANVAS band 0xFFFFEB10..0xFFFFEB1F.
+//
+//   0xFFFFEDB0  BLTS_ERR_LIST_DRAW_RC        list_draw returned non-zero
+//   0xFFFFEDB1  BLTS_ERR_LIST_ROW0           row 0 word0 mismatch
+//   0xFFFFEDB2  BLTS_ERR_LIST_ROW1_HL        row 1 highlight word0 mismatch
+//   0xFFFFEDB3  BLTS_ERR_LIST_ROW2           row 2 word0 mismatch
+//   0xFFFFEDB4  BLTS_ERR_TABLE_DRAW_RC       table_draw returned non-zero
+//   0xFFFFEDB5  BLTS_ERR_TABLE_A             table cell (0,4) mismatch
+//   0xFFFFEDB6  BLTS_ERR_TABLE_B             table cell (3,4) mismatch
+//   0xFFFFEDB7  BLTS_ERR_TABLE_C             table cell (0,5) mismatch
+//   0xFFFFEDB8  BLTS_ERR_TABLE_D             table cell (3,5) mismatch
+//   0xFFFFEDB9  BLTS_ERR_LSVW_PACK_LEN       list_view_pack returned != 40
+//   0xFFFFEDBA  BLTS_ERR_LSVW_DISPATCH_RC    dispatch returned != 1
+//   0xFFFFEDBB  BLTS_ERR_LSVW_COUNTER        counter != 1 after dispatch
+//   0xFFFFEDBC  BLTS_ERR_TBVW_PACK_LEN       table_view_pack returned != 40
+//   0xFFFFEDBD  BLTS_ERR_TBVW_DISPATCH_RC    dispatch returned != 1
+//   0xFFFFEDBE  BLTS_ERR_TBVW_COUNTER        counter != 1 after dispatch
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BootListTableSmoke`), matches file
+//     basename `boot_list_table_smoke.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` and every
+//     small-value compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF.
+//   - Every fail sentinel (0xFFFFEDB0..0xFFFFEDBE), packed rect literal
+//     (0x0003000500000000, 0x0002000600040000), and expected highlight
+//     word0 (0x0000000100000069) is loaded via `mov reg, imm64` (movabs,
+//     10-byte form) -- legal for mov, NOT for cmp/and.
+//   - The 0xFFFF..FF sentinel for TableState.selected_row is composed
+//     via `xor rsi, rsi; sub rsi, 1` (list.pdx idiom), not a movabs of
+//     the imm64 literal.
+//   - Every schema magic (LSVW=0x5756534C, TBVW=0x57564254) is < 0x7FFFFFFF
+//     so paideia-as emits the compact `mov r32, imm32` form (matches
+//     list_view_pack L754 / table_view_pack L843 store pattern).
+//   - No 2-op `imul reg, imm`; no imul used at all in this module.
+//   - No `and reg, imm64`; no `and` used at all.
+//   - Single-line pub let for every string literal.
+//   - r11 discipline: r11 is used only as a transit for the expected-value
+//     compare at row-1-highlight (movabs staging), never preserved across
+//     a call.
+//   - SysV alignment: `push rbx` (8 B) rounds SysV entry rsp%16==8 to 0,
+//     aligned for every nested call. rbx caches the current spec/buffer
+//     base across each locality (setup blocks re-lea rbx as they move
+//     between specs); the entry-time rbx survives every callee (all
+//     invoked functions preserve rbx via SysV callee-save discipline).
+//   - Cross-module calls (span_init, line_init, list_state_init,
+//     table_state_init, list_draw, table_draw, list_view_pack,
+//     table_view_pack, layout_length, semantic_binding_init,
+//     semantic_binding_dispatch) resolve via paideia-as's flat ELF symbol
+//     namespace -- same pattern block_smoke.pdx uses to reach
+//     block_spec_init / widget_draw.
+//   - Callback function pointers (_bls_cb_lsvw / _bls_cb_tbvw) are loaded
+//     via `lea reg, [rip + <sym>]` (RIP-relative code-address form; same
+//     addressing mode block_smoke.pdx uses for data at line 299).
+//   - Effect row `!{mem} @{}` on boot_list_table_smoke -- writes to every
+//     fixture slab (transitively via span_init/line_init/*_state_init/
+//     *_draw/*_view_pack/binding_init/binding_dispatch), reads back for
+//     compares. Callback functions declare `!{mem}` for their counter
+//     increment. No sysreg (semantic_send is a stub at v1, not invoked
+//     by this test), no cap.
+//   - Labels prefixed `bls_` per docs fingerprint discipline.
+
+module BootListTableSmoke = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDB0..0xFFFFEDBF per architecture.md §7)
+  // ==========================================================================
+  pub let BLTS_ERR_LIST_DRAW_RC     : u64 = 0xFFFFEDB0
+  pub let BLTS_ERR_LIST_ROW0        : u64 = 0xFFFFEDB1
+  pub let BLTS_ERR_LIST_ROW1_HL     : u64 = 0xFFFFEDB2
+  pub let BLTS_ERR_LIST_ROW2        : u64 = 0xFFFFEDB3
+  pub let BLTS_ERR_TABLE_DRAW_RC    : u64 = 0xFFFFEDB4
+  pub let BLTS_ERR_TABLE_A          : u64 = 0xFFFFEDB5
+  pub let BLTS_ERR_TABLE_B          : u64 = 0xFFFFEDB6
+  pub let BLTS_ERR_TABLE_C          : u64 = 0xFFFFEDB7
+  pub let BLTS_ERR_TABLE_D          : u64 = 0xFFFFEDB8
+  pub let BLTS_ERR_LSVW_PACK_LEN    : u64 = 0xFFFFEDB9
+  pub let BLTS_ERR_LSVW_DISPATCH_RC : u64 = 0xFFFFEDBA
+  pub let BLTS_ERR_LSVW_COUNTER     : u64 = 0xFFFFEDBB
+  pub let BLTS_ERR_TBVW_PACK_LEN    : u64 = 0xFFFFEDBC
+  pub let BLTS_ERR_TBVW_DISPATCH_RC : u64 = 0xFFFFEDBD
+  pub let BLTS_ERR_TBVW_COUNTER     : u64 = 0xFFFFEDBE
+
+  // ==========================================================================
+  // Fixture-shape constants (exported so a downstream harness can replay
+  // the same geometry without decoding raw numerals from this file).
+  // ==========================================================================
+  pub let BLTS_ROWS : u64 = 10
+  pub let BLTS_COLS : u64 = 20
+
+  // ==========================================================================
+  // Static UTF-8 byte runs for List / Table cell contents. Single-line
+  // pub let for every string literal per paideia-as pitfall (multi-line
+  // quoted form parses as a separate token stream and drops the pub let
+  // half; matches block_smoke.pdx L220 posture).
+  // ==========================================================================
+  pub let _bls_str_item0 : [u8; 5] = "item0"
+  pub let _bls_str_item1 : [u8; 5] = "item1"
+  pub let _bls_str_item2 : [u8; 5] = "item2"
+  pub let _bls_str_a     : [u8; 1] = "A"
+  pub let _bls_str_b     : [u8; 1] = "B"
+  pub let _bls_str_c     : [u8; 1] = "C"
+  pub let _bls_str_d     : [u8; 1] = "D"
+
+  // ==========================================================================
+  // Buffer: 20 cols x 10 rows x 16 bytes = 3200 bytes = 400 u64.
+  // @align(16) so every (y*cols+x)*16 offset lands on a Cell boundary
+  // (matches Cell::CELL_BYTES = 16, per src/cell.pdx).
+  // ==========================================================================
+  pub let mut _bls_buffer : [u64; 400] = uninit @align(16)
+
+  // ==========================================================================
+  // List fixture slots.
+  //
+  //   _bls_list_spans  : 3 Spans x 24 B = 72 B = 9 u64
+  //     span slot i lives at &_bls_list_spans + i*24
+  //   _bls_list_lines  : 3 Lines x 24 B = 72 B = 9 u64
+  //     line slot i lives at &_bls_list_lines + i*24; its spans_ptr
+  //     points at &_bls_list_spans + i*24 (single-span line per item)
+  //   _bls_list_state  : one ListState (24 B = 3 u64)
+  //   _bls_list_spec   : one ListSpec  (64 B = 8 u64)
+  // ==========================================================================
+  pub let mut _bls_list_spans : [u64; 9] = uninit @align(8)
+  pub let mut _bls_list_lines : [u64; 9] = uninit @align(8)
+  pub let mut _bls_list_state : [u64; 3] = uninit @align(8)
+  pub let mut _bls_list_spec  : [u64; 8] = uninit @align(8)
+
+  // ==========================================================================
+  // Table fixture slots.
+  //
+  //   _bls_table_spans       : 4 Spans (A, B, C, D) x 24 B = 96 B = 12 u64
+  //   _bls_table_rows        : 2 TableRows x 16 B = 32 B = 4 u64
+  //   _bls_table_state       : one TableState (24 B = 3 u64)
+  //   _bls_table_constraints : 2 packed Constraints x 8 B = 16 B = 2 u64
+  //   _bls_table_spec        : one TableSpec (80 B = 10 u64)
+  // ==========================================================================
+  pub let mut _bls_table_spans       : [u64; 12] = uninit @align(8)
+  pub let mut _bls_table_rows        : [u64; 4]  = uninit @align(8)
+  pub let mut _bls_table_state       : [u64; 3]  = uninit @align(8)
+  pub let mut _bls_table_constraints : [u64; 2]  = uninit @align(8)
+  pub let mut _bls_table_spec        : [u64; 10] = uninit @align(8)
+
+  // ==========================================================================
+  // Semantic-pipe fixture slots.
+  //
+  //   _bls_lsvw_out    : 40 B scratch for ListView@0.1 record (5 u64)
+  //   _bls_tbvw_out    : 40 B scratch for TableView@0.1 record (5 u64)
+  //   _bls_lsvw_binding: 24 B Binding for LSVW schema (3 u64)
+  //   _bls_tbvw_binding: 24 B Binding for TBVW schema (3 u64)
+  //   _bls_counter_*   : 1 u64 counter each -- zeroed at test entry,
+  //                       incremented once by the matching callback per
+  //                       dispatch hit.
+  // ==========================================================================
+  pub let mut _bls_lsvw_out       : [u64; 5] = uninit @align(8)
+  pub let mut _bls_tbvw_out       : [u64; 5] = uninit @align(8)
+  pub let mut _bls_lsvw_binding   : [u64; 3] = uninit @align(8)
+  pub let mut _bls_tbvw_binding   : [u64; 3] = uninit @align(8)
+  pub let mut _bls_counter_lsvw   : [u64; 1] = uninit @align(8)
+  pub let mut _bls_counter_tbvw   : [u64; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // _bls_cb_lsvw(record_ptr, record_len) -> u64
+  //
+  // Test callback for the LSVW binding. Increments _bls_counter_lsvw and
+  // returns 1 so semantic_binding_dispatch's `call rax; ret` propagates
+  // a non-zero rax to boot_list_table_smoke (which uses it to distinguish
+  // "dispatch fired" from "dispatch missed the schema").
+  //
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (one 8-byte load + one 8-byte store to the counter).
+  // ==========================================================================
+  pub let _bls_cb_lsvw : (u64, u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-010 (postui#19): LSVW subscriber callback for the boot smoke round-trip. Body: lea rcx, [rip + _bls_counter_lsvw]; mov rax, [rcx+0]; add rax, 1; mov [rcx+0], rax; mov rax, 1; ret. Args (rdi=record_ptr, rsi=record_len) are unread -- this test only witnesses that the schema-matching dispatch fires the callback exactly once and returns 1 so a caller can distinguish 'fired' from 'missed'. Pure leaf: no callee-save touched (rcx and rax are SysV caller-save), no push/pop, no nested call. rsp % 16 == 0 at entry when reached via `call rax` from semantic_binding_dispatch (dispatch itself has no push/pop / no sub rsp, so its own rsp % 16 == 8 propagates into the `call rax` which pushes 8 more bytes; a leaf callback that does no aligned SSE tolerates the slight misalignment). Every immediate (0, 1) fits imm8. No `test`, no `imul`, no `and`, no `cmp`. Effect `!{mem}` covers the one load + one store through rcx. Labels prefixed bls_ per docs fingerprint discipline (none needed here -- straight-line body).",
+      block: {
+        lea rcx, [rip + _bls_counter_lsvw];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _bls_cb_tbvw(record_ptr, record_len) -> u64
+  //
+  // Test callback for the TBVW binding. Same shape as _bls_cb_lsvw
+  // against _bls_counter_tbvw.
+  // ==========================================================================
+  pub let _bls_cb_tbvw : (u64, u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-010 (postui#19): TBVW subscriber callback for the boot smoke round-trip. Same shape as _bls_cb_lsvw against _bls_counter_tbvw so the TBVW dispatch verification is independent of the LSVW one (separate counters mean either check can fail alone, letting the fail-code family sentinels attribute the failure to the exact schema hop). Pure leaf, no callee-save, no push/pop, no nested call. Effect `!{mem}`.",
+      block: {
+        lea rcx, [rip + _bls_counter_tbvw];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // boot_list_table_smoke() -> u64
+  //
+  // Runs the test end-to-end:
+  //
+  //   Phase 0: zero both LSVW / TBVW counters (uninit .bss may hold
+  //            arbitrary bytes from an earlier run's stack frame).
+  //   Phase 1: init 3 List Spans and 3 Lines, list_state_init,
+  //            direct-store ListSpec.
+  //   Phase 2: list_draw; verify row-0 default, row-1 highlight, row-2
+  //            default (one cell each; three assertions total).
+  //   Phase 3: init 4 Table Spans, direct-store 2 TableRows,
+  //            layout_length x2 into _bls_table_constraints,
+  //            table_state_init (selected=FF..FF sentinel via xor+sub 1),
+  //            direct-store TableSpec.
+  //   Phase 4: table_draw; verify 4 body cells (A / B / C / D at their
+  //            column-split positions).
+  //   Phase 5: list_view_pack; verify record_len == 40; semantic_binding_init
+  //            for LSVW; semantic_binding_dispatch; verify rax == 1;
+  //            verify _bls_counter_lsvw == 1.
+  //   Phase 6: same as Phase 5 for TBVW.
+  //
+  // Returns 0 on ALL passes. First mismatch short-circuits with a
+  // family-specific sentinel; the smoke harness can attribute the
+  // failure without a full-value table lookup.
+  //
+  // Register plan: nullary entry. 1-push (rbx) = 8 B -- rsp%16 goes
+  // from entry 8 to 0, aligned for every nested call. rbx is used as a
+  // scratch base-address register during the direct-store phases (each
+  // spec re-lea's rbx as it starts). rbx is SysV callee-save so every
+  // called function (span_init, line_init, list_state_init,
+  // table_state_init, layout_length, list_draw, table_draw,
+  // list_view_pack, table_view_pack, semantic_binding_init,
+  // semantic_binding_dispatch) preserves it end-to-end.
+  //
+  // Labels prefixed `bls_` per docs fingerprint discipline.
+  // ==========================================================================
+  pub let boot_list_table_smoke : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-010 (postui#19): boot_list_table_smoke witnesses List+Table draws and end-to-end semantic-pipe round-trip. Structure follows tests/boot_block_smoke.pdx: 1-push (rbx) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for every nested call. Phase 0 zeros both counters via lea + xor + mov (uninit .bss may hold arbitrary bytes). Phase 1 initializes 3 List Spans (span_init: rdi=slot=&_bls_list_spans+i*24, rsi=str_ptr, rdx=byte_len=5, rcx=style=0), 3 Lines (line_init: rdi=slot=&_bls_list_lines+i*24, rsi=&_bls_list_spans+i*24, rdx=1, rcx=0), ListState (list_state_init: rdi=&_bls_list_state, rsi=1, rdx=0), then direct-store ListSpec fields at [rbx+0..+56) with rbx=&_bls_list_spec: rect=(0,0,5,3) packed 0x0003000500000000 via movabs (imm > 0x7FFFFFFF; legal for mov), reserved_a=0, items_ptr=&_bls_list_lines, item_count=3, state_ptr=&_bls_list_state, highlight_style=1, default_style=0, reserved_b=0. Phase 2 calls list_draw(spec, buf, 10, 20); cmp rax, 0; jne fail_list_draw. Verify: lea rbx, [rip + _bls_buffer]; read [rbx+0] (row 0 col 0, offset 0) expect 0x69 (imm32-safe); read [rbx+320] (row 1 col 0, offset (1*20+0)*16) expect 0x0000000100000069 via movabs staged into r11 then reg-reg cmp; read [rbx+640] (row 2 col 0) expect 0x69. Phase 3 initializes 4 Table Spans at strides 0/24/48/72 with style=0, direct-store 2 TableRows at strides 0/16 (cells_ptr=&_bls_table_spans+{0,48}, cell_count=2), calls layout_length(3) twice storing into _bls_table_constraints[0..8) and [8..16), table_state_init(rdi=state, rsi=xor+sub 1=0xFF..FF, rdx=0), then direct-store TableSpec at [rbx+0..+72) with rbx=&_bls_table_spec: rect=(0,4,6,2) packed 0x0002000600040000 via movabs, rows_ptr=&_bls_table_rows, row_count=2, constraints_ptr=&_bls_table_constraints, column_count=2, header_ptr=0, state_ptr=&_bls_table_state, highlight_style=0, default_style=0, reserved=0. Phase 4 calls table_draw; cmp rax, 0; jne fail_table_draw. Verify 4 cells at (0,4)/(3,4)/(0,5)/(3,5) at offsets 1280/1328/1600/1648 (each = (y*20+x)*16 with y in {4,5} and x in {0,3}) expect 0x41/0x42/0x43/0x44 respectively (all imm32-safe). Phase 5 calls list_view_pack(spec, out) expecting rax=40 (imm32-safe cmp); semantic_binding_init(&_bls_lsvw_binding, LSVW=0x5756534C imm32-safe, callback=&_bls_cb_lsvw via lea rip-relative); semantic_binding_dispatch(binding, LSVW, out, 40); cmp rax, 1; jne fail_lsvw_dispatch_rc. Read counter, cmp rax, 1; jne fail_lsvw_counter. Phase 6 mirrors Phase 5 for TBVW=0x57564254 (imm32-safe). Success path: xor rax, rax; pop rbx; ret. Each fail arm: mov rax, 0xFFFFEDBx (movabs; imm > 0x7FFFFFFF; legal for mov); pop rbx; ret. Every immediate that reaches cmp/and (0, 1, 40, 20, 10, 3, 5, 24, 48, 72, 320, 640, 1280, 1328, 1600, 1648, 0x41, 0x42, 0x43, 0x44, 0x69, 0x5756534C, 0x57564254) fits imm32; every immediate in shift/add contexts (1, 3, 5, 24, 40, 48, 72) fits imm8. Every large expected literal (0x0003000500000000, 0x0002000600040000, 0x0000000100000069, 0xFFFFEDBx) is loaded via mov reg, imm64 (movabs, legal for mov). The 0xFF..FF TableState.selected_row sentinel is composed via xor + sub 1 (list.pdx idiom, list.pdx L510-513). No `test`, no `imul`, no `and reg, imm64`, no `cmp reg, imm > 0x7FFFFFFF`. Every callee resolves via paideia-as's flat ELF symbol namespace: span_init/line_init from Text; list_state_init/list_draw/list_view_pack from List; table_state_init/table_draw/table_view_pack from Table; layout_length from Layout; semantic_binding_init/semantic_binding_dispatch from SemanticRegistry. Callback function pointers loaded via `lea reg, [rip + _bls_cb_*]` (RIP-relative code-address form). Effect `!{mem}` covers every store into the fixture slabs (transitively) and every readback for compare. rbx caches whichever spec/buffer base the current locality reads; every callee is SysV-conformant and preserves rbx. Labels prefixed bls_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+
+        // ==================================================================
+        // Phase 0: zero the two counters (uninit .bss slabs).
+        // ==================================================================
+        xor rax, rax;
+        lea rcx, [rip + _bls_counter_lsvw];
+        mov [rcx + 0], rax;
+        lea rcx, [rip + _bls_counter_tbvw];
+        mov [rcx + 0], rax;
+
+        // ==================================================================
+        // Phase 1: init List Spans + Lines + State + Spec.
+        // ==================================================================
+
+        // ---- List Span 0: (&_bls_list_spans+0, "item0", 5, 0) -----------
+        lea rdi, [rip + _bls_list_spans];
+        lea rsi, [rip + _bls_str_item0];
+        mov rdx, 5;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- List Span 1: (&_bls_list_spans+24, "item1", 5, 0) ----------
+        lea rdi, [rip + _bls_list_spans];
+        add rdi, 24;
+        lea rsi, [rip + _bls_str_item1];
+        mov rdx, 5;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- List Span 2: (&_bls_list_spans+48, "item2", 5, 0) ----------
+        lea rdi, [rip + _bls_list_spans];
+        add rdi, 48;
+        lea rsi, [rip + _bls_str_item2];
+        mov rdx, 5;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- List Line 0: (&_bls_list_lines+0, &_bls_list_spans+0, 1, 0)
+        lea rdi, [rip + _bls_list_lines];
+        lea rsi, [rip + _bls_list_spans];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        // ---- List Line 1: (+24 both, span_count=1, alignment=0) ---------
+        lea rdi, [rip + _bls_list_lines];
+        add rdi, 24;
+        lea rsi, [rip + _bls_list_spans];
+        add rsi, 24;
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        // ---- List Line 2: (+48 both, span_count=1, alignment=0) ---------
+        lea rdi, [rip + _bls_list_lines];
+        add rdi, 48;
+        lea rsi, [rip + _bls_list_spans];
+        add rsi, 48;
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        // ---- ListState: (&_bls_list_state, selected=1, offset=0) --------
+        lea rdi, [rip + _bls_list_state];
+        mov rsi, 1;
+        xor rdx, rdx;
+        call list_state_init;
+
+        // ---- ListSpec direct-store (64 B) -------------------------------
+        // rect = (x=0, y=0, w=5, h=3) packed = (5<<32) | (3<<48)
+        //      = 0x0003000500000000 (imm64 -> movabs; legal for mov)
+        lea rbx, [rip + _bls_list_spec];
+        mov rax, 0x0003000500000000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // reserved_a
+        lea rax, [rip + _bls_list_lines];
+        mov [rbx + 16], rax;                // items_ptr
+        mov rax, 3;
+        mov [rbx + 24], rax;                // item_count
+        lea rax, [rip + _bls_list_state];
+        mov [rbx + 32], rax;                // state_ptr
+        mov rax, 1;
+        mov [rbx + 40], rax;                // highlight_style = 1
+        xor rax, rax;
+        mov [rbx + 48], rax;                // default_style = 0
+        mov [rbx + 56], rax;                // reserved_b = 0
+
+        // ==================================================================
+        // Phase 2: list_draw + verify.
+        // ==================================================================
+        // list_draw(&_bls_list_spec, &_bls_buffer, 10, 20)
+        lea rdi, [rip + _bls_list_spec];
+        lea rsi, [rip + _bls_buffer];
+        mov rdx, 10;
+        mov rcx, 20;
+        call list_draw;
+        cmp rax, 0;
+        jne bls_fail_list_draw_rc;
+
+        // Verify: row 0 col 0, offset 0, default_style=0, byte 'i' (0x69).
+        // Expected word0 = byte | (0<<32) = 0x69 (imm32-safe cmp).
+        lea rbx, [rip + _bls_buffer];
+        mov rax, [rbx + 0];
+        cmp rax, 0x69;
+        jne bls_fail_list_row0;
+
+        // Row 1 col 0, offset 320, highlight_style=1, byte 'i'.
+        // Expected word0 = 0x69 | (1<<32) = 0x0000000100000069 (movabs; reg-reg cmp).
+        mov rax, [rbx + 320];
+        mov r11, 0x0000000100000069;
+        cmp rax, r11;
+        jne bls_fail_list_row1;
+
+        // Row 2 col 0, offset 640, default_style=0. Expected word0 = 0x69.
+        mov rax, [rbx + 640];
+        cmp rax, 0x69;
+        jne bls_fail_list_row2;
+
+        // ==================================================================
+        // Phase 3: init Table Spans + Rows + Constraints + State + Spec.
+        // ==================================================================
+
+        // ---- Table Span 0 (A): (&_bls_table_spans+0, "A", 1, 0) ---------
+        lea rdi, [rip + _bls_table_spans];
+        lea rsi, [rip + _bls_str_a];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- Table Span 1 (B): (+24, "B", 1, 0) -------------------------
+        lea rdi, [rip + _bls_table_spans];
+        add rdi, 24;
+        lea rsi, [rip + _bls_str_b];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- Table Span 2 (C): (+48, "C", 1, 0) -------------------------
+        lea rdi, [rip + _bls_table_spans];
+        add rdi, 48;
+        lea rsi, [rip + _bls_str_c];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- Table Span 3 (D): (+72, "D", 1, 0) -------------------------
+        lea rdi, [rip + _bls_table_spans];
+        add rdi, 72;
+        lea rsi, [rip + _bls_str_d];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        // ---- TableRow 0: cells_ptr = &_bls_table_spans+0, cell_count=2
+        lea rbx, [rip + _bls_table_rows];
+        lea rax, [rip + _bls_table_spans];
+        mov [rbx + 0], rax;                 // cells_ptr row 0
+        mov rax, 2;
+        mov [rbx + 8], rax;                 // cell_count row 0
+
+        // ---- TableRow 1: cells_ptr = &_bls_table_spans+48, cell_count=2
+        lea rax, [rip + _bls_table_spans];
+        add rax, 48;
+        mov [rbx + 16], rax;                // cells_ptr row 1
+        mov rax, 2;
+        mov [rbx + 24], rax;                // cell_count row 1
+
+        // ---- Constraints[0] = layout_length(3) --------------------------
+        mov rdi, 3;
+        call layout_length;
+        lea rbx, [rip + _bls_table_constraints];
+        mov [rbx + 0], rax;
+
+        // ---- Constraints[1] = layout_length(3) --------------------------
+        mov rdi, 3;
+        call layout_length;
+        lea rbx, [rip + _bls_table_constraints];
+        mov [rbx + 8], rax;
+
+        // ---- TableState: (state, selected=0xFF..FF, offset=0) -----------
+        // Compose the 0xFF..FF sentinel via xor+sub 1 (list.pdx idiom;
+        // avoids an imm64 movabs into rsi where it isn't necessary).
+        lea rdi, [rip + _bls_table_state];
+        xor rsi, rsi;
+        sub rsi, 1;
+        xor rdx, rdx;
+        call table_state_init;
+
+        // ---- TableSpec direct-store (80 B) ------------------------------
+        // rect = (x=0, y=4, w=6, h=2) packed = (4<<16)|(6<<32)|(2<<48)
+        //      = 0x0002000600040000 (imm64 -> movabs; legal for mov)
+        lea rbx, [rip + _bls_table_spec];
+        mov rax, 0x0002000600040000;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bls_table_rows];
+        mov [rbx + 8], rax;                 // rows_ptr
+        mov rax, 2;
+        mov [rbx + 16], rax;                // row_count
+        lea rax, [rip + _bls_table_constraints];
+        mov [rbx + 24], rax;                // constraints_ptr
+        mov rax, 2;
+        mov [rbx + 32], rax;                // column_count
+        xor rax, rax;
+        mov [rbx + 40], rax;                // header_ptr = 0
+        lea rax, [rip + _bls_table_state];
+        mov [rbx + 48], rax;                // state_ptr
+        xor rax, rax;
+        mov [rbx + 56], rax;                // highlight_style = 0
+        mov [rbx + 64], rax;                // default_style   = 0
+        mov [rbx + 72], rax;                // reserved        = 0
+
+        // ==================================================================
+        // Phase 4: table_draw + verify.
+        // ==================================================================
+        // table_draw(&_bls_table_spec, &_bls_buffer, 10, 20)
+        lea rdi, [rip + _bls_table_spec];
+        lea rsi, [rip + _bls_buffer];
+        mov rdx, 10;
+        mov rcx, 20;
+        call table_draw;
+        cmp rax, 0;
+        jne bls_fail_table_draw_rc;
+
+        // Verify 4 body cells (per-span style=0 for all -> word0 = byte).
+        //   (0,4) 'A' 0x41 at offset (4*20+0)*16 = 1280
+        //   (3,4) 'B' 0x42 at offset (4*20+3)*16 = 1328
+        //   (0,5) 'C' 0x43 at offset (5*20+0)*16 = 1600
+        //   (3,5) 'D' 0x44 at offset (5*20+3)*16 = 1648
+        lea rbx, [rip + _bls_buffer];
+
+        mov rax, [rbx + 1280];
+        cmp rax, 0x41;
+        jne bls_fail_table_a;
+
+        mov rax, [rbx + 1328];
+        cmp rax, 0x42;
+        jne bls_fail_table_b;
+
+        mov rax, [rbx + 1600];
+        cmp rax, 0x43;
+        jne bls_fail_table_c;
+
+        mov rax, [rbx + 1648];
+        cmp rax, 0x44;
+        jne bls_fail_table_d;
+
+        // ==================================================================
+        // Phase 5: LSVW round-trip (pack -> bind -> dispatch -> callback).
+        // ==================================================================
+        // list_view_pack(&_bls_list_spec, &_bls_lsvw_out) -> record_len
+        lea rdi, [rip + _bls_list_spec];
+        lea rsi, [rip + _bls_lsvw_out];
+        call list_view_pack;
+        cmp rax, 40;
+        jne bls_fail_lsvw_pack_len;
+
+        // semantic_binding_init(&_bls_lsvw_binding, LSVW, &_bls_cb_lsvw)
+        // LSVW = 0x5756534C < 0x7FFFFFFF -> mov r32, imm32 (compact form).
+        lea rdi, [rip + _bls_lsvw_binding];
+        mov rsi, 0x5756534C;
+        lea rdx, [rip + _bls_cb_lsvw];
+        call semantic_binding_init;
+
+        // semantic_binding_dispatch(&_bls_lsvw_binding, LSVW,
+        //                            &_bls_lsvw_out, 40) -> callback's rax
+        lea rdi, [rip + _bls_lsvw_binding];
+        mov rsi, 0x5756534C;
+        lea rdx, [rip + _bls_lsvw_out];
+        mov rcx, 40;
+        call semantic_binding_dispatch;
+        cmp rax, 1;
+        jne bls_fail_lsvw_dispatch_rc;
+
+        // Verify counter == 1 (callback fired exactly once).
+        lea rcx, [rip + _bls_counter_lsvw];
+        mov rax, [rcx + 0];
+        cmp rax, 1;
+        jne bls_fail_lsvw_counter;
+
+        // ==================================================================
+        // Phase 6: TBVW round-trip (mirrors Phase 5).
+        // ==================================================================
+        lea rdi, [rip + _bls_table_spec];
+        lea rsi, [rip + _bls_tbvw_out];
+        call table_view_pack;
+        cmp rax, 40;
+        jne bls_fail_tbvw_pack_len;
+
+        // TBVW = 0x57564254 < 0x7FFFFFFF -> mov r32, imm32.
+        lea rdi, [rip + _bls_tbvw_binding];
+        mov rsi, 0x57564254;
+        lea rdx, [rip + _bls_cb_tbvw];
+        call semantic_binding_init;
+
+        lea rdi, [rip + _bls_tbvw_binding];
+        mov rsi, 0x57564254;
+        lea rdx, [rip + _bls_tbvw_out];
+        mov rcx, 40;
+        call semantic_binding_dispatch;
+        cmp rax, 1;
+        jne bls_fail_tbvw_dispatch_rc;
+
+        lea rcx, [rip + _bls_counter_tbvw];
+        mov rax, [rcx + 0];
+        cmp rax, 1;
+        jne bls_fail_tbvw_counter;
+
+        // ==================================================================
+        // All checks passed.
+        // ==================================================================
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      bls_fail_list_draw_rc:
+        mov rax, 0xFFFFEDB0;
+        pop rbx;
+        ret;
+
+      bls_fail_list_row0:
+        mov rax, 0xFFFFEDB1;
+        pop rbx;
+        ret;
+
+      bls_fail_list_row1:
+        mov rax, 0xFFFFEDB2;
+        pop rbx;
+        ret;
+
+      bls_fail_list_row2:
+        mov rax, 0xFFFFEDB3;
+        pop rbx;
+        ret;
+
+      bls_fail_table_draw_rc:
+        mov rax, 0xFFFFEDB4;
+        pop rbx;
+        ret;
+
+      bls_fail_table_a:
+        mov rax, 0xFFFFEDB5;
+        pop rbx;
+        ret;
+
+      bls_fail_table_b:
+        mov rax, 0xFFFFEDB6;
+        pop rbx;
+        ret;
+
+      bls_fail_table_c:
+        mov rax, 0xFFFFEDB7;
+        pop rbx;
+        ret;
+
+      bls_fail_table_d:
+        mov rax, 0xFFFFEDB8;
+        pop rbx;
+        ret;
+
+      bls_fail_lsvw_pack_len:
+        mov rax, 0xFFFFEDB9;
+        pop rbx;
+        ret;
+
+      bls_fail_lsvw_dispatch_rc:
+        mov rax, 0xFFFFEDBA;
+        pop rbx;
+        ret;
+
+      bls_fail_lsvw_counter:
+        mov rax, 0xFFFFEDBB;
+        pop rbx;
+        ret;
+
+      bls_fail_tbvw_pack_len:
+        mov rax, 0xFFFFEDBC;
+        pop rbx;
+        ret;
+
+      bls_fail_tbvw_dispatch_rc:
+        mov rax, 0xFFFFEDBD;
+        pop rbx;
+        ret;
+
+      bls_fail_tbvw_counter:
+        mov rax, 0xFFFFEDBE;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

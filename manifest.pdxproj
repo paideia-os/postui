@@ -67,9 +67,11 @@ deps:
 # test source landing is picked up without any build.sh change.
 #
 # Fail-code family bands per design/architecture.md §7:
-#   test_boot_smoke  0xFFFFEDA0..0xFFFFEDAF   (this entry, M1-008)
+#   test_boot_smoke              0xFFFFEDA0..0xFFFFEDAF   (M1-008)
+#   test_boot_list_table_smoke   0xFFFFEDB0..0xFFFFEDBF   (M2-010)
 tests:
-  - tests/boot_block_smoke.pdx    # M1-008: render one Block, verify cell bytes
+  - tests/boot_block_smoke.pdx        # M1-008: render one Block, verify cell bytes
+  - tests/boot_list_table_smoke.pdx   # M2-010: List+Table render + semantic-pipe round-trip
 
 # --- Documentation targets ---------------------------------------------
 # The authoritative postui spec lives at docs/design.md and is not a
