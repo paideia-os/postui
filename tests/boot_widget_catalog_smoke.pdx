@@ -1,0 +1,1357 @@
+// tests/boot_widget_catalog_smoke.pdx -- postui.M4-008 (paideia-os/postui#34)
+//
+// BootWidgetCatalogSmoke: fourth-wave boot smoke -- witness that ALL 15
+// widget draw entrypoints render into an in-memory Buffer without error,
+// stamp at least one cell inside their assigned Rect, and DO NOT leak
+// writes across their Rect boundaries into a set of guard rows that
+// separate the three tile rows of the catalog layout.
+//
+// =============================================================================
+// SCOPE (docs/design.md sec.5.1 M4-008, design/architecture.md sec.7)
+// =============================================================================
+//
+// M4-008 lands the FOURTH tests/*.pdx module in postui, closing the M4
+// milestone with a regression corpus that exercises the entire widget
+// catalog end-to-end:
+//
+//   M1: block                                                (1 kind)
+//   M2: paragraph, list, table, tabs, scrollbar              (5 kinds)
+//   M3: gauge, sparkline, barchart, chart, canvas            (5 kinds)
+//   M4: text_input, tree, calendar, clear                    (4 kinds)
+//
+//   Total: 15 widget draw entrypoints.
+//
+// Structure follows the M1-008 / M2-010 / M3-007 precedents but adopts
+// a REDUCED verification stance -- pixel-perfect fixture matching for
+// 15 widgets would need 15 golden files (~5x the maintenance surface of
+// the M3-007 determinism witness alone) and would refuse the "keep
+// per-widget setup terse" issue directive. Instead, each widget is
+// verified against three properties:
+//
+//   1. widget_draw returns 0 (or a documented widget-specific error).
+//   2. AT LEAST ONE non-zero cell exists inside the widget's Rect tile
+//      (proves the draw wrote SOMETHING and did not silent-no-op).
+//   3. Rect dimensions are respected -- no bytes are written OUTSIDE
+//      the widget's Rect. Verified via a set of guard rows (rows 9, 19,
+//      29) that separate the three tile rows of the catalog layout;
+//      after every widget has drawn, every guard-row cell must still
+//      read zero (they were zero at test entry and no widget's Rect
+//      overlaps them).
+//
+// A dedicated postui-smoke consumer (deferred to M5) invokes
+// boot_widget_catalog_smoke() as one entry in its smoke suite. This
+// test is a LIBRARY test -- postui is a userspace library (see
+// design/architecture.md sec.2, no _start, no boot log).
+//
+// =============================================================================
+// FIXTURE (40 cols x 30 rows shared buffer, 15 tiles + 3 guard rows)
+// =============================================================================
+//
+// Buffer: 40 cols x 30 rows x 16 B = 19200 B = 2400 u64 slots. @align(16)
+//         so every (y*cols+x)*16 offset lands on a Cell boundary (matches
+//         Cell::CELL_BYTES = 16, per src/cell.pdx).
+//
+// Tile layout (5 tile cols x 3 tile rows = 15 slots; every tile is
+// 8 cols wide x 9 rows tall; row 9, row 19, row 29 are GUARD rows
+// separating tile rows, all-zero throughout the test):
+//
+//   x= 0 x= 8 x=16 x=24 x=32
+//   +----+----+----+----+----+
+//   |Blck|Para|List|Tabl|Tabs|  y=0..9   (M1 + M2 widget row)
+//   +----+----+----+----+----+
+//     ~~~~~~~~~~~~ row 9 GUARD ~~~~~~~~~~~~
+//   +----+----+----+----+----+
+//   |Scrb|Gaug|Sprk|Barc|Char|  y=10..19 (M2 + M3 widget row)
+//   +----+----+----+----+----+
+//     ~~~~~~~~~~~ row 19 GUARD ~~~~~~~~~~~~
+//   +----+----+----+----+----+
+//   |Cvas|TIpt|Tree|Cldr|Clr |  y=20..29 (M3 + M4 widget row)
+//   +----+----+----+----+----+
+//     ~~~~~~~~~~~ row 29 GUARD ~~~~~~~~~~~~
+//
+// Widget-to-tile slot map (slot index === widget catalog index):
+//
+//   slot  widget        rect (x, y, w, h)  top-left byte offset  packed rect
+//   ----  ------------  -----------------  --------------------  -----------
+//    0    block         ( 0,  0, 8, 9)                     0     0x0009000800000000
+//    1    paragraph     ( 8,  0, 8, 9)                   128     0x0009000800000008
+//    2    list          (16,  0, 8, 9)                   256     0x0009000800000010
+//    3    table         (24,  0, 8, 9)                   384     0x0009000800000018
+//    4    tabs          (32,  0, 8, 9)                   512     0x0009000800000020
+//    5    scrollbar     ( 0, 10, 8, 9)                  6400     0x00090008000A0000
+//    6    gauge         ( 8, 10, 8, 9)                  6528     0x00090008000A0008
+//    7    sparkline     (16, 10, 8, 9)                  6656     0x00090008000A0010
+//    8    barchart      (24, 10, 8, 9)                  6784     0x00090008000A0018
+//    9    chart         (32, 10, 8, 9)                  6912     0x00090008000A0020
+//   10    canvas        ( 0, 20, 8, 9)                 12800     0x0009000800140000
+//   11    text_input    ( 8, 20, 8, 9)                 12928     0x0009000800140008
+//   12    tree          (16, 20, 8, 9)                 13056     0x0009000800140010
+//   13    calendar      (24, 20, 8, 9)                 13184     0x0009000800140018
+//   14    clear         (32, 20, 8, 9)                 13312     0x0009000800140020
+//
+// Guard rows: row 9 (offsets 5760..6400), row 19 (offsets 12160..12800),
+// row 29 (offsets 18560..19200). 3 rows x 40 cols x 16 B/cell = 1920 B
+// = 240 qwords total to check.
+//
+// Tile top-left byte offsets are (y*40 + x)*16; every offset above is
+// imm32-safe. Every packed rect literal has w=8 (bit 35 set), so the
+// literal >= 0x0000000800000000 > 0x7FFFFFFF -- movabs (10-byte
+// mov reg, imm64) is the only legal path; NEVER cmp reg, imm64.
+//
+// =============================================================================
+// PER-WIDGET MINIMAL SPEC (see design/architecture.md sec.5 wire tables)
+// =============================================================================
+//
+// Every widget is set up with the smallest spec that guarantees:
+//
+//   * widget_draw returns 0 (all input-validation predicates pass);
+//   * at least one cell inside the Rect is written with a non-zero
+//     symbol byte or non-zero style overlay.
+//
+// The specs share auxiliary data slots (a single "X" byte, a single
+// Span/Line/Text struct, etc.) where the widget only READS its input --
+// spans are immutable to the draw path so a common "X" span is legal.
+//
+//   block:       kind=PLAIN (borders draw), pad=0, title="B"
+//                -> top-left cell = LT-corner glyph (non-zero).
+//   paragraph:   text with 1 line "X", wrap=NONE, alignment=Left
+//                -> top-left cell = 'X' overlay (non-zero).
+//   list:        1 item "X", state_ptr=0 (decodes as selected=NONE)
+//                -> top-left cell = 'X' overlay.
+//   table:       column_count=1, 1 row of 1 cell "X",
+//                constraints=[Length(4)], state=(sel=FF..FF, off=0)
+//                -> top-left cell = 'X' overlay.
+//   tabs:        1 tab titled "X"
+//                -> top-left cell = 'X' overlay.
+//   scrollbar:   V-orientation, content=10, viewport=5, position=2
+//                -> every cell filled with track/thumb glyph.
+//   gauge:       kind=Bar, value=50, max=100
+//                -> every cell filled with filled or empty glyph.
+//   sparkline:   values=[7], value_count=1, max_override=7
+//                -> column 0 fills full height with bar glyph.
+//   barchart:    bars=[7,3,5], bar_count=3, bar_width=1, max_override=7
+//                -> column 0 fills full height with bar glyph.
+//   chart:       kind=Scatter, 1 point at (fx(0), fx(9)) with y_max=fx(9)
+//                -> marker glyph drawn at top-left cell.
+//   canvas:      bw=8, bh=9, bitmap 72 B pre-cleared,
+//                canvas_line((fx(0),fx(0)) -> (fx(15),fx(17)))
+//                -> braille dot at top-left cell.
+//   text_input:  buffer="X", buffer_len=1, cursor=1, mode=SingleLine
+//                -> top-left cell = 'X' overlay OR fill_cell background.
+//   tree:        root_ptr = TreeNode("X", child_count=0, expanded=1)
+//                -> row 0 = label overlay.
+//   calendar:    year=2026, month=1, selected_day=0
+//                -> header row = year+month text (non-zero).
+//   clear:       style=1
+//                -> every cell = fill_cell (word0 = 0x20 | 1<<32).
+//
+// =============================================================================
+// TILE-NON-EMPTY CHECK (bwcs_tile_or_scan helper)
+// =============================================================================
+//
+// After each widget's draw + rc check, an inline call to
+// bwcs_tile_or_scan(base_ptr) reduces the tile's 9 rows x 8 cells x
+// 2 qwords/cell = 144 qwords via a straight OR accumulator and returns
+// the OR value in rax. A zero return means every cell in the tile is
+// still zero -- the widget silently no-op'd, which the tile-empty
+// sentinel catches.
+//
+// Fixed-geometry helper (rows=9, w=8, cols_stride=40*16=640) avoids
+// hoisting three arguments per call site and keeps every dispatch to a
+// single `lea rdi, [buf + tile_offset]; call bwcs_tile_or_scan`
+// two-instruction sequence.
+//
+// =============================================================================
+// GUARD-ROW CHECK (post-catalog invariant)
+// =============================================================================
+//
+// Rows 9, 19, 29 sit BETWEEN the three tile rows of the catalog layout.
+// No widget's Rect intersects any guard row (every widget has y in
+// {0, 10, 20} and h=9, so its y-range is [y, y+9); the guard rows are
+// {9, 19, 29} = y+9 for each tile row -- disjoint by construction).
+// After every widget's draw, an inline three-segment loop walks each
+// guard row (40 cells x 16 B x 3 rows = 1920 B = 240 qwords) and
+// checks every qword is still zero. A single non-zero qword short-
+// circuits to the guard-violated sentinel.
+//
+// The guard check catches:
+//   * A widget that writes past its Rect's bottom edge (into y+9).
+//   * A widget that stamps into a foreign tile row.
+//
+// It does NOT catch a widget that overflows LEFT/RIGHT into an adjacent
+// tile in the same row (that would land in the neighbor widget's tile,
+// which the neighbor overwrites next). That failure mode is left to a
+// future per-widget snapshot-diff test (dedicated per-widget suite,
+// M5+ scope); the M4 catalog smoke is a REGRESSION corpus, not a
+// per-widget fixture harness.
+//
+// =============================================================================
+// FAIL SENTINELS (band 0xFFFFEDD0..0xFFFFEDDF)
+// =============================================================================
+//
+// Anchored per architecture.md sec.7 (Fail-code family table). The
+// M1-008 test_boot_smoke slot owns 0xFFFFEDA0..0xFFFFEDAF; M2-010
+// test_boot_list_table_smoke owns 0xFFFFEDB0..0xFFFFEDBF; M3-007
+// test_boot_chart_canvas_smoke owns 0xFFFFEDC0..0xFFFFEDCF; this
+// landing takes the next 16-slot band 0xFFFFEDD0..0xFFFFEDDF for the
+// M4 boot smoke.
+//
+// The band packs exactly:
+//   * 15 draw-rc sentinels (one per widget catalog index)
+//   * 1 aggregate sentinel used by BOTH the tile-empty check and the
+//     guard-row check (each check-site's source location attributes
+//     the failure -- callers walk the source, not a value table).
+//
+//   0xFFFFEDD0  BWCS_ERR_BLOCK_DRAW_RC      block_draw returned non-zero
+//   0xFFFFEDD1  BWCS_ERR_PARAGRAPH_DRAW_RC  paragraph_draw returned non-zero
+//   0xFFFFEDD2  BWCS_ERR_LIST_DRAW_RC       list_draw returned non-zero
+//   0xFFFFEDD3  BWCS_ERR_TABLE_DRAW_RC      table_draw returned non-zero
+//   0xFFFFEDD4  BWCS_ERR_TABS_DRAW_RC       tabs_draw returned non-zero
+//   0xFFFFEDD5  BWCS_ERR_SCROLLBAR_DRAW_RC  scrollbar_draw returned non-zero
+//   0xFFFFEDD6  BWCS_ERR_GAUGE_DRAW_RC      gauge_draw returned non-zero
+//   0xFFFFEDD7  BWCS_ERR_SPARKLINE_DRAW_RC  sparkline_draw returned non-zero
+//   0xFFFFEDD8  BWCS_ERR_BARCHART_DRAW_RC   barchart_draw returned non-zero
+//   0xFFFFEDD9  BWCS_ERR_CHART_DRAW_RC      chart_draw returned non-zero
+//   0xFFFFEDDA  BWCS_ERR_CANVAS_DRAW_RC     canvas_draw or canvas_line/clear rc
+//   0xFFFFEDDB  BWCS_ERR_TEXT_INPUT_DRAW_RC text_input_draw returned non-zero
+//   0xFFFFEDDC  BWCS_ERR_TREE_DRAW_RC       tree_draw returned non-zero
+//   0xFFFFEDDD  BWCS_ERR_CALENDAR_DRAW_RC   calendar_draw returned non-zero
+//   0xFFFFEDDE  BWCS_ERR_CLEAR_DRAW_RC      clear_draw returned non-zero
+//   0xFFFFEDDF  BWCS_ERR_TILE_OR_GUARD      tile all-zero OR guard non-zero
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BootWidgetCatalogSmoke`), matches
+//     file basename `boot_widget_catalog_smoke.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` and every
+//     small-value compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF.
+//   - Every packed rect literal (0x0009000800000000 ..
+//     0x0009000800140020) is > 0x7FFFFFFF -> movabs (10-byte
+//     mov reg, imm64), legal for mov, NOT for cmp/and. Every fail
+//     sentinel (0xFFFFEDDx) is likewise a movabs.
+//   - Every Fixed64 constant (fx(9) = 0x0000000900000000, fx(8) =
+//     0x0000000800000000, fx(15) = 0x0000000F00000000, fx(16) =
+//     0x0000001000000000, fx(17) = 0x0000001100000000, fx(18) =
+//     0x0000001200000000) is > 0x7FFFFFFF -> movabs.
+//   - The 0xFFFF..FF selected_row sentinel for TableState is composed
+//     via `xor rsi, rsi; sub rsi, 1` (list.pdx idiom), not via a
+//     movabs of the literal.
+//   - The block_spec_init kind_and_pad (rdx) literal 0x0000000000000001
+//     (kind=PLAIN, pad=all zero) fits imm32.
+//   - The paragraph_spec_init wrap_and_align (r8) literal 0 (both 0)
+//     is loaded via `xor r8, r8`.
+//   - The text_input_spec_init buffer_len_and_cursor (r8) literal
+//     packs len=1 at low32, cursor=1 at high32 = 0x0000000100000001
+//     (imm32-safe); scroll_and_mode (r9) literal packs scroll=0,
+//     mode=0 = 0 via xor.
+//   - No 2-op `imul reg, imm`; no imul used at all in this module.
+//   - No `and reg, imm64`; no `and` used at all.
+//   - Single-line pub let for every string literal.
+//   - r11 discipline: r11 is used only inside the OR-scan accumulator
+//     and guard-check loops as transit for the loaded qword, never
+//     preserved across a call.
+//   - SysV alignment: `push rbx` (8 B) rounds SysV entry rsp%16==8 to 0
+//     in bwcs_tile_or_scan (leaf, no nested calls -- alignment is a
+//     discipline anchor). The main body pushes rbx only, keeping the
+//     same posture as the M3-007 template; each widget setup is a
+//     straight-line phase that re-lea's rbx as its base and calls
+//     nested spec_init / _draw entries preserving rbx via SysV
+//     callee-save discipline.
+//   - Cross-module bare calls (block_spec_init, paragraph_spec_init,
+//     text_input_spec_init, span_init, line_init, text_init,
+//     list_state_init, table_state_init, layout_length, canvas_clear,
+//     canvas_line, fx_from_i64, and every <w>_draw) resolve via
+//     paideia-as's flat ELF symbol namespace -- same pattern
+//     boot_chart_canvas_smoke.pdx / boot_list_table_smoke.pdx use.
+//   - Effect row `!{mem} @{}` on boot_widget_catalog_smoke -- writes to
+//     every fixture slab and the buffer (transitively via every
+//     invoked spec_init / _draw / _init helper). No sysreg, no cap.
+//   - Labels prefixed `bwcs_` per docs fingerprint discipline.
+
+module BootWidgetCatalogSmoke = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDD0..0xFFFFEDDF per architecture.md sec.7)
+  // ==========================================================================
+  pub let BWCS_ERR_BLOCK_DRAW_RC      : u64 = 0xFFFFEDD0
+  pub let BWCS_ERR_PARAGRAPH_DRAW_RC  : u64 = 0xFFFFEDD1
+  pub let BWCS_ERR_LIST_DRAW_RC       : u64 = 0xFFFFEDD2
+  pub let BWCS_ERR_TABLE_DRAW_RC      : u64 = 0xFFFFEDD3
+  pub let BWCS_ERR_TABS_DRAW_RC       : u64 = 0xFFFFEDD4
+  pub let BWCS_ERR_SCROLLBAR_DRAW_RC  : u64 = 0xFFFFEDD5
+  pub let BWCS_ERR_GAUGE_DRAW_RC      : u64 = 0xFFFFEDD6
+  pub let BWCS_ERR_SPARKLINE_DRAW_RC  : u64 = 0xFFFFEDD7
+  pub let BWCS_ERR_BARCHART_DRAW_RC   : u64 = 0xFFFFEDD8
+  pub let BWCS_ERR_CHART_DRAW_RC      : u64 = 0xFFFFEDD9
+  pub let BWCS_ERR_CANVAS_DRAW_RC     : u64 = 0xFFFFEDDA
+  pub let BWCS_ERR_TEXT_INPUT_DRAW_RC : u64 = 0xFFFFEDDB
+  pub let BWCS_ERR_TREE_DRAW_RC       : u64 = 0xFFFFEDDC
+  pub let BWCS_ERR_CALENDAR_DRAW_RC   : u64 = 0xFFFFEDDD
+  pub let BWCS_ERR_CLEAR_DRAW_RC      : u64 = 0xFFFFEDDE
+  pub let BWCS_ERR_TILE_OR_GUARD      : u64 = 0xFFFFEDDF
+
+  // ==========================================================================
+  // Fixture-shape constants (exported so a downstream harness can replay
+  // the same geometry without decoding raw numerals from this file).
+  // ==========================================================================
+  pub let BWCS_ROWS       : u64 = 30
+  pub let BWCS_COLS       : u64 = 40
+  pub let BWCS_TILE_W     : u64 = 8
+  pub let BWCS_TILE_H     : u64 = 9
+  pub let BWCS_ROW_STRIDE : u64 = 640    // 40 cols * 16 B/cell
+
+  // ==========================================================================
+  // Static UTF-8 byte runs. Single-line pub let for every string literal
+  // per paideia-as pitfall (multi-line quoted form parses as a separate
+  // token stream and drops the pub let half).
+  // ==========================================================================
+  pub let _bwcs_str_b : [u8; 1] = "B"
+  pub let _bwcs_str_x : [u8; 1] = "X"
+
+  // ==========================================================================
+  // Shared buffer: 40 cols x 30 rows x 16 B = 19200 B = 2400 u64 slots.
+  // @align(16) so every (y*cols+x)*16 offset lands on a Cell boundary.
+  // ==========================================================================
+  pub let mut _bwcs_buffer : [u64; 2400] = uninit @align(16)
+
+  // ==========================================================================
+  // Shared auxiliary data (spans, lines, text) -- immutable to draw paths,
+  // so paragraph / list / table / tabs / tree can all point at the same
+  // "X" span/line without cross-contamination.
+  // ==========================================================================
+  pub let mut _bwcs_span_x  : [u64; 3] = uninit @align(8)    // Span (24 B)
+  pub let mut _bwcs_line_x  : [u64; 3] = uninit @align(8)    // Line (24 B)
+  pub let mut _bwcs_text_x  : [u64; 2] = uninit @align(8)    // Text (16 B)
+
+  // ==========================================================================
+  // Widget slot 0 (block): BlockSpec (48 B) = 6 u64.
+  // ==========================================================================
+  pub let mut _bwcs_block_spec : [u64; 6] = uninit @align(16)
+
+  // ==========================================================================
+  // Widget slot 1 (paragraph): ParagraphSpec (48 B) = 6 u64.
+  // ==========================================================================
+  pub let mut _bwcs_para_spec : [u64; 6] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 2 (list): ListSpec (64 B) = 8 u64.
+  // items_ptr -> _bwcs_line_x (single Line "X"), item_count=1.
+  // state_ptr = 0 (list_draw decodes as selected=NONE, offset=0).
+  // ==========================================================================
+  pub let mut _bwcs_list_spec : [u64; 8] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 3 (table): TableSpec (80 B) = 10 u64, plus auxiliary:
+  //   _bwcs_table_state       -- TableState 24 B (3 u64)
+  //   _bwcs_table_constraints -- 1 Constraint packed u64 (1 u64)
+  //   _bwcs_table_row         -- 1 TableRow 16 B (2 u64)
+  //     cells_ptr -> _bwcs_span_x, cell_count=1.
+  // ==========================================================================
+  pub let mut _bwcs_table_spec        : [u64; 10] = uninit @align(8)
+  pub let mut _bwcs_table_state       : [u64; 3]  = uninit @align(8)
+  pub let mut _bwcs_table_constraints : [u64; 1]  = uninit @align(8)
+  pub let mut _bwcs_table_row         : [u64; 2]  = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 4 (tabs): TabsSpec (56 B) = 7 u64.
+  // titles_ptr -> _bwcs_span_x, tab_count=1.
+  // ==========================================================================
+  pub let mut _bwcs_tabs_spec : [u64; 7] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 5 (scrollbar): ScrollbarSpec (56 B) = 7 u64.
+  // ==========================================================================
+  pub let mut _bwcs_scroll_spec : [u64; 7] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 6 (gauge): GaugeSpec (48 B) = 6 u64.
+  // ==========================================================================
+  pub let mut _bwcs_gauge_spec : [u64; 6] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 7 (sparkline): SparklineSpec (40 B) = 5 u64, plus 1 value.
+  // ==========================================================================
+  pub let mut _bwcs_spark_spec   : [u64; 5] = uninit @align(8)
+  pub let mut _bwcs_spark_values : [u64; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 8 (barchart): BarChartSpec (64 B) = 8 u64, plus 3 bars.
+  // ==========================================================================
+  pub let mut _bwcs_bar_spec : [u64; 8] = uninit @align(8)
+  pub let mut _bwcs_bar_bars : [u64; 3] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 9 (chart): ChartSpec (72 B) = 9 u64, plus 1 Dataset
+  // (32 B = 4 u64) and 1 Point (16 B = 2 u64).
+  // ==========================================================================
+  pub let mut _bwcs_chart_spec    : [u64; 9] = uninit @align(8)
+  pub let mut _bwcs_chart_dataset : [u64; 4] = uninit @align(8)
+  pub let mut _bwcs_chart_point   : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 10 (canvas): CanvasSpec (64 B) = 8 u64, plus bitmap
+  // (bw * bh = 8 * 9 = 72 B; use 9 u64 = 72 B).
+  // ==========================================================================
+  pub let mut _bwcs_canvas_spec   : [u64; 8] = uninit @align(8)
+  pub let mut _bwcs_canvas_bitmap : [u64; 9] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 11 (text_input): TextInputSpec (72 B) = 9 u64, plus 16 B
+  // input buffer (2 u64) holding a single byte 'X'.
+  // ==========================================================================
+  pub let mut _bwcs_ti_spec   : [u64; 9] = uninit @align(8)
+  pub let mut _bwcs_ti_buffer : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 12 (tree): TreeSpec (64 B) = 8 u64, plus 1 TreeNode
+  // (32 B = 4 u64). Label points at _bwcs_str_x.
+  // ==========================================================================
+  pub let mut _bwcs_tree_spec : [u64; 8] = uninit @align(8)
+  pub let mut _bwcs_tree_node : [u64; 4] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 13 (calendar): CalendarSpec (48 B) = 6 u64.
+  // ==========================================================================
+  pub let mut _bwcs_cal_spec : [u64; 6] = uninit @align(8)
+
+  // ==========================================================================
+  // Widget slot 14 (clear): ClearSpec (16 B) = 2 u64.
+  // ==========================================================================
+  pub let mut _bwcs_clear_spec : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // bwcs_tile_or_scan(base_ptr) -> u64
+  //
+  // Fixed-geometry OR-reduction over an 8-col x 9-row Cell tile (144
+  // qwords). Returns the OR of every qword in the tile; a zero return
+  // means every cell in the tile is zero. Row stride = 40 cols * 16 B
+  // = 640 B (BWCS_ROW_STRIDE).
+  //
+  // Register plan: leaf, no nested calls. Push rbx to satisfy the
+  // SysV callee-save discipline (rbx used as row-base cursor). rax
+  // holds the OR accumulator; r8 holds the inner column-cell qword
+  // load; r9 = row counter; r10 = per-row col cursor; rcx = inner
+  // cell counter.
+  //
+  // Labels prefixed `bwcs_ts_` per docs fingerprint discipline.
+  // ==========================================================================
+  pub let bwcs_tile_or_scan : (u64) -> u64 !{mem} @{} =
+    fn (base_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-008 (postui#34): bwcs_tile_or_scan reduces a fixed-geometry 8-col x 9-row Cell tile (144 qwords) via straight OR into rax. Register plan: leaf, push rbx (SysV callee-save; rbx tracks the per-row base). Outer y-loop counts 9 rows in r9, inner x-loop counts 8 cells in rcx and touches both qwords per cell via base+displacement addressing (mov r8, [r10+0]; or rax, r8; mov r8, [r10+8]; or rax, r8; add r10, 16). After each row, add rbx, 640 (BWCS_ROW_STRIDE = 40*16, imm32-safe) and re-seed r10 = rbx. Return rax. Every immediate (0, 8, 16, 640, 8, 9) fits imm32; no test, no imul, no and reg, imm64. Effect !{mem} (144 qword loads).",
+      block: {
+        push rbx;
+        mov rbx, rdi;                       // row-base cursor
+        xor rax, rax;                       // OR accumulator
+        mov r9, 9;                          // row counter
+      bwcs_ts_row_loop:
+        cmp r9, 0;
+        je  bwcs_ts_done;
+        mov r10, rbx;                       // per-row col cursor
+        mov rcx, 8;                         // cells per row
+      bwcs_ts_col_loop:
+        cmp rcx, 0;
+        je  bwcs_ts_row_next;
+        mov r8, [r10 + 0];
+        or  rax, r8;
+        mov r8, [r10 + 8];
+        or  rax, r8;
+        add r10, 16;
+        sub rcx, 1;
+        jmp bwcs_ts_col_loop;
+      bwcs_ts_row_next:
+        add rbx, 640;                       // BWCS_ROW_STRIDE
+        sub r9, 1;
+        jmp bwcs_ts_row_loop;
+      bwcs_ts_done:
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // boot_widget_catalog_smoke() -> u64
+  //
+  // Runs the catalog smoke end-to-end. Phases:
+  //
+  //   Phase 0: zero the 2400-qword shared buffer and every fixture slab.
+  //            Uninit .bss may hold arbitrary bytes from a prior run's
+  //            stack frame; a per-buffer zero-init makes the guard-row
+  //            invariant well-defined (every guard qword starts zero
+  //            and must stay zero) and lets the tile-non-empty scan
+  //            observe true "widget wrote something" without prior-run
+  //            bleed.
+  //
+  //   Phase 1: build shared auxiliary data (Span "X", Line, Text).
+  //
+  //   Phases 2..16: for each of the 15 widget catalog slots -- build
+  //            the widget's minimal spec, invoke its draw entry point,
+  //            check rc == 0, and OR-scan the tile to prove at least
+  //            one non-zero qword exists.
+  //
+  //   Phase 17: guard-row check -- walk rows 9, 19, 29 (240 qwords)
+  //            and assert every qword is still zero.
+  //
+  // Returns 0 on ALL passes. First failure short-circuits with a
+  // family-specific sentinel; the smoke harness can attribute the
+  // failure without a full-value table lookup.
+  //
+  // Register plan: nullary entry. 1-push (rbx) = 8 B -- rsp%16 goes
+  // from entry 8 to 0, aligned for every nested call. rbx caches
+  // whichever spec/aux base the current locality is writing into;
+  // every callee (bwcs_tile_or_scan, span_init, line_init, text_init,
+  // list_state_init, table_state_init, layout_length, block_spec_init,
+  // paragraph_spec_init, text_input_spec_init, fx_from_i64,
+  // canvas_clear, canvas_line, and every <w>_draw) is SysV-conformant
+  // and preserves rbx end-to-end.
+  //
+  // Labels prefixed `bwcs_` per docs fingerprint discipline.
+  // ==========================================================================
+  pub let boot_widget_catalog_smoke : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-008 (postui#34): boot_widget_catalog_smoke drives all 15 widget draw entrypoints against a 40x30 shared buffer laid out as 5x3 tiles (each 8x9 cells) with row-9/19/29 guard rows between tile rows. Structure follows M1-008 / M2-010 / M3-007 templates: 1-push (rbx) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for every nested call. Phase 0 zeros the shared buffer (2400 qwords) then zeros every fixture slab via a repeated qword-store loop reshaped by re-lea + re-mov counter (span 3, line 3, text 2, ti buffer 2, canvas bitmap 9); the widget spec slabs are overwritten wholesale in their setup phases so they need no pre-zero. Phase 1 seeds shared aux: span_init(rdi=&_bwcs_span_x, rsi=&_bwcs_str_x, rdx=1, rcx=0); line_init(&_bwcs_line_x, &_bwcs_span_x, 1, 0); text_init(&_bwcs_text_x, &_bwcs_line_x, 1). Phases 2..16 walk each widget: setup spec (via spec_init helper OR direct-store of the fields at fixed offsets), call widget_draw, check rc == 0 with jne to per-widget fail arm, then call bwcs_tile_or_scan at the widget's tile top-left byte offset and check the OR-accumulator is non-zero (je bwcs_fail_tile_or_guard). Every packed rect literal (0x00090008xxxxxxxx) is > 0x7FFFFFFF -> movabs (10-byte mov reg, imm64), legal for mov. block: block_spec_init(rect, kind_and_pad=1, title=&_bwcs_str_b, title_len=1). paragraph: paragraph_spec_init(rect, text_ptr, scroll=0, wrap_and_align=0 via xor r8, r8, style=0 via xor r9, r9). list: direct-store 8 slots (rect, _res=0, items_ptr, item_count=1, state=0, hl=0, def=0, _res=0). table: direct-store TableRow (cells_ptr, cell_count=1); layout_length(4) into constraints[0]; table_state_init(sel=0xFF..FF via xor rsi/sub rsi,1, off=0); direct-store TableSpec 10 slots. tabs: direct-store 7 slots. scrollbar: direct-store 7 slots with content=10, viewport=5, pos=2, style_track=1, style_thumb=2. gauge: direct-store 6 slots with value=50, max=100, kind=0 (Bar), style_filled=1. sparkline: direct-store values[0]=7, spec with value_count=1, max_override=7, style=1. barchart: direct-store bars[0..3]={7,3,5}, spec with bar_count=3, bar_width=1, max_override=7, style_bar=1. chart: fx_from_i64(0)/fx_from_i64(9) -> point (fx(0), fx(9)); direct-store Dataset (points_ptr, count=1, kind=1 SCATTER, marker=0); direct-store ChartSpec 9 slots with x_min=0, x_max=fx(8) via movabs, y_min=0, y_max=fx(9) via movabs, style_line=1. canvas: direct-store CanvasSpec (rect, x_min=0, x_max=fx(16) via movabs, y_min=0, y_max=fx(18) via movabs, bitmap_ptr, style=1, _res=0); canvas_clear (rc check); canvas_line(fx(0), fx(0), fx(15) via movabs, fx(17) via movabs) (rc check); canvas_draw (rc check). text_input: mov_b [_bwcs_ti_buffer+0], 'X' (0x58 via mov_b, low byte of rax); text_input_spec_init(rect, buffer_ptr, cap=16, buffer_len_and_cursor=0x0000000100000001 via movabs (imm > 0x7FFFFFFF; low32=len=1, high32=cursor=1), scroll_and_mode=0 via xor r9, r9). tree: direct-store TreeNode (label_ptr, label_len=1, children_ptr=0, packed_flags=0x8000000000000000 via movabs -- bit 63 expanded, child_count=0); direct-store TreeSpec 8 slots (root_ptr, sel=0, state=0, style_line=1, ...). calendar: direct-store 6 slots (rect, year=2026, month=1, day=0, style_normal=1, style_selected=0). clear: direct-store 2 slots (rect, style=1). Phase 17 guard-row check: three separate segments at byte offsets 5760 (row 9), 12160 (row 19), 18560 (row 29). Each segment: lea rbx, [_bwcs_buffer]; add rbx, offset; mov rcx, 80 (40 cells x 2 qwords); loop mov rax, [rbx+0]; cmp rax, 0; jne bwcs_fail_tile_or_guard; add rbx, 8; sub rcx, 1; jmp. Success: xor rax, rax; pop rbx; ret. Each fail arm: mov rax, 0xFFFFEDDx via movabs (imm > 0x7FFFFFFF; legal for mov); pop rbx; ret. Every immediate that reaches cmp (0, 1, 2, 3, 4, 5, 7, 8, 10, 16, 30, 40, 50, 80, 100, 2026, 2400 -- plus every byte offset 128, 256, 384, 512, 5760, 6400, 6528, 6656, 6784, 6912, 12160, 12800, 12928, 13056, 13184, 13312, 18560) fits imm32; every immediate in shift/add contexts fits imm32 similarly. Every large constant (packed rects 0x00090008..., Fixed64 constants 0x0000000{8,9,F}0000000/0x00000010/11/1200000000, buffer_len_and_cursor 0x0000000100000001, tree packed_flags 0x8000000000000000, fail sentinels 0xFFFFEDDx) is loaded via mov reg, imm64 (movabs, legal for mov). No test, no imul, no and, no cmp reg, imm > 0x7FFFFFFF, no cmp reg, [mem]. Every callee (bwcs_tile_or_scan, span_init, line_init, text_init, list_state_init, table_state_init, layout_length, block_spec_init, paragraph_spec_init, text_input_spec_init, fx_from_i64, canvas_clear, canvas_line, and every <w>_draw) resolves via paideia-as's flat ELF symbol namespace. Effect !{mem} covers every fixture store and buffer readback. rbx caches whichever spec/aux base the current locality is writing to; every callee is SysV-conformant and preserves rbx across the whole test. Labels prefixed bwcs_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+
+        // ==================================================================
+        // Phase 0: zero the shared buffer (2400 qwords).
+        // ==================================================================
+        xor rax, rax;
+        lea rbx, [rip + _bwcs_buffer];
+        mov rcx, 2400;
+      bwcs_zbuf_loop:
+        cmp rcx, 0;
+        je  bwcs_zbuf_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_zbuf_loop;
+      bwcs_zbuf_done:
+
+        // ==================================================================
+        // Phase 0b: zero every fixture slab. Uninit .bss may hold stale
+        // bytes; per-spec zero-init makes every direct-store phase idempotent
+        // against dirty memory (reserved slots stay zero even without an
+        // explicit mov, and helper-init calls overwrite only their own
+        // fields).
+        // ==================================================================
+        // Batches: span_x(3), line_x(3), text_x(2) = 8 qwords contiguous
+        // in intent but not in .bss layout -- use separate loops per slab
+        // so the source clearly documents each zero region.
+        xor rax, rax;
+        lea rbx, [rip + _bwcs_span_x];
+        mov rcx, 3;
+      bwcs_zspan_loop:
+        cmp rcx, 0;
+        je  bwcs_zspan_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_zspan_loop;
+      bwcs_zspan_done:
+
+        lea rbx, [rip + _bwcs_line_x];
+        mov rcx, 3;
+      bwcs_zline_loop:
+        cmp rcx, 0;
+        je  bwcs_zline_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_zline_loop;
+      bwcs_zline_done:
+
+        lea rbx, [rip + _bwcs_text_x];
+        mov rcx, 2;
+      bwcs_ztext_loop:
+        cmp rcx, 0;
+        je  bwcs_ztext_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_ztext_loop;
+      bwcs_ztext_done:
+
+        lea rbx, [rip + _bwcs_ti_buffer];
+        mov rcx, 2;
+      bwcs_ztibuf_loop:
+        cmp rcx, 0;
+        je  bwcs_ztibuf_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_ztibuf_loop;
+      bwcs_ztibuf_done:
+
+        lea rbx, [rip + _bwcs_canvas_bitmap];
+        mov rcx, 9;
+      bwcs_zcvsbmp_loop:
+        cmp rcx, 0;
+        je  bwcs_zcvsbmp_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_zcvsbmp_loop;
+      bwcs_zcvsbmp_done:
+
+        // ==================================================================
+        // Phase 1: build shared aux (Span "X", Line, Text).
+        // span_init(dst, str_ptr, byte_len, style)
+        // ==================================================================
+        lea rdi, [rip + _bwcs_span_x];
+        lea rsi, [rip + _bwcs_str_x];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        // line_init(dst, spans_ptr, span_count, alignment)
+        lea rdi, [rip + _bwcs_line_x];
+        lea rsi, [rip + _bwcs_span_x];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        // text_init(dst, lines_ptr, line_count)
+        lea rdi, [rip + _bwcs_text_x];
+        lea rsi, [rip + _bwcs_line_x];
+        mov rdx, 1;
+        call text_init;
+
+        // ==================================================================
+        // Phase 2: widget slot 0 -- BLOCK at (0, 0, 8, 9).
+        // block_spec_init(dst, rect, kind_and_pad, title_ptr, title_len)
+        //   rect = 0x0009000800000000 (movabs, imm > 0x7FFFFFFF)
+        //   kind_and_pad = 1 (PLAIN, all pads 0; imm32-safe)
+        //   title = "B" (1 byte)
+        // ==================================================================
+        lea rdi, [rip + _bwcs_block_spec];
+        mov rsi, 0x0009000800000000;
+        mov rdx, 1;
+        lea rcx, [rip + _bwcs_str_b];
+        mov r8, 1;
+        call block_spec_init;
+
+        lea rdi, [rip + _bwcs_block_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call block_draw;
+        cmp rax, 0;
+        jne bwcs_fail_block_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 3: widget slot 1 -- PARAGRAPH at (8, 0, 8, 9).
+        // paragraph_spec_init(dst, rect, text_ptr, scroll, wrap_and_align, style)
+        // ==================================================================
+        lea rdi, [rip + _bwcs_para_spec];
+        mov rsi, 0x0009000800000008;
+        lea rdx, [rip + _bwcs_text_x];
+        xor rcx, rcx;
+        xor r8, r8;
+        xor r9, r9;
+        call paragraph_spec_init;
+
+        lea rdi, [rip + _bwcs_para_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call paragraph_draw;
+        cmp rax, 0;
+        jne bwcs_fail_paragraph_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 128;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 4: widget slot 2 -- LIST at (16, 0, 8, 9).
+        // Direct-store ListSpec (64 B, 8 slots).
+        //   rect, _reserved_a=0, items_ptr, item_count=1, state_ptr=0,
+        //   highlight_style=0, default_style=0, _reserved_b=0.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_list_spec];
+        mov rax, 0x0009000800000010;
+        mov [rbx + 0], rax;
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // _reserved_a
+        lea rax, [rip + _bwcs_line_x];
+        mov [rbx + 16], rax;                // items_ptr
+        mov rax, 1;
+        mov [rbx + 24], rax;                // item_count
+        xor rax, rax;
+        mov [rbx + 32], rax;                // state_ptr = 0
+        mov [rbx + 40], rax;                // highlight_style = 0
+        mov [rbx + 48], rax;                // default_style = 0
+        mov [rbx + 56], rax;                // _reserved_b = 0
+
+        lea rdi, [rip + _bwcs_list_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call list_draw;
+        cmp rax, 0;
+        jne bwcs_fail_list_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 256;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 5: widget slot 3 -- TABLE at (24, 0, 8, 9).
+        // Direct-store TableRow (16 B), layout_length(4) -> constraint,
+        // table_state_init, direct-store TableSpec (80 B).
+        // ==================================================================
+        // TableRow: cells_ptr, cell_count=1
+        lea rbx, [rip + _bwcs_table_row];
+        lea rax, [rip + _bwcs_span_x];
+        mov [rbx + 0], rax;                 // cells_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // cell_count
+
+        // Constraint: layout_length(4)
+        mov rdi, 4;
+        call layout_length;
+        lea rbx, [rip + _bwcs_table_constraints];
+        mov [rbx + 0], rax;
+
+        // TableState: selected_row = 0xFF..FF (sentinel), offset = 0.
+        lea rdi, [rip + _bwcs_table_state];
+        xor rsi, rsi;
+        sub rsi, 1;
+        xor rdx, rdx;
+        call table_state_init;
+
+        // TableSpec direct-store (80 B, 10 slots).
+        lea rbx, [rip + _bwcs_table_spec];
+        mov rax, 0x0009000800000018;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_table_row];
+        mov [rbx + 8], rax;                 // rows_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // row_count
+        lea rax, [rip + _bwcs_table_constraints];
+        mov [rbx + 24], rax;                // constraints_ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // column_count
+        xor rax, rax;
+        mov [rbx + 40], rax;                // header_ptr = 0
+        lea rax, [rip + _bwcs_table_state];
+        mov [rbx + 48], rax;                // state_ptr
+        xor rax, rax;
+        mov [rbx + 56], rax;                // highlight_style = 0
+        mov [rbx + 64], rax;                // default_style = 0
+        mov [rbx + 72], rax;                // reserved = 0
+
+        lea rdi, [rip + _bwcs_table_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call table_draw;
+        cmp rax, 0;
+        jne bwcs_fail_table_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 384;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 6: widget slot 4 -- TABS at (32, 0, 8, 9).
+        // Direct-store TabsSpec (56 B, 7 slots).
+        //   rect, titles_ptr, tab_count=1, selected=0, divider=0,
+        //   style_active=0, style_inactive=0.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_tabs_spec];
+        mov rax, 0x0009000800000020;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_span_x];
+        mov [rbx + 8], rax;                 // titles_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // tab_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // selected = 0
+        mov [rbx + 32], rax;                // divider = 0 (auto-elects default)
+        mov [rbx + 40], rax;                // style_active
+        mov [rbx + 48], rax;                // style_inactive
+
+        lea rdi, [rip + _bwcs_tabs_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call tabs_draw;
+        cmp rax, 0;
+        jne bwcs_fail_tabs_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 512;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 7: widget slot 5 -- SCROLLBAR at (0, 10, 8, 9).
+        // Direct-store ScrollbarSpec (56 B, 7 slots).
+        //   rect, orientation=0 (V), position=2, content_length=10,
+        //   viewport_length=5, style_track=1, style_thumb=2.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_scroll_spec];
+        mov rax, 0x00090008000A0000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // orientation = 0 (V)
+        mov rax, 2;
+        mov [rbx + 16], rax;                // position = 2
+        mov rax, 10;
+        mov [rbx + 24], rax;                // content_length = 10
+        mov rax, 5;
+        mov [rbx + 32], rax;                // viewport_length = 5
+        mov rax, 1;
+        mov [rbx + 40], rax;                // style_track = 1
+        mov rax, 2;
+        mov [rbx + 48], rax;                // style_thumb = 2
+
+        lea rdi, [rip + _bwcs_scroll_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call scrollbar_draw;
+        cmp rax, 0;
+        jne bwcs_fail_scrollbar_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 6400;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 8: widget slot 6 -- GAUGE at (8, 10, 8, 9).
+        // Direct-store GaugeSpec (48 B, 6 slots).
+        //   rect, value=50, max=100, kind=0 (Bar),
+        //   style_filled=1, style_empty=0.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_gauge_spec];
+        mov rax, 0x00090008000A0008;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 50;
+        mov [rbx + 8], rax;                 // value = 50
+        mov rax, 100;
+        mov [rbx + 16], rax;                // max = 100
+        xor rax, rax;
+        mov [rbx + 24], rax;                // kind = Bar
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_filled = 1
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_empty = 0
+
+        lea rdi, [rip + _bwcs_gauge_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call gauge_draw;
+        cmp rax, 0;
+        jne bwcs_fail_gauge_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 6528;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 9: widget slot 7 -- SPARKLINE at (16, 10, 8, 9).
+        // 1 value = 7 with max_override = 7 -> column 0 fills full height.
+        // Direct-store SparklineSpec (40 B, 5 slots).
+        // ==================================================================
+        lea rbx, [rip + _bwcs_spark_values];
+        mov rax, 7;
+        mov [rbx + 0], rax;                 // values[0] = 7
+
+        lea rbx, [rip + _bwcs_spark_spec];
+        mov rax, 0x00090008000A0010;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_spark_values];
+        mov [rbx + 8], rax;                 // values_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // value_count = 1
+        mov rax, 7;
+        mov [rbx + 24], rax;                // max_override = 7
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style = 1
+
+        lea rdi, [rip + _bwcs_spark_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call sparkline_draw;
+        cmp rax, 0;
+        jne bwcs_fail_sparkline_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 6656;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 10: widget slot 8 -- BARCHART at (24, 10, 8, 9).
+        // 3 bars = [7, 3, 5] with max_override = 7 -> bar 0 fills full height.
+        // Direct-store BarChartSpec (64 B, 8 slots).
+        // ==================================================================
+        lea rbx, [rip + _bwcs_bar_bars];
+        mov rax, 7;
+        mov [rbx + 0], rax;                 // bars[0] = 7
+        mov rax, 3;
+        mov [rbx + 8], rax;                 // bars[1] = 3
+        mov rax, 5;
+        mov [rbx + 16], rax;                // bars[2] = 5
+
+        lea rbx, [rip + _bwcs_bar_spec];
+        mov rax, 0x00090008000A0018;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_bar_bars];
+        mov [rbx + 8], rax;                 // bars_ptr
+        mov rax, 3;
+        mov [rbx + 16], rax;                // bar_count = 3
+        mov rax, 1;
+        mov [rbx + 24], rax;                // bar_width = 1
+        xor rax, rax;
+        mov [rbx + 32], rax;                // gap = 0
+        mov rax, 7;
+        mov [rbx + 40], rax;                // max_override = 7
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style_bar = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // style_bg = 0
+
+        lea rdi, [rip + _bwcs_bar_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call barchart_draw;
+        cmp rax, 0;
+        jne bwcs_fail_barchart_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 6784;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 11: widget slot 9 -- CHART at (32, 10, 8, 9).
+        // 1 SCATTER point at (fx(0), fx(9)) with y_max = fx(9) -- marker
+        // lands at top-left cell.
+        // ==================================================================
+        // Build the point via fx_from_i64 (per issue-directive precedent
+        // from M3-007: fx_from_i64 is the canonical Fixed64 builder).
+        mov rdi, 0;
+        call fx_from_i64;
+        lea rbx, [rip + _bwcs_chart_point];
+        mov [rbx + 0], rax;                 // x_fx = fx(0)
+        mov rdi, 9;
+        call fx_from_i64;
+        lea rbx, [rip + _bwcs_chart_point];
+        mov [rbx + 8], rax;                 // y_fx = fx(9)
+
+        // Dataset direct-store (32 B, 4 slots).
+        lea rbx, [rip + _bwcs_chart_dataset];
+        lea rax, [rip + _bwcs_chart_point];
+        mov [rbx + 0], rax;                 // points_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // point_count = 1
+        mov rax, 1;
+        mov [rbx + 16], rax;                // kind = SCATTER
+        xor rax, rax;
+        mov [rbx + 24], rax;                // marker = 0 (default)
+
+        // ChartSpec direct-store (72 B, 9 slots).
+        lea rbx, [rip + _bwcs_chart_spec];
+        mov rax, 0x00090008000A0020;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_chart_dataset];
+        mov [rbx + 8], rax;                 // datasets_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // dataset_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // x_min = fx(0) = 0
+        mov rax, 0x0000000800000000;
+        mov [rbx + 32], rax;                // x_max = fx(8) (movabs)
+        xor rax, rax;
+        mov [rbx + 40], rax;                // y_min = fx(0) = 0
+        mov rax, 0x0000000900000000;
+        mov [rbx + 48], rax;                // y_max = fx(9) (movabs)
+        mov rax, 1;
+        mov [rbx + 56], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 64], rax;                // style_axis = 0 (reserved)
+
+        lea rdi, [rip + _bwcs_chart_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call chart_draw;
+        cmp rax, 0;
+        jne bwcs_fail_chart_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 6912;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 12: widget slot 10 -- CANVAS at (0, 20, 8, 9).
+        // value-space (0..16, 0..18) -> dot-space (0..16, 0..27) ->
+        // cell-space (0..8, 0..9). canvas_line from (fx(0), fx(0)) to
+        // (fx(15), fx(17)) traces a diagonal that sets a dot in the
+        // top-left cell.
+        // ==================================================================
+        // Direct-store CanvasSpec (64 B, 8 slots).
+        lea rbx, [rip + _bwcs_canvas_spec];
+        mov rax, 0x0009000800140000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // x_min = fx(0) = 0
+        mov rax, 0x0000001000000000;
+        mov [rbx + 16], rax;                // x_max = fx(16) (movabs)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // y_min = fx(0) = 0
+        mov rax, 0x0000001200000000;
+        mov [rbx + 32], rax;                // y_max = fx(18) (movabs)
+        lea rax, [rip + _bwcs_canvas_bitmap];
+        mov [rbx + 40], rax;                // bitmap_ptr
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // _reserved = 0
+
+        // canvas_clear(spec) -- zeros bitmap
+        lea rdi, [rip + _bwcs_canvas_spec];
+        call canvas_clear;
+        cmp rax, 0;
+        jne bwcs_fail_canvas_rc;
+
+        // canvas_line(spec, x0=fx(0), y0=fx(0), x1=fx(15), y1=fx(17))
+        lea rdi, [rip + _bwcs_canvas_spec];
+        xor rsi, rsi;                       // x0 = fx(0) = 0
+        xor rdx, rdx;                       // y0 = fx(0) = 0
+        mov rcx, 0x0000000F00000000;        // x1 = fx(15) (movabs)
+        mov r8,  0x0000001100000000;        // y1 = fx(17) (movabs)
+        call canvas_line;
+        cmp rax, 0;
+        jne bwcs_fail_canvas_rc;
+
+        // canvas_draw(spec, buf, 30, 40)
+        lea rdi, [rip + _bwcs_canvas_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call canvas_draw;
+        cmp rax, 0;
+        jne bwcs_fail_canvas_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 12800;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 13: widget slot 11 -- TEXT_INPUT at (8, 20, 8, 9).
+        // Buffer holds "X" (1 byte); buffer_len=1, cursor_byte=1,
+        // mode=SingleLine. text_input_spec_init packs rect + buffer +
+        // len/cursor + scroll/mode; the zero-styles helper is skipped
+        // (init already zeros the two style slots).
+        // ==================================================================
+        // Stamp 'X' byte at buffer[0].
+        lea rbx, [rip + _bwcs_ti_buffer];
+        mov rax, 0x58;                      // 'X' == 0x58
+        mov_b [rbx + 0], rax;
+
+        // text_input_spec_init(dst, rect, buffer_ptr, buffer_cap,
+        //                       buffer_len_and_cursor, scroll_and_mode)
+        //   buffer_len_and_cursor = 1 (len) | 1<<32 (cursor)
+        //                         = 0x0000000100000001 (imm32-safe)
+        //   scroll_and_mode       = 0 (scroll=0, mode=SingleLine)
+        lea rdi, [rip + _bwcs_ti_spec];
+        mov rsi, 0x0009000800140008;
+        lea rdx, [rip + _bwcs_ti_buffer];
+        mov rcx, 16;
+        mov r8, 0x0000000100000001;
+        xor r9, r9;
+        call text_input_spec_init;
+
+        lea rdi, [rip + _bwcs_ti_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call text_input_draw;
+        cmp rax, 0;
+        jne bwcs_fail_text_input_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 12928;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 14: widget slot 12 -- TREE at (16, 20, 8, 9).
+        // Root TreeNode: label="X", 0 children, expanded=1 (bit 63 set).
+        // Direct-store TreeNode (32 B) then TreeSpec (64 B).
+        // ==================================================================
+        // TreeNode direct-store (32 B, 4 slots).
+        lea rbx, [rip + _bwcs_tree_node];
+        lea rax, [rip + _bwcs_str_x];
+        mov [rbx + 0], rax;                 // label_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // label_len = 1
+        xor rax, rax;
+        mov [rbx + 16], rax;                // children_ptr = 0
+        mov rax, 0x8000000000000000;
+        mov [rbx + 24], rax;                // packed_flags: bit 63 = expanded
+
+        // TreeSpec direct-store (64 B, 8 slots).
+        lea rbx, [rip + _bwcs_tree_spec];
+        mov rax, 0x0009000800140010;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bwcs_tree_node];
+        mov [rbx + 8], rax;                 // root_ptr
+        xor rax, rax;
+        mov [rbx + 16], rax;                // selected_ptr = 0
+        mov [rbx + 24], rax;                // state_ptr = 0
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected = 0
+        mov [rbx + 48], rax;                // _reserved_a = 0
+        mov [rbx + 56], rax;                // _reserved_b = 0
+
+        lea rdi, [rip + _bwcs_tree_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call tree_draw;
+        cmp rax, 0;
+        jne bwcs_fail_tree_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 13056;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 15: widget slot 13 -- CALENDAR at (24, 20, 8, 9).
+        // year=2026, month=1, selected_day=0. bw=8 >= 8 keeps the header
+        // row; bh=9 >= 3 keeps the grid.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_cal_spec];
+        mov rax, 0x0009000800140018;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 2026;
+        mov [rbx + 8], rax;                 // year
+        mov rax, 1;
+        mov [rbx + 16], rax;                // month = January
+        xor rax, rax;
+        mov [rbx + 24], rax;                // selected_day = 0 (none)
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_normal = 1
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected = 0
+
+        lea rdi, [rip + _bwcs_cal_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call calendar_draw;
+        cmp rax, 0;
+        jne bwcs_fail_calendar_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 13184;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 16: widget slot 14 -- CLEAR at (32, 20, 8, 9).
+        // ClearSpec (16 B, 2 slots): rect + style.
+        // ==================================================================
+        lea rbx, [rip + _bwcs_clear_spec];
+        mov rax, 0x0009000800140020;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // style = 1
+
+        lea rdi, [rip + _bwcs_clear_spec];
+        lea rsi, [rip + _bwcs_buffer];
+        mov rdx, 30;
+        mov rcx, 40;
+        call clear_draw;
+        cmp rax, 0;
+        jne bwcs_fail_clear_rc;
+
+        lea rdi, [rip + _bwcs_buffer];
+        add rdi, 13312;
+        call bwcs_tile_or_scan;
+        cmp rax, 0;
+        je  bwcs_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 17: guard-row check. Walk row 9, row 19, row 29 (80 qwords
+        // per row = 40 cells x 2 qwords/cell) and assert every qword is
+        // still zero. A single non-zero qword short-circuits to the
+        // shared tile-or-guard sentinel.
+        // ==================================================================
+        // Row 9 (byte offset 5760 = (9 * 40) * 16).
+        lea rbx, [rip + _bwcs_buffer];
+        add rbx, 5760;
+        mov rcx, 80;
+      bwcs_g9_loop:
+        cmp rcx, 0;
+        je  bwcs_g9_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne bwcs_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_g9_loop;
+      bwcs_g9_done:
+
+        // Row 19 (byte offset 12160 = (19 * 40) * 16).
+        lea rbx, [rip + _bwcs_buffer];
+        add rbx, 12160;
+        mov rcx, 80;
+      bwcs_g19_loop:
+        cmp rcx, 0;
+        je  bwcs_g19_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne bwcs_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_g19_loop;
+      bwcs_g19_done:
+
+        // Row 29 (byte offset 18560 = (29 * 40) * 16).
+        lea rbx, [rip + _bwcs_buffer];
+        add rbx, 18560;
+        mov rcx, 80;
+      bwcs_g29_loop:
+        cmp rcx, 0;
+        je  bwcs_g29_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne bwcs_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bwcs_g29_loop;
+      bwcs_g29_done:
+
+        // ==================================================================
+        // All checks passed.
+        // ==================================================================
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      bwcs_fail_block_rc:
+        mov rax, 0xFFFFEDD0;
+        pop rbx;
+        ret;
+
+      bwcs_fail_paragraph_rc:
+        mov rax, 0xFFFFEDD1;
+        pop rbx;
+        ret;
+
+      bwcs_fail_list_rc:
+        mov rax, 0xFFFFEDD2;
+        pop rbx;
+        ret;
+
+      bwcs_fail_table_rc:
+        mov rax, 0xFFFFEDD3;
+        pop rbx;
+        ret;
+
+      bwcs_fail_tabs_rc:
+        mov rax, 0xFFFFEDD4;
+        pop rbx;
+        ret;
+
+      bwcs_fail_scrollbar_rc:
+        mov rax, 0xFFFFEDD5;
+        pop rbx;
+        ret;
+
+      bwcs_fail_gauge_rc:
+        mov rax, 0xFFFFEDD6;
+        pop rbx;
+        ret;
+
+      bwcs_fail_sparkline_rc:
+        mov rax, 0xFFFFEDD7;
+        pop rbx;
+        ret;
+
+      bwcs_fail_barchart_rc:
+        mov rax, 0xFFFFEDD8;
+        pop rbx;
+        ret;
+
+      bwcs_fail_chart_rc:
+        mov rax, 0xFFFFEDD9;
+        pop rbx;
+        ret;
+
+      bwcs_fail_canvas_rc:
+        mov rax, 0xFFFFEDDA;
+        pop rbx;
+        ret;
+
+      bwcs_fail_text_input_rc:
+        mov rax, 0xFFFFEDDB;
+        pop rbx;
+        ret;
+
+      bwcs_fail_tree_rc:
+        mov rax, 0xFFFFEDDC;
+        pop rbx;
+        ret;
+
+      bwcs_fail_calendar_rc:
+        mov rax, 0xFFFFEDDD;
+        pop rbx;
+        ret;
+
+      bwcs_fail_clear_rc:
+        mov rax, 0xFFFFEDDE;
+        pop rbx;
+        ret;
+
+      bwcs_fail_tile_or_guard:
+        mov rax, 0xFFFFEDDF;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

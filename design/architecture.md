@@ -887,6 +887,7 @@ names:
 | `test_boot_smoke`          | `0xFFFFEDA0..0xFFFFEDAF` | M1-008 |
 | `test_boot_list_table_smoke` | `0xFFFFEDB0..0xFFFFEDBF` | M2-010 |
 | `test_boot_chart_canvas_smoke` | `0xFFFFEDC0..0xFFFFEDCF` | M3-007 |
+| `test_boot_widget_catalog_smoke` | `0xFFFFEDD0..0xFFFFEDDF` | M4-008 |
 
 Every family follows the shell precedent's shape: each test case
 allocates a distinct sentinel in its band, an umbrella
