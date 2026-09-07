@@ -1,0 +1,708 @@
+// tools/scraper_example.pdx -- postui.M5-002 (paideia-os/postui#36)
+//
+// ScraperExample: a minimal read-only semantic-pipe subscriber example.
+// Demonstrates the M2-009 Binding pattern (src/semantic_registry.pdx)
+// end-to-end as a tool binary rather than a library API: three static
+// Binding slabs are initialized against the LSVW / TABV / GGVW schemas,
+// three fixture records are dispatched THROUGH those bindings, and each
+// callback prints a one-line human-readable summary of the record it
+// received via sys_write(1, buf, len).
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.3, §5.1 M5-002)
+// =============================================================================
+//
+// Per docs/design.md §5.1 M5 the "scraper example" is the FIRST tool
+// binary shipped alongside postui: a read-only subscriber client for a
+// running app's semantic pipe. Real "over-the-wire" subscription needs
+// libpdx-semantic-pipe's sys_semantic_send syscall (still stubbed at v1
+// per SemanticRegistry::semantic_send docs -- postui#42 tracks the
+// syscall reservation); until that lands, this example runs the
+// dispatch loop IN-PROCESS so the wiring shape is demonstrable without
+// waiting on the kernel-side substrate:
+//
+//   1. Initialize three static Binding slabs, one per schema (LSVW /
+//      TABV / GGVW), against three on-module callbacks (on_list,
+//      on_tabs, on_gauge). The Binding wire is the 24-byte layout
+//      SemanticRegistry::SEM_BINDING_BYTES pins.
+//
+//   2. Lay three fixture view-records in .bss: an LSVW record
+//      (40 B, item_count=42, selected=7), a TABV record (56 B,
+//      tab_count=4, selected=1), and a GGVW record (32 B, value=75,
+//      max=100). The RECT slots are zero -- the print output only
+//      exercises the semantic fields, not geometry.
+//
+//   3. Call SemanticRegistry::semantic_binding_dispatch three times,
+//      once per (binding, record) pair. Each call schema-matches, then
+//      tail-calls the corresponding on_* callback with (record_ptr,
+//      record_len). Each callback formats a summary line and emits it
+//      via sys_write to stdout.
+//
+//   4. Return 0 from scraper_main; _start exits with that status via
+//      sys_exit(0).
+//
+// The in-process dispatch harness is faithful to the future over-the-
+// wire shape: when SemanticRegistry::semantic_send flips its
+// SEMANTIC_SEND_LIVE marker to 1 and starts issuing the real syscall,
+// the SUBSCRIBER side (this example) needs zero changes -- the same
+// Binding slab and the same semantic_binding_dispatch call drive the
+// callback either way. The ONLY code path that gains a syscall is the
+// PUBLISHER's semantic_send; the subscriber's schema-match + tail-call
+// path is already what a live libpdx-semantic-pipe receive-loop would
+// invoke on each incoming frame (design.md §2.3 last paragraph).
+//
+// =============================================================================
+// TOOL-BINARY SHAPE (not a library file)
+// =============================================================================
+//
+// postui itself is a userspace LIBRARY (manifest.pdxproj kind = library,
+// no _start). tools/scraper_example.pdx is the FIRST tool binary in the
+// repo: it carries a _start entry that the ELF loader jumps to when a
+// paideia-os shell invokes the compiled binary. The manifest still
+// declares this file's compilation unit (see manifest.pdxproj sources
+// section update in this landing) so tools/build.sh picks it up, but
+// downstream packaging treats it as a tool image rather than a library
+// object -- the release-manifest signer's tarball layer will drop
+// /bin/postui-scraper-example rather than a linkable .o.
+//
+// The self-contained pattern (inlined syscalls, no libpdx-* link
+// dependency) mirrors paideia-os/src/user/true.pdx exactly: one .pdx
+// file compiled to one loose ELF64 object, containing every symbol its
+// _start reaches. Cross-module calls (SemanticRegistry's
+// semantic_binding_init / semantic_binding_dispatch) resolve via
+// paideia-as's flat ELF symbol namespace -- the same discipline
+// tests/boot_block_smoke.pdx uses when it `call block_spec_init`s
+// across the module boundary. build-out/scraper_example.o and
+// build-out/semantic_registry.o get linked into the final tool binary
+// by the downstream packaging step (release-manifest layer at
+// postui.M5-003; today the loose objects both compile cleanly and are
+// ready to link when M5-003 lands).
+//
+// =============================================================================
+// FIXTURE WIRE VALUES
+// =============================================================================
+//
+// LSVW record (40 bytes, src/widgets/list.pdx L273..280):
+//   [+0]   magic       u32 = 0x5756534C ("LSVW" LE)
+//   [+4]   record_len  u32 = 40
+//   [+8]   rect        u64 = 0 (unused for the print output)
+//   [+16]  item_count  u64 = 42
+//   [+24]  selected    u64 = 7
+//   [+32]  offset      u64 = 0
+//
+// TABV record (56 bytes, src/widgets/tabs.pdx L312..321):
+//   [+0]   magic          u32 = 0x56424154 ("TABV" LE)
+//   [+4]   record_len     u32 = 56
+//   [+8]   rect           u64 = 0
+//   [+16]  tab_count      u64 = 4
+//   [+24]  selected       u64 = 1
+//   [+32]  divider        u64 = 0
+//   [+40]  style_active   u64 = 0
+//   [+48]  style_inactive u64 = 0
+//
+// GGVW record (32 bytes, src/widgets/gauge.pdx L235..241):
+//   [+0]   magic       u32 = 0x57564747 ("GGVW" LE)
+//   [+4]   record_len  u32 = 32
+//   [+8]   rect        u64 = 0
+//   [+16]  value       u64 = 75
+//   [+24]  max         u64 = 100
+//
+// The magic + record_len pair at [+0..+8) is stamped in ONE qword store
+// using the combined value (record_len << 32) | magic (little-endian
+// packing). Each combined value:
+//   LSVW: (40 << 32) | 0x5756534C = 0x000000285756534C
+//   TABV: (56 << 32) | 0x56424154 = 0x0000003856424154
+//   GGVW: (32 << 32) | 0x57564747 = 0x0000002057564747
+// All three exceed imm32 (>= 0x28_00000000) so paideia-as emits the
+// 10-byte movabs form -- legal for mov (not for cmp/and) and matches
+// the block_spec_init default-fill_cell pattern at block.pdx L321.
+//
+// The schema magics themselves are re-loaded standalone for the
+// dispatch call (rsi=incoming_schema) using the imm32-safe form
+// (0x5756534C, 0x56424154, 0x57564747 all < 0x7FFFFFFF), which paideia-as
+// encodes as 5-byte `mov r32, imm32`.
+//
+// =============================================================================
+// EXPECTED STDOUT (deterministic byte-for-byte fingerprint)
+// =============================================================================
+//
+//   LSVW event: count=42 selected=7
+//   TABV event: tab_count=4 selected=1
+//   GGVW event: value=75 max=100
+//
+// Trailing newline after each line. Numbers are decimal ASCII (right-
+// end contiguous), formatted by scr_emit_u64 via a divmod-10 chain into
+// a shared 32-byte .bss scratch, then sys_write'd through stdout. The
+// three lines total 96 output bytes across NINE sys_write calls (three
+// prefix + two number + one separator + one newline per record).
+//
+// =============================================================================
+// SC+ SYSCALL NUMBERS (design/user/syscall-table.md L44..64)
+// =============================================================================
+//
+//   1  = sys_write(fd, buf, count) -> bytes_written or -errno
+//   60 = sys_exit(status) -- never returns
+//
+// Both are inlined directly (no libpdx-syscall link dependency), same
+// self-contained shape true.pdx uses. rdi/rsi/rdx map identically from
+// SysV to SYSCALL arg registers so no shuffle is needed for either.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ScraperExample`), matches
+//     file basename `scraper_example.pdx` (snake_case -> PascalCase
+//     via paideia-as's module-registry rule -- same discipline every
+//     other .pdx in this tree follows).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` (imm8).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 or 10 appear
+//     in this file). Combined magic|record_len values exceed imm32 but
+//     are only ever LOADED via `mov reg, imm64` (movabs, 10-byte, legal
+//     for mov even though not for cmp/and) -- never compared as an
+//     immediate.
+//   - Every schema magic (0x5756534C, 0x56424154, 0x57564747) fits
+//     imm32 signed positive so `mov rsi, imm` for the dispatch schema
+//     load emits the compact 5-byte form.
+//   - No 2-op `imul reg, imm` (no address arithmetic at this tier).
+//   - No `and reg, imm64` (no bit-masking beyond byte-level literal
+//     stores which use the byte-store forms mov_b).
+//   - Reserved-label prefix `scr_` throughout (scr_eu_ for
+//     scr_emit_u64's loop arms).
+//   - Effect row `!{mem, sysreg} @{fs}` on every function that emits
+//     via sys_write; `!{mem, sysreg} @{fs, sched}` on _start which
+//     adds the sys_exit call (sched cap widening matches true.pdx).
+//     Union chosen per src/user/syscall_shim.pdx sys_write and sys_exit
+//     effect declarations in paideia-os.
+//   - Callback prologue (`push rbx`) sits 8 bytes = 1 push, rounds
+//     callback-entry rsp%16==8 to 0, aligning nested `call scr_write`
+//     / `call scr_emit_u64`. rbx is SysV callee-save so it survives
+//     both nested calls (both are pure leafs that touch only caller-
+//     save regs including rcx/r11 clobbered by syscall).
+//   - scraper_main's alignment: `sub rsp, 8` (no callee-save needed
+//     across the six nested calls -- semantic_binding_init /
+//     semantic_binding_dispatch both preserve every SysV callee-save
+//     register per their justification blocks in semantic_registry.pdx).
+//   - _start entry rsp%16 == 0 (ELF process-init convention per
+//     AMD64 ABI § 3.4.1); no prologue needed for its single nested
+//     `call scraper_main` which is already aligned.
+//   - `lea reg, [rip + label]` uses r11 as paideia-as's internal
+//     scratch; every subsequent `mov r11, imm` explicitly overwrites
+//     that scratch value before use so no stale content survives
+//     (matches the calendar.pdx L346 discipline note).
+//   - Byte load followed by defensive zero-extend (`xor rax, rax;
+//     mov_b rax, ...`) is not needed here -- scr_emit_u64 works with
+//     full-qword arithmetic and never byte-loads. mov_b is used only
+//     for BYTE STORES which are unaffected by paideia-as pitfall #1248.
+//   - Cross-module calls: `call semantic_binding_init`, `call
+//     semantic_binding_dispatch` resolve via the flat ELF symbol
+//     namespace exactly as tests/boot_block_smoke.pdx does with
+//     `call block_spec_init` / `call widget_draw`. The scraper's own
+//     inner callbacks (on_list / on_tabs / on_gauge) are referenced
+//     via `lea rdx, [rip + on_<...>]` for the binding-init callback
+//     slot -- that lands the function's entry-address as a u64 which
+//     semantic_binding_dispatch consumes at [rdi+8].
+
+module ScraperExample = structure {
+
+  // ==========================================================================
+  // Schema magics (mirror src/semantic_registry.pdx SEMANTIC_SCHEMA_*).
+  // Redeclared here so the tool binary is self-contained -- a fresh
+  // reader of this file can trace every immediate back to a label
+  // without cross-module hunting. All three fit imm32 signed positive
+  // so paideia-as's `mov r32, imm32` emitter picks the compact 5-byte
+  // form at every load site.
+  // ==========================================================================
+  pub let SCR_LSVW_MAGIC : u64 = 0x5756534C
+  pub let SCR_TABV_MAGIC : u64 = 0x56424154
+  pub let SCR_GGVW_MAGIC : u64 = 0x57564747
+
+  pub let SCR_LSVW_BYTES : u64 = 40
+  pub let SCR_TABV_BYTES : u64 = 56
+  pub let SCR_GGVW_BYTES : u64 = 32
+
+  // ==========================================================================
+  // Print templates (single-line pub let strings per paideia-as
+  // multi-line quoted-form pitfall). Each length is fixed at design
+  // time and hard-coded at every scr_write call site so the emit
+  // path never re-reads a length constant.
+  // ==========================================================================
+  pub let _scr_lsvw_pre : [u8; 18] = "LSVW event: count="
+  pub let _scr_lsvw_sep : [u8; 10] = " selected="
+  pub let _scr_tabv_pre : [u8; 22] = "TABV event: tab_count="
+  pub let _scr_tabv_sep : [u8; 10] = " selected="
+  pub let _scr_ggvw_pre : [u8; 18] = "GGVW event: value="
+  pub let _scr_ggvw_sep : [u8; 5]  = " max="
+  pub let _scr_nl       : [u8; 1]  = "\n"
+
+  // ==========================================================================
+  // Scratch buffer for u64 -> decimal ASCII conversion. Max u64
+  // (18446744073709551615) is 20 decimal digits, 32 bytes gives
+  // comfortable slack. Single shared slot is safe because callbacks
+  // are invoked serially by the in-process dispatch harness and each
+  // call emits its digits + sys_write's them before the next call
+  // touches the buffer.
+  // ==========================================================================
+  pub let mut _scr_num_buf : [u8; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // Static Binding slabs (24 B = 3 u64 slots each, per
+  // SemanticRegistry::SEM_BINDING_BYTES). Populated at scraper_main
+  // start by three semantic_binding_init calls. Layout matches the
+  // wire the dispatch primitive reads:
+  //   [+0]  schema   (SCR_<TAG>_MAGIC)
+  //   [+8]  callback (on_<...>)
+  //   [+16] reserved (zero on init)
+  // ==========================================================================
+  pub let mut _scr_bind_list  : [u64; 3] = uninit @align(8)
+  pub let mut _scr_bind_tabs  : [u64; 3] = uninit @align(8)
+  pub let mut _scr_bind_gauge : [u64; 3] = uninit @align(8)
+
+  // ==========================================================================
+  // Fixture view-record slabs. LSVW = 5 u64 (40 B), TABV = 7 u64
+  // (56 B), GGVW = 4 u64 (32 B). Populated at scraper_main start.
+  // ==========================================================================
+  pub let mut _scr_rec_list  : [u64; 5] = uninit @align(8)
+  pub let mut _scr_rec_tabs  : [u64; 7] = uninit @align(8)
+  pub let mut _scr_rec_gauge : [u64; 4] = uninit @align(8)
+
+  // ==========================================================================
+  // scr_write(buf, len) -> u64
+  //
+  // Thin sys_write(1, buf, len) wrapper. Returns whatever the kernel
+  // returned (bytes written, or a negative errno). SC+ ID 1 per
+  // design/user/syscall-table.md; three SysV arg registers map
+  // identically to the first three SYSCALL arg registers so the shuffle
+  // is a two-move rotation: rsi <- rdi (buf), rdx <- rsi (len). rdi
+  // then gets the fd literal 1, rax the sysno. Pure leaf: syscall
+  // clobbers rcx/r11 (both SysV caller-save, harmless).
+  //
+  // Callers pass the total emit length inline so this function need
+  // not walk the buffer to compute it -- every prefix / separator /
+  // newline literal has a design-time-fixed length.
+  //
+  // Register plan: rdi=buf (moved to rsi), rsi=len (moved to rdx),
+  // rax=sysno. Pure leaf: no callee-save touched, no push/pop, no
+  // nested call.
+  // ==========================================================================
+  pub let scr_write : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): scr_write is a two-move sys_write(1, buf, len) wrapper. SysV rdi=buf, rsi=len. SYSCALL wants rdi=fd, rsi=buf, rdx=count. Two-move shuffle in dependency-safe order: mov rdx, rsi (len -> count) FIRST, then mov rsi, rdi (buf -> buf slot) -- reading rsi before we overwrite it. Then mov rdi, 1 (fd = stdout, imm8) and mov rax, 1 (SC+ ID 1, imm8) and syscall. Kernel returns bytes written or -errno in rax; wrapper returns that verbatim. Pure leaf: no push/pop, no callee-save touched, no nested call. syscall clobbers rcx/r11 (both SysV caller-save, harmless). No test, no imul, no and, no cmp. All immediates fit imm8. Effect !{mem, sysreg} + capability @{fs} matches paideia-os/src/user/syscall_shim.pdx sys_write declaration. Labels: none (straight-line body).",
+      block: {
+        mov rdx, rsi;
+        mov rsi, rdi;
+        mov rdi, 1;
+        mov rax, 1;
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // scr_emit_u64(val) -> u64
+  //
+  // Convert val (rdi) to decimal ASCII in _scr_num_buf and sys_write
+  // it to stdout. Returns 0. Digits are written right-to-left via a
+  // divmod-10 chain; the cursor r8 walks down from the end of the
+  // scratch and the sys_write call emits [r8, end) as the digit run.
+  //
+  // Zero is handled specially: skip the divmod loop, write a single
+  // '0' byte at the last slot. Non-zero: divmod loop until quotient
+  // reaches 0.
+  //
+  // Register plan:
+  //   rdi = val (working value in rax after first mov)
+  //   r8  = cursor (walks down from end)
+  //   r9  = end sentinel (unchanged across body; used for length)
+  //   rax = working value / syscall sysno / return
+  //   rcx = divisor (10)
+  //   rdx = remainder / syscall count / scratch
+  //   rsi = syscall buf (after cursor computation)
+  //
+  // Pure leaf: no push/pop, no callee-save touched, no nested call.
+  // syscall clobbers rcx/r11 (both SysV caller-save, harmless). The
+  // paideia-as `lea reg, [rip + label]` internal r11 scratch is
+  // sidestepped by only leaing INTO r8 (never a subsequent read of
+  // r11 by this function -- syscall would clobber it anyway).
+  //
+  // Labels prefixed scr_eu_ per docs fingerprint discipline
+  // (scr_eu_zero for the val==0 arm, scr_eu_loop for the divmod arm,
+  // scr_eu_write for the shared emit tail).
+  // ==========================================================================
+  pub let scr_emit_u64 : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (val: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): scr_emit_u64 converts rdi to decimal ASCII in _scr_num_buf, sys_writes it to stdout, returns 0. Phase 1 (cursor init): lea r8, [rip + _scr_num_buf] (paideia-as's lea uses r11 as internal scratch; leaing to r8 lets r11 stay dirty which is fine because we never read r11 in this function -- syscall would clobber it anyway); add r8, 32 (imm8; r8 now = one-past-end sentinel); mov r9, r8 (r9 = end sentinel, unchanged across body, used for length compute after emit). mov rax, rdi (working value); mov rcx, 10 (divisor, imm8). Phase 2 (special-case zero): cmp rax, 0 (imm8); jne scr_eu_loop. Zero path: sub r8, 1; mov rdx, 0x30 (imm8, '0'); mov_b [r8 + 0], rdx (byte store using low byte of rdx); jmp scr_eu_write. Phase 3 (divmod loop scr_eu_loop): xor rdx, rdx (clear high divide operand); div rcx (unsigned rdx:rax / rcx -> rax=quotient, rdx=remainder 0..9); add rdx, 0x30 (imm8, digit -> ASCII); sub r8, 1 (advance cursor); mov_b [r8 + 0], rdx (byte store); cmp rax, 0 (imm8); jne scr_eu_loop. Same shape used across the codebase (calendar.pdx L365/373/381, fixed64.pdx L493). Phase 4 (emit scr_eu_write): mov rsi, r8 (buf = first digit); mov rdx, r9 (count staging); sub rdx, r8 (count = end - first_digit); mov rdi, 1 (fd = stdout, imm8); mov rax, 1 (SC+ ID sys_write, imm8); syscall. Phase 5: xor rax, rax; ret. All immediates (0, 1, 10, 32, 0x30) fit imm8. No test, no imul, no and reg,imm64, no cmp reg,imm64. Pure leaf: no push/pop, no callee-save touched, no nested call. Effect !{mem, sysreg} @{fs}. Labels prefixed scr_eu_ per fingerprint discipline.",
+      block: {
+        // ---- Phase 1: cursor init (r8 = end, r9 = end sentinel) -----------
+        lea r8, [rip + _scr_num_buf];
+        add r8, 32;
+        mov r9, r8;
+
+        mov rax, rdi;
+        mov rcx, 10;
+
+        cmp rax, 0;
+        jne scr_eu_loop;
+
+        // ---- Phase 2: val == 0 special case -------------------------------
+        sub r8, 1;
+        mov rdx, 0x30;
+        mov_b [r8 + 0], rdx;
+        jmp scr_eu_write;
+
+        // ---- Phase 3: divmod-10 loop --------------------------------------
+      scr_eu_loop:
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        sub r8, 1;
+        mov_b [r8 + 0], rdx;
+        cmp rax, 0;
+        jne scr_eu_loop;
+
+        // ---- Phase 4: sys_write(1, r8, r9 - r8) ---------------------------
+      scr_eu_write:
+        mov rsi, r8;
+        mov rdx, r9;
+        sub rdx, r8;
+        mov rdi, 1;
+        mov rax, 1;
+        syscall;
+
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // on_list(record_ptr, record_len) -> u64
+  //
+  // LSVW schema callback. Emits:
+  //   "LSVW event: count=<item_count> selected=<selected>\n"
+  //
+  // record_ptr (rdi) points at a 40-byte LSVW record; item_count sits
+  // at [+16] and selected at [+24] per src/widgets/list.pdx L273..280.
+  // record_len (rsi) is 40 but unread -- the callback trusts the
+  // upstream length and reads the two u64 fields at their fixed slots.
+  //
+  // Register plan:
+  //   rbx (pushed) = record_ptr snapshot for post-nested-call reload
+  //   Nested calls to scr_write and scr_emit_u64 (both leafs but
+  //   both invoke syscall which clobbers rcx/r11).
+  //
+  // Callback-entry rsp%16 == 8 (set by semantic_binding_dispatch's
+  // `sub rsp, 8; call rax` bracket which turns dispatch-entry
+  // rsp%16==8 into 0 immediately before the call, so callee sees 8
+  // again). `push rbx` (8 B) rounds to 0, aligning every nested call.
+  //
+  // Labels prefixed on_ls_ per docs fingerprint discipline (none
+  // needed at v1 -- straight-line body, no branches).
+  // ==========================================================================
+  pub let on_list : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): on_list is the LSVW callback registered in _scr_bind_list. Snapshots record_ptr (rdi) to rbx across the five nested calls -- rbx is SysV callee-save so it survives every nested syscall and every scr_write/scr_emit_u64 leaf (both preserve callee-save). push rbx (8 B) rounds callback-entry rsp%16==8 to 0, aligning nested SysV calls. Sequence: (1) print prefix `LSVW event: count=` via lea rdi, [rip + _scr_lsvw_pre]; mov rsi, 18 (imm8); call scr_write. (2) print item_count: mov rdi, [rbx + 16]; call scr_emit_u64. (3) print separator ` selected=` via lea rdi, [rip + _scr_lsvw_sep]; mov rsi, 10 (imm8); call scr_write. (4) print selected: mov rdi, [rbx + 24]; call scr_emit_u64. (5) print newline via lea rdi, [rip + _scr_nl]; mov rsi, 1 (imm8); call scr_write. Return 0 via xor rax, rax. pop rbx; ret. All immediates (16, 24, 18, 10, 1) fit imm8. No test, no imul, no and reg,imm64, no cmp. lea into rdi uses r11 as internal scratch (paideia-as's lea discipline); we never read r11 across the function -- syscall would clobber it anyway. Effect !{mem, sysreg} @{fs} same as scr_write / scr_emit_u64 (both callees). record_len (rsi) is unread -- the callback trusts upstream length. Labels prefixed on_ls_ per fingerprint discipline (none needed -- straight-line body).",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        // ---- prefix: "LSVW event: count=" (18 bytes) ----------------------
+        lea rdi, [rip + _scr_lsvw_pre];
+        mov rsi, 18;
+        call scr_write;
+
+        // ---- item_count ---------------------------------------------------
+        mov rdi, [rbx + 16];
+        call scr_emit_u64;
+
+        // ---- separator: " selected=" (10 bytes) ---------------------------
+        lea rdi, [rip + _scr_lsvw_sep];
+        mov rsi, 10;
+        call scr_write;
+
+        // ---- selected -----------------------------------------------------
+        mov rdi, [rbx + 24];
+        call scr_emit_u64;
+
+        // ---- newline ------------------------------------------------------
+        lea rdi, [rip + _scr_nl];
+        mov rsi, 1;
+        call scr_write;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // on_tabs(record_ptr, record_len) -> u64
+  //
+  // TABV schema callback. Emits:
+  //   "TABV event: tab_count=<tab_count> selected=<selected>\n"
+  //
+  // record_ptr (rdi) points at a 56-byte TABV record; tab_count sits
+  // at [+16] and selected at [+24] per src/widgets/tabs.pdx L312..321.
+  //
+  // Same prologue/register-plan/label discipline as on_list.
+  // ==========================================================================
+  pub let on_tabs : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): on_tabs is the TABV callback registered in _scr_bind_tabs. Same shape as on_list -- push rbx snapshots record_ptr across five nested calls (prefix, tab_count u64, separator, selected u64, newline). tab_count at [rbx+16] and selected at [rbx+24] per src/widgets/tabs.pdx TABV_OFF_TAB_COUNT / TABV_OFF_SELECTED. Prefix length = 22 (`TABV event: tab_count=`), separator length = 10 (` selected=`). All immediates (16, 22, 24, 10, 1) fit imm8. All conformance notes identical to on_list -- lea's r11 scratch is harmless because we never read r11; syscall would clobber it. Effect !{mem, sysreg} @{fs}. Labels prefixed on_tv_ per fingerprint discipline (none needed -- straight-line body).",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        // ---- prefix: "TABV event: tab_count=" (22 bytes) ------------------
+        lea rdi, [rip + _scr_tabv_pre];
+        mov rsi, 22;
+        call scr_write;
+
+        // ---- tab_count ----------------------------------------------------
+        mov rdi, [rbx + 16];
+        call scr_emit_u64;
+
+        // ---- separator: " selected=" (10 bytes) ---------------------------
+        lea rdi, [rip + _scr_tabv_sep];
+        mov rsi, 10;
+        call scr_write;
+
+        // ---- selected -----------------------------------------------------
+        mov rdi, [rbx + 24];
+        call scr_emit_u64;
+
+        // ---- newline ------------------------------------------------------
+        lea rdi, [rip + _scr_nl];
+        mov rsi, 1;
+        call scr_write;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // on_gauge(record_ptr, record_len) -> u64
+  //
+  // GGVW schema callback. Emits:
+  //   "GGVW event: value=<value> max=<max>\n"
+  //
+  // record_ptr (rdi) points at a 32-byte GGVW record; value sits at
+  // [+16] and max at [+24] per src/widgets/gauge.pdx L235..241.
+  //
+  // Same prologue/register-plan/label discipline as on_list.
+  // ==========================================================================
+  pub let on_gauge : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): on_gauge is the GGVW callback registered in _scr_bind_gauge. Same shape as on_list -- push rbx snapshots record_ptr across five nested calls (prefix, value u64, separator, max u64, newline). value at [rbx+16] and max at [rbx+24] per src/widgets/gauge.pdx GGVW_OFF_VALUE / GGVW_OFF_MAX. Prefix length = 18 (`GGVW event: value=`), separator length = 5 (` max=`). All immediates (16, 18, 24, 5, 1) fit imm8. All conformance notes identical to on_list -- lea's r11 scratch is harmless because we never read r11; syscall would clobber it. Effect !{mem, sysreg} @{fs}. Labels prefixed on_gg_ per fingerprint discipline (none needed -- straight-line body).",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        // ---- prefix: "GGVW event: value=" (18 bytes) ----------------------
+        lea rdi, [rip + _scr_ggvw_pre];
+        mov rsi, 18;
+        call scr_write;
+
+        // ---- value --------------------------------------------------------
+        mov rdi, [rbx + 16];
+        call scr_emit_u64;
+
+        // ---- separator: " max=" (5 bytes) ---------------------------------
+        lea rdi, [rip + _scr_ggvw_sep];
+        mov rsi, 5;
+        call scr_write;
+
+        // ---- max ----------------------------------------------------------
+        mov rdi, [rbx + 24];
+        call scr_emit_u64;
+
+        // ---- newline ------------------------------------------------------
+        lea rdi, [rip + _scr_nl];
+        mov rsi, 1;
+        call scr_write;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // scraper_main() -> u64
+  //
+  // The in-process test harness: init three fixture records, init
+  // three bindings, dispatch three fake events, return 0.
+  //
+  // Phase 1 (record init): stamp magic|record_len as one qword store
+  // per record using the combined (record_len << 32) | magic value
+  // (movabs), then write the semantic scalar fields (item_count,
+  // selected, etc.) with imm8 loads. Rect and other unused slots are
+  // zeroed via xor+store.
+  //
+  // Phase 2 (binding init): three semantic_binding_init calls, one
+  // per (binding_slot, schema_magic, callback) triple.
+  //
+  // Phase 3 (dispatch): three semantic_binding_dispatch calls, one
+  // per (binding_ptr, incoming_schema, record_ptr, record_len)
+  // quadruple. Each dispatch schema-matches (magic == binding's
+  // stored schema), null-guards the callback (non-null after init),
+  // then tail-calls the callback which emits the summary line.
+  //
+  // Register plan: `sub rsp, 8` rounds SysV entry rsp%16==8 to 0
+  // (aligned for the six nested calls). No callee-save preservation
+  // needed -- every intermediate value is a fresh lea/mov before
+  // the next call. Nested callees (semantic_binding_init,
+  // semantic_binding_dispatch, and transitively on_*) all preserve
+  // SysV callee-save regs per their own justification blocks.
+  //
+  // Labels prefixed scr_m_ per docs fingerprint discipline (none
+  // needed at v1 -- straight-line body, no branches).
+  // ==========================================================================
+  pub let scraper_main : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "postui.M5-002 (postui#36): scraper_main runs the in-process test harness. sub rsp, 8 (imm8) rounds SysV entry rsp%16==8 to 0, aligning six nested calls (three semantic_binding_init + three semantic_binding_dispatch). Phase 1 (record init) stamps three fixture records in .bss. LSVW record: lea rax, [rip + _scr_rec_list]; mov r11, 0x000000285756534C (combined magic 0x5756534C + record_len 40<<32, movabs since imm > 0x7FFFFFFF, legal for mov); mov [rax+0], r11 (magic + record_len). Zero rect at [rax+8] via xor rdx + store; mov rdx, 42; mov [rax+16], rdx (item_count = 42, imm8); mov rdx, 7; mov [rax+24], rdx (selected = 7, imm8); xor rdx + mov [rax+32], rdx (offset = 0). TABV record: same shape with combined value 0x0000003856424154 (magic + record_len 56<<32, movabs), tab_count = 4 (imm8), selected = 1 (imm8), rect / divider / style_active / style_inactive all zeroed. GGVW record: combined value 0x0000002057564747 (magic + record_len 32<<32, movabs), value = 75 (imm8), max = 100 (imm8), rect zeroed. lea uses r11 as internal scratch (paideia-as discipline); every subsequent mov r11, imm64 explicitly overwrites that scratch. Phase 2 (binding init): three semantic_binding_init calls with (binding_slot, schema, callback) each: lea rdi, [rip + _scr_bind_list]; mov rsi, 0x5756534C (imm32, 5-byte form); lea rdx, [rip + on_list] (function pointer as u64); call semantic_binding_init. Repeat for tabs (schema 0x56424154, callback on_tabs) and gauge (schema 0x57564747, callback on_gauge). Phase 3 (dispatch): three semantic_binding_dispatch calls with (binding_ptr, incoming_schema, record_ptr, record_len): lea rdi, [rip + _scr_bind_list]; mov rsi, 0x5756534C; lea rdx, [rip + _scr_rec_list]; mov rcx, 40 (imm8); call semantic_binding_dispatch. Repeat for tabs (schema 0x56424154, record _scr_rec_tabs, len 56) and gauge (schema 0x57564747, record _scr_rec_gauge, len 32). Each dispatch fires the tail-call to on_*, which prints its summary line. Return: xor rax, rax; add rsp, 8; ret. All non-magic immediates (8, 40, 42, 7, 56, 4, 1, 32, 75, 100) fit imm8. Schema magics (0x5756534C, 0x56424154, 0x57564747) all < 0x7FFFFFFF so mov rsi, imm emits 5-byte form. Combined magic+record_len values (all > 0x7FFFFFFF) use movabs, legal for mov. No test, no imul, no and reg,imm64, no cmp. Cross-module calls semantic_binding_init and semantic_binding_dispatch resolve via paideia-as's flat ELF symbol namespace. Labels prefixed scr_m_ per fingerprint discipline (none needed at v1 -- straight-line body, no branches).",
+      block: {
+        sub rsp, 8;
+
+        // ==================================================================
+        // Phase 1: initialize three fixture records
+        // ==================================================================
+
+        // ---- LSVW record (item_count=42, selected=7) ---------------------
+        lea rax, [rip + _scr_rec_list];
+        mov r11, 0x000000285756534C;
+        mov [rax + 0], r11;
+        xor rdx, rdx;
+        mov [rax + 8], rdx;
+        mov rdx, 42;
+        mov [rax + 16], rdx;
+        mov rdx, 7;
+        mov [rax + 24], rdx;
+        xor rdx, rdx;
+        mov [rax + 32], rdx;
+
+        // ---- TABV record (tab_count=4, selected=1) -----------------------
+        lea rax, [rip + _scr_rec_tabs];
+        mov r11, 0x0000003856424154;
+        mov [rax + 0], r11;
+        xor rdx, rdx;
+        mov [rax + 8], rdx;
+        mov rdx, 4;
+        mov [rax + 16], rdx;
+        mov rdx, 1;
+        mov [rax + 24], rdx;
+        xor rdx, rdx;
+        mov [rax + 32], rdx;
+        mov [rax + 40], rdx;
+        mov [rax + 48], rdx;
+
+        // ---- GGVW record (value=75, max=100) -----------------------------
+        lea rax, [rip + _scr_rec_gauge];
+        mov r11, 0x0000002057564747;
+        mov [rax + 0], r11;
+        xor rdx, rdx;
+        mov [rax + 8], rdx;
+        mov rdx, 75;
+        mov [rax + 16], rdx;
+        mov rdx, 100;
+        mov [rax + 24], rdx;
+
+        // ==================================================================
+        // Phase 2: initialize three Binding slabs
+        // ==================================================================
+
+        // ---- LSVW binding ------------------------------------------------
+        lea rdi, [rip + _scr_bind_list];
+        mov rsi, 0x5756534C;
+        lea rdx, [rip + on_list];
+        call semantic_binding_init;
+
+        // ---- TABV binding ------------------------------------------------
+        lea rdi, [rip + _scr_bind_tabs];
+        mov rsi, 0x56424154;
+        lea rdx, [rip + on_tabs];
+        call semantic_binding_init;
+
+        // ---- GGVW binding ------------------------------------------------
+        lea rdi, [rip + _scr_bind_gauge];
+        mov rsi, 0x57564747;
+        lea rdx, [rip + on_gauge];
+        call semantic_binding_init;
+
+        // ==================================================================
+        // Phase 3: dispatch three fixture events
+        // ==================================================================
+
+        // ---- LSVW dispatch -----------------------------------------------
+        lea rdi, [rip + _scr_bind_list];
+        mov rsi, 0x5756534C;
+        lea rdx, [rip + _scr_rec_list];
+        mov rcx, 40;
+        call semantic_binding_dispatch;
+
+        // ---- TABV dispatch -----------------------------------------------
+        lea rdi, [rip + _scr_bind_tabs];
+        mov rsi, 0x56424154;
+        lea rdx, [rip + _scr_rec_tabs];
+        mov rcx, 56;
+        call semantic_binding_dispatch;
+
+        // ---- GGVW dispatch -----------------------------------------------
+        lea rdi, [rip + _scr_bind_gauge];
+        mov rsi, 0x57564747;
+        lea rdx, [rip + _scr_rec_gauge];
+        mov rcx, 32;
+        call semantic_binding_dispatch;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _start: () -> ()
+  //
+  // ELF entry point per AMD64 ABI § 3.4.1. rsp is 16-byte-aligned at
+  // ELF process-init time (differs from a normal SysV call site
+  // where rsp%16==8). The single nested `call scraper_main` sees
+  // rsp%16==0 immediately before the call, which is exactly the
+  // alignment SysV requires. No prologue needed.
+  //
+  // Returns scraper_main's rax as the process exit status via
+  // sys_exit (SC+ ID 60). sys_exit never returns; the trailing hlt
+  // is defensive belt-and-suspenders for the impossible fallthrough
+  // (mirrors true.pdx).
+  //
+  // Effect union: scraper_main = {mem, sysreg} @{fs}; sys_exit =
+  // {sysreg} @{sched}. Union = {mem, sysreg} @{fs, sched} -- matches
+  // true.pdx exactly.
+  // ==========================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "postui.M5-002 (postui#36): _start is the ELF entry point of the scraper example tool binary. Per AMD64 ABI process-init convention rsp%16==0 at entry (not 8 like a normal SysV call site), so no prologue push/sub is needed for alignment -- the single nested `call scraper_main` already sees rsp%16==0. Sequence: (1) call scraper_main -- rax carries scraper_main's return (0 on OK). (2) sys_exit(rax): mov rdi, rax (status); mov rax, 60 (SC+ ID sys_exit, imm8); syscall. sys_exit never returns. (3) trailing hlt as defensive stop in case the kernel ever returned from ID 60 (impossible, but keeps the fallthrough from executing whatever bytes the linker places next -- mirrors src/user/true.pdx exactly). Effect union: scraper_main = {mem, sysreg} @{fs}; sys_exit = {sysreg} @{sched}. Union = {mem, sysreg} @{fs, sched} -- identical to true.pdx. All immediates (60) fit imm8. No test, no imul, no and, no cmp. No labels (straight-line body).",
+      block: {
+        call scraper_main;
+        mov rdi, rax;
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    }
+
+}

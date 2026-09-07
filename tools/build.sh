@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # postui — per-repo build script.
 #
-# Compiles every src/*.pdx (and, when present, every tests/*.pdx)
+# Compiles every src/*.pdx, tests/*.pdx (when present), and tools/*.pdx
 # to a loose ELF64 object under build-out/ via `paideia-as build`.
-# postui is a userspace library, not a tool: no _start, no single
-# link target, no per-profile split -- every source is a stand-alone
-# module the downstream consumer link line pulls in.
+# postui itself is a userspace library -- src/*.pdx modules have no
+# _start and no single link target; every source is a stand-alone
+# module the downstream consumer link line pulls in. The tools/*.pdx
+# files are the exception: each is a small tool binary (starting with
+# postui.M5-002 scraper_example.pdx) that carries its own _start and
+# is linked with the library objects into a standalone ELF program by
+# the downstream packaging step.
 #
 # Resolves paideia-as via (in order):
 #   1. $PAIDEIA_AS env var
@@ -88,7 +92,7 @@ mkdir -p "$BUILD_DIR"
 FAIL=0
 COUNT=0
 
-for pdx in src/*.pdx src/widgets/*.pdx src/input/*.pdx; do
+for pdx in src/*.pdx src/widgets/*.pdx src/input/*.pdx tools/*.pdx; do
     [ -f "$pdx" ] || continue
     COUNT=$((COUNT + 1))
     base="$(basename "$pdx")"

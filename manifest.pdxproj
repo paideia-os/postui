@@ -104,6 +104,13 @@ tests:
 docs:
   - doc/postui.pdxdoc                       # M5-004: .pdxdoc source for the doc viewer
 
+# --- Tool binaries (M5-002+) -------------------------------------------
+# postui itself is a library (kind = library above) but the repo also
+# ships a small set of tool binaries that demonstrate library use as
+# real programs -- each carries its own _start.
+tools:
+  - tools/scraper_example.pdx               # M5-002: read-only semantic-pipe subscriber example
+
 # --- Paideia-as compliance flags ---------------------------------------
 # Same invariant set the shell / libpdx-* satellites observe. A build
 # under a non-conforming paideia-as revision refuses fast in tools/
