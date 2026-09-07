@@ -1,0 +1,1322 @@
+// src/widgets/text_input.pdx -- postui.M4-001 (paideia-os/postui#27)
+//
+// TextInput / TextArea widget: cursor math, byte-level insert/delete,
+// UTF-8 codepoint-aware cursor movement, single-line or wrapped
+// multi-line render, plus TextInputView@0.1 semantic-pipe record.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog row TextInput; §5.1 M4-001)
+// =============================================================================
+//
+// TextInput is the 14th ordinal (WK_TEXTINPUT = 13) in the closed widget
+// catalog and the first M4 landing. It is the first postui widget with
+// mutating state: unlike Paragraph / List / Table (all read-only over a
+// caller-supplied Text or Row array), TextInput OWNS a caller-provided
+// UTF-8 byte buffer through spec fields (buffer_ptr, buffer_cap,
+// buffer_len, cursor_byte) and mutates it in-place via the insert /
+// delete / cursor_left / cursor_right primitives. The buffer itself is
+// still caller-owned memory (no heap allocation, matching postui's
+// no-allocator posture) -- TextInput only bumps the len / cursor
+// bookkeeping fields inside the spec and shifts bytes inside the
+// caller's buffer.
+//
+// This landing ships:
+//   - The TextInputSpec state record (72-byte struct laid out in memory;
+//     see WIRE block below). One packed Rect + eight u64 fields.
+//   - text_input_spec_init: pack a TextInputSpec into caller-provided
+//     memory. Included for parity with every other widget's spec_init
+//     even though the M4-001 issue text does not name it explicitly --
+//     downstream tests and callers need a total constructor that does
+//     not skip the discipline of writing every slot.
+//   - text_input_insert: insert one byte at cursor, advance cursor,
+//     shift tail. Returns TI_ERR_BUFFER_FULL if the buffer has no room.
+//   - text_input_delete: backspace -- delete byte before cursor, shift
+//     tail left. Returns TI_ERR_CURSOR_AT_START if cursor == 0.
+//   - text_input_cursor_left: walk cursor back one UTF-8 codepoint,
+//     respecting continuation bytes so the cursor never lands mid-
+//     codepoint.
+//   - text_input_cursor_right: walk cursor forward one UTF-8 codepoint,
+//     using the lead-byte class (2/3/4-byte) to compute the advance.
+//   - text_input_draw: widget_draw-shape entry (spec_ptr, buf_ptr, rows,
+//     cols) -> u64. SingleLine mode renders one visible row honouring
+//     scroll_col; MultiLine mode word-wraps to the Rect width via
+//     Text::line_break_positions and stamps into successive rows. Both
+//     modes overlay a cursor cell (style_cursor) at the byte address
+//     cursor_byte -- or, when the cursor sits past the last byte
+//     (cursor_byte == buffer_len), at the empty display cell where the
+//     next inserted byte would appear.
+//   - text_input_view_pack: pack a TextInputView@0.1 semantic-pipe
+//     record (40 bytes; magic "TIVW", record_len, rect, cursor_byte,
+//     buffer_len, mode) into caller-provided memory. The buffer BYTES
+//     themselves are deliberately NOT copied through the semantic pipe
+//     -- per BlockView / ParagraphView precedent the view is a control-
+//     plane snapshot, and text bytes are per-process behind buffer_ptr.
+//
+// =============================================================================
+// TEXTINPUTSPEC WIRE (72 bytes, TI_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect           u64 packed (x, y, w, h) per Rect wire
+//                                    (identical to every other widget's
+//                                    +0 slot; a shared cell-index helper
+//                                    can be lifted later without
+//                                    re-shaping this record).
+//   [+ 8..+16)   buffer_ptr     u64 pointer to caller-owned UTF-8 byte
+//                                    buffer. The buffer is per-process
+//                                    memory (stack slot, static, or
+//                                    Buffer-adjacent) -- TextInput does
+//                                    NOT allocate. A null buffer_ptr is
+//                                    a caller bug (insert/delete/draw
+//                                    would fault on first dereference);
+//                                    the constructor is total and stores
+//                                    the field verbatim.
+//   [+16..+24)   buffer_cap     u64 maximum bytes the buffer holds.
+//                                    text_input_insert returns
+//                                    TI_ERR_BUFFER_FULL when
+//                                    buffer_len >= buffer_cap.
+//   [+24..+32)   buffer_len     u64 current used bytes (0..=buffer_cap).
+//                                    Mutated in place by insert (bump +1)
+//                                    and delete (bump -1).
+//   [+32..+40)   cursor_byte    u64 cursor byte offset in [0, buffer_len].
+//                                    cursor_byte == buffer_len is the
+//                                    "cursor at end" state; a valid
+//                                    cursor is always at a codepoint
+//                                    boundary (never on a UTF-8
+//                                    continuation byte) because
+//                                    cursor_left / cursor_right walk in
+//                                    codepoint steps and insert /
+//                                    delete are byte-level (the caller
+//                                    is expected to feed insert / delete
+//                                    sequences that preserve UTF-8
+//                                    well-formedness).
+//   [+40..+48)   scroll_col     u64 leftmost visible byte offset for
+//                                    horizontal scroll (SingleLine mode
+//                                    only). A byte at buffer offset i
+//                                    lands at visible column (i -
+//                                    scroll_col) when
+//                                    scroll_col <= i < scroll_col + bw;
+//                                    else off-screen. Ignored in
+//                                    MultiLine mode (wrap consumes the
+//                                    horizontal axis).
+//   [+48..+56)   mode           u64 0 = SingleLine, 1 = MultiLine
+//                                    (TextArea). Any other value at
+//                                    draw time is treated as SingleLine
+//                                    (documented v1 tolerance; a future
+//                                    revision may trap through an
+//                                    added TI_ERR_BAD_MODE sentinel).
+//   [+56..+64)   style_normal   u64 packed Style (Style module wire) for
+//                                    every non-cursor cell.
+//   [+64..+72)   style_cursor   u64 packed Style for the cursor cell;
+//                                    typically a REVERSED-mods variant
+//                                    of style_normal (an inverse-video
+//                                    block cursor). Applied to the
+//                                    display cell containing cursor_byte
+//                                    -- or to an empty space cell when
+//                                    cursor_byte == buffer_len.
+//
+// The 72-byte size falls between BlockSpec/ParagraphSpec (48 B) and
+// ScrollbarSpec (56 B); every field is 8-byte aligned so the draw body
+// loads each with a single qword mov. 72 % 16 = 8 -- not cache-line
+// aligned but no widget hot path crosses that line: text_input_draw
+// reads every spec field ONCE at prologue into stack slots and never
+// re-reads through spec_ptr in the render loops.
+//
+// The M4-001 issue estimated "~80B"; 72 B is the actual size with the
+// naturally-shaped 9-slot layout. The 8-byte delta is not material to
+// downstream slot-arena sizing (which already keys off the max spec
+// size across kinds; TextInputSpec becomes the new max at M4 landing,
+// bumping past ScrollbarSpec's 56 B).
+//
+// =============================================================================
+// TEXTINPUTVIEW@0.1 WIRE (40 bytes fixed, TIVW_RECORD_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic          u32 = 0x57564954 ("TIVW" LE)
+//   [+ 4..+ 8)   record_len     u32 = 40
+//   [+ 8..+16)   rect_pack      u64 verbatim from TextInputSpec+0
+//   [+16..+24)   cursor_byte    u64 verbatim from TextInputSpec+32
+//   [+24..+32)   buffer_len     u64 verbatim from TextInputSpec+24
+//   [+32..+40)   mode           u64 verbatim from TextInputSpec+48
+//
+// buffer_ptr / buffer_cap / scroll_col / style_normal / style_cursor
+// are deliberately excluded -- buffer_ptr is a per-process address
+// (semantically meaningless to a downstream reader), buffer_cap is a
+// caller-allocation detail, scroll_col is transient render state, and
+// the two style words are visual attributes (no semantic weight, same
+// exclusion Scrollbar's own view record makes for its style_track /
+// style_thumb; see src/widgets/scrollbar.pdx L142-145).
+//
+// The four u64 payload slots keep the record fully qword-aligned; no
+// pad loop is needed. record_len at 40 (u32) matches the fixed-length
+// posture ParagraphView, GaugeView, and ScrollbarView all take.
+//
+// TIVW_MAGIC = 0x57564954 (< 0x7FFFFFFF) so paideia-as emits the
+// compact 5-byte `mov r32, imm32` form at the header store, not the
+// 10-byte movabs.
+//
+// =============================================================================
+// ERROR BAND (0xFFFFEBE0..0xFFFFEBEF, M4 batch)
+// =============================================================================
+//
+// The M2 batch owns 0xFFFFEBC0..CF (Layout / Width / Text / Paragraph
+// / Scrollbar); the M3 batch reserves 0xFFFFEBD0..DF (Gauge / Sparkline
+// / BarChart / Chart / Canvas). The M4 batch starts at 0xFFFFEBE0.
+// TextInput takes the low two slots:
+//
+//   TI_ERR_BUFFER_FULL     : 0xFFFFEBE0 -- text_input_insert with
+//                            buffer_len >= buffer_cap. The insert
+//                            leaves the buffer unchanged (no
+//                            partial-write); the caller can free space
+//                            (e.g. via text_input_delete) and retry.
+//   TI_ERR_CURSOR_AT_START : 0xFFFFEBE1 -- text_input_delete with
+//                            cursor_byte == 0. The delete leaves the
+//                            buffer unchanged. Callers can key on this
+//                            specific sentinel to render a bell / no-op
+//                            audible cue rather than aborting the frame.
+//
+// (0xFFFFEBE2..EF reserved for future M4 widget landings: paragraph-
+// scroll wraparound, list-search-not-found, table-column-overflow, etc.)
+//
+// Both sentinels exceed 0x7FFFFFFF -- `mov reg, imm` is emitted by
+// paideia-as as movabs (10-byte imm64 form), legal for mov but NEVER
+// legal in cmp/and. Callers gate error detection via
+// `cmp rax, POSTUI_ERR_BAND_BASE` staged through a scratch register (or
+// via the `cmp rax, 1; ja error` shortcut against the OK/error split
+// since both sentinels are >> 1).
+//
+// =============================================================================
+// UTF-8 CURSOR DISCIPLINE
+// =============================================================================
+//
+// text_input_cursor_left walks the byte at cursor_byte - 1 back through
+// contiguous UTF-8 continuation bytes (0x80..0xBF) until it lands on a
+// lead byte or a lone ASCII byte (< 0x80) -- so the cursor NEVER stops
+// mid-codepoint. If cursor_byte == 0 on entry, the function is a no-op
+// (returns 0 without touching the spec).
+//
+// text_input_cursor_right reads the byte at cursor_byte, dispatches on
+// its lead-byte class:
+//
+//   b < 0x80      -> advance 1 (ASCII, complete one-byte codepoint)
+//   b < 0xC0      -> advance 1 (stray continuation; defensive -- a
+//                    well-formed cursor never lands here)
+//   b < 0xE0      -> advance 2 (2-byte lead)
+//   b < 0xF0      -> advance 3 (3-byte lead)
+//   b < 0xF8      -> advance 4 (4-byte lead)
+//   else          -> advance 1 (invalid lead 0xF8+, U+FFFD substitute)
+//
+// The result is clamped against buffer_len so a truncated multi-byte
+// sequence at the tail (a 3-byte lead with only one byte remaining, for
+// instance) still leaves the cursor at buffer_len rather than past it.
+// If cursor_byte >= buffer_len on entry, the function is a no-op.
+//
+// text_input_insert and text_input_delete are BYTE-level operations by
+// design (the M4-001 issue text explicitly frames them as "insert one
+// byte" / "delete byte before cursor"). Well-formed UTF-8 sequence
+// preservation is the caller's responsibility -- an editor stack that
+// wants codepoint-atomic edits assembles them from insert() sequences
+// for the encoded bytes of a codepoint and delete() sequences that walk
+// back over continuation bytes first. This shape keeps the M4-001
+// landing register-local and total, matching the byte-scan discipline
+// Width and Text already use.
+//
+// =============================================================================
+// DRAW ALGORITHM (text_input_draw)
+// =============================================================================
+//
+// The draw body branches once on `mode`, running one of two body shapes.
+// Both share the same prologue (arg cache, rect extract, early exits)
+// and the same cell-write shape (word0 = byte | style<<32-ish laid via
+// paragraph_draw's two-store pattern: mov_d [dst+0], byte_zx and
+// mov [dst+4], style_masked -- byte lives in symbol slot's low byte,
+// upper 3 zero; style word covers fg/bg/mods; cell bytes 12..15 retain
+// their zeroed initial state from buffer_init).
+//
+// Both modes overlay the cursor cell in-place (not as a separate pass)
+// by choosing style_cursor over style_normal whenever the byte's
+// absolute buffer offset equals cursor_byte. A separate "cursor at end"
+// post-pass handles cursor_byte == buffer_len (no byte to overlay --
+// stamp an empty space cell with style_cursor).
+//
+// SingleLine mode (ti_dr_sl_):
+//   for c in [0, bw):
+//     abs = scroll_col + c
+//     if abs < buffer_len:
+//       byte  = buffer[abs]
+//       style = (abs == cursor_byte) ? style_cursor : style_normal
+//       stamp byte at (bx+c, by) with style
+//     else if c == cursor_byte - scroll_col AND cursor_byte == buffer_len:
+//       stamp space (0x20) at (bx+c, by) with style_cursor
+//     (else: leave cell as buffer_init already set it)
+//
+// MultiLine mode (ti_dr_ml_):
+//   Build a synthetic 24-B Span on stack: (ptr = buffer_ptr,
+//     byte_len = buffer_len, style = 0). Style is 0 in the synthetic
+//     Span because line_break_positions does not consult the Span
+//     style word (it only touches ptr / byte_len).
+//   Build a synthetic 24-B Line on stack: (spans_ptr = &span_slot,
+//     span_count = 1, alignment = 0).
+//   call line_break_positions(&line_slot, bw, break_array, 64) into a
+//     64-slot u64 array at [rsp+0..512). A return > 64 (error sentinel
+//     or over-cap) degrades to break_count = 0 -- the whole buffer is
+//     rendered as one visual row truncated at the right edge, matching
+//     paragraph_draw's own degrade posture (postui.M2-004).
+//   for seg_idx in [0, break_count + 1) while cur_y < ye:
+//     seg_end = (seg_idx < break_count) ? break[seg_idx] : buffer_len
+//     for byte_off in [seg_start, seg_end):
+//       col = byte_off - seg_start
+//       if col >= bw: break (right-edge truncation)
+//       byte  = buffer[byte_off]
+//       style = (byte_off == cursor_byte) ? style_cursor : style_normal
+//       stamp byte at (bx+col, cur_y) with style
+//     seg_start = seg_end
+//     cur_y += 1
+//   Post-pass (cursor at end):
+//     if cursor_byte == buffer_len:
+//       Find last segment: cursor_row = by + break_count,
+//                          cursor_col = buffer_len - (break_count == 0
+//                                                    ? 0
+//                                                    : break[break_count-1])
+//       if cursor_row < ye AND cursor_col < bw:
+//         stamp space (0x20) at (bx+cursor_col, cursor_row) with
+//         style_cursor
+//
+// Both modes leave every cell OUTSIDE the write set untouched -- the
+// caller's Frame::init zeroed the whole back region at bind time, so
+// unwritten cells render as space with default style (matching every
+// other postui widget's contract).
+//
+// v1 approximation: byte-per-cell for cell address computation
+// (matches paragraph_draw, list_draw, table_draw). A CJK codepoint's
+// 3-byte lead takes 3 cells rather than the 2 cells its display width
+// would call for; a combining mark takes 1 cell rather than 0. A v2
+// revision folding grapheme-cluster-aware address math lifts this to a
+// per-cell Width::char_display_width dispatch; the cell-write shape
+// stays byte-driven so the v2 change is localized to the address
+// arithmetic in the inner loop, not the outer segment structure.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TextInput`), matches file
+//     basename `text_input.pdx` per manifest.pdxproj snake_case ->
+//     PascalCase mapping (same rule SemanticRegistry follows at
+//     src/semantic_registry.pdx).
+//   - No `test` mnemonic anywhere; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension). The mov_b byte-STORES
+//     (used in insert/delete's shift loops and the buffer[cursor] write)
+//     are unaffected by that pitfall; only load-side needs the pre-zero.
+//   - All immediates in cmp/and fit imm32: 0, 1, 2, 3, 4, 0x20, 0x80,
+//     0xC0, 0xE0, 0xF0, 0xF8, 0xFFFF, 64 -- widest is 0xFFFF = 65535 for
+//     rect-field masks. Every shift count (3, 4, 8, 16, 32, 48) fits
+//     imm8.
+//   - The three sentinels (TI_ERR_BUFFER_FULL 0xFFFFEBE0,
+//     TI_ERR_CURSOR_AT_START 0xFFFFEBE1, and TIVW_MAGIC 0x57564954)
+//     are staged as follows: the two error sentinels via `mov reg,
+//     imm64` (movabs; imm > 0x7FFFFFFF, legal for mov not cmp/and);
+//     TIVW_MAGIC via `mov r32, imm32` (compact 5-byte form; imm <
+//     0x80000000). No sentinel ever appears in cmp/and.
+//   - No 2-op `imul reg, imm`. Every multiply is 2-op `imul reg, reg`
+//     with the constant staged into a scratch register first (used
+//     twice: for the cell address's y*cols product, and for the span-
+//     count-times-24-byte stride during the synthetic-line setup;
+//     actually the synthetic line uses span_count = 1 so the stride
+//     step is unnecessary -- the synthetic path only needs one imul
+//     for the address math).
+//   - No `and reg, imm64`. Widest mask is 0xFFFF.
+//   - Single-line `pub let X : type = value` for every constant.
+//   - Module `TextInput = structure`, module keyword on the header line.
+//   - r11 discipline: text_input_draw uses r11 as the per-iter dst
+//     address (paragraph_draw / scrollbar_draw precedent). There is NO
+//     `lea` in this module (unlike char_display_width, which loads a
+//     rip-relative table), so paideia-as's r11 LEA-emission scratch
+//     never touches these registers mid-use.
+//   - SysV push/pop parity:
+//       * text_input_spec_init is a pure leaf (no push/pop, no callee-
+//         save writes, no nested call). Nine 8-byte stores.
+//       * text_input_insert and text_input_delete are pure leafs (no
+//         push/pop; the shift loops run in caller-save regs).
+//       * text_input_cursor_left / cursor_right are pure leafs (no
+//         push/pop; ASCII-fast-path + continuation-scan in caller-save
+//         regs).
+//       * text_input_draw pushes 5 callee-save regs (rbx / r12 / r13 /
+//         r14 / r15 = 40 B; entry rsp%16==8, +40==0) plus `sub rsp,
+//         736` for the stack scratch area (64-slot break array + span
+//         slot + line slot + 25 state slots; 736 % 16 == 0 so rsp
+//         stays aligned for the nested line_break_positions call).
+//         One nested call site (line_break_positions) which the aligned
+//         rsp satisfies without a further `sub rsp, 8`.
+//       * text_input_view_pack is a pure leaf (no push/pop; four u64
+//         copies + two u32 header stores).
+//   - Cross-module call convention: bare `call line_break_positions`
+//     per paragraph.pdx precedent (postui.M2-004). paideia-as's flat
+//     symbol namespace resolves it against src/text.pdx's exported
+//     symbol without a module::function prefix.
+//   - Labels prefixed `ti_` per docs/design.md fingerprint discipline.
+//     Sub-prefixes: ti_si_ (spec_init), ti_in_ (insert), ti_dl_
+//     (delete), ti_cl_ (cursor_left), ti_cr_ (cursor_right), ti_dr_
+//     (draw), ti_vp_ (view_pack). Every prefix scanned against the
+//     union of existing prefixes (bl_ / bl_bv_ / rc_ / ri_ / cd_ / sd_
+//     / cell_eq_ / cl_ / ci_ / wk_ / sp_ / sw_ / ln_ / lw_ / tx_ /
+//     tw_ / bp_ / pg_ / pg_pv_ / ls_ / tb_ / tab_ / sc_ / sr_ / ga_ /
+//     sk_ / bc_ / ch_ / cvs_) confirms no collision.
+//   - Effect row `!{mem}` on every function -- reads through spec_ptr /
+//     buffer_ptr, writes through buffer_ptr / buf_ptr / out_ptr.
+
+module TextInput = structure {
+
+  // ==========================================================================
+  // TextInputSpec layout (72 bytes)
+  // ==========================================================================
+  pub let TI_SPEC_BYTES        : u64 = 72
+
+  pub let TI_OFF_RECT          : u64 = 0
+  pub let TI_OFF_BUFFER_PTR    : u64 = 8
+  pub let TI_OFF_BUFFER_CAP    : u64 = 16
+  pub let TI_OFF_BUFFER_LEN    : u64 = 24
+  pub let TI_OFF_CURSOR_BYTE   : u64 = 32
+  pub let TI_OFF_SCROLL_COL    : u64 = 40
+  pub let TI_OFF_MODE          : u64 = 48
+  pub let TI_OFF_STYLE_NORMAL  : u64 = 56
+  pub let TI_OFF_STYLE_CURSOR  : u64 = 64
+
+  // ==========================================================================
+  // Mode ordinals (docs/design.md §2.6 TextInput vs TextArea distinction).
+  // ==========================================================================
+  pub let TI_MODE_SINGLE : u64 = 0
+  pub let TI_MODE_MULTI  : u64 = 1
+
+  // ==========================================================================
+  // Wrap scratch cap. text_input_draw allocates a 64-slot u64 break-
+  // position array on its own stack (64 * 8 = 512 B) and passes it as
+  // line_break_positions' out buffer. A return > 64 (either the
+  // TEXT_ERR_BUF_TOO_SMALL sentinel 0xFFFFEBCA or an over-cap count)
+  // is read as "wrap needed more breaks than the cap allows"; the
+  // draw degrades to break_count = 0 (whole buffer renders as one
+  // visual row, right-edge-truncated). 64 breaks covers a 4096-cell
+  // buffer at a 64-column wrap width -- matches paragraph.pdx L334.
+  // ==========================================================================
+  pub let TI_BREAKS_MAX : u64 = 64
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x60 offset = 0xFFFFEBE0 (M4 batch band start; see ERROR BAND
+  // block in the module header). Both values > 0x7FFFFFFF -- movabs
+  // required for `mov reg, imm`; NEVER usable in cmp/and.
+  // ==========================================================================
+  pub let TI_ERR_BAND            : u64 = 0xFFFFEBE0
+  pub let TI_ERR_BUFFER_FULL     : u64 = 0xFFFFEBE0
+  pub let TI_ERR_CURSOR_AT_START : u64 = 0xFFFFEBE1
+
+  // ==========================================================================
+  // TextInputView@0.1 semantic-pipe wire (docs/design.md §2.3).
+  //
+  // TIVW_MAGIC = 0x57564954 -- little-endian bytes 0x54 0x49 0x56 0x57
+  // spell "TIVW" (TextInput View). Fits imm32 (< 0x7FFFFFFF) so the
+  // packer's magic store uses the compact 5-byte `mov r32, imm32`
+  // form, not a 10-byte movabs.
+  // ==========================================================================
+  pub let TIVW_MAGIC           : u64 = 0x57564954
+  pub let TIVW_RECORD_BYTES    : u64 = 40
+  pub let TIVW_OFF_MAGIC       : u64 = 0
+  pub let TIVW_OFF_RECORD_LEN  : u64 = 4
+  pub let TIVW_OFF_RECT        : u64 = 8
+  pub let TIVW_OFF_CURSOR_BYTE : u64 = 16
+  pub let TIVW_OFF_BUFFER_LEN  : u64 = 24
+  pub let TIVW_OFF_MODE        : u64 = 32
+
+  // Schema name ("TextInputView@0.1", NUL-terminated). Kept here as the
+  // authoritative source so the M2-009 BLAKE3-hash landing (if it
+  // upgrades TIVW's schema constant beyond the u32 MAGIC) has exactly
+  // one string to hash. Byte length 17 + 1 terminator = 18.
+  pub let TIVW_SCHEMA_NAME     : [u8; 18] = "TextInputView@0.1\0"
+  pub let TIVW_SCHEMA_NAME_LEN : u64 = 17
+
+  // ==========================================================================
+  // text_input_spec_init(dst, rect, buffer_ptr, buffer_cap,
+  //                       buffer_len_and_cursor, scroll_and_mode, styles)
+  //                       -> ()
+  //
+  // Pack a TextInputSpec into 72 bytes at [dst..dst+72). Ten u64 fields
+  // do not fit in the 6-arg SysV register budget (rdi/rsi/rdx/rcx/r8/r9),
+  // so three of the fields are folded into two composite arguments:
+  //
+  //   buffer_len_and_cursor bits:
+  //     [ 0..32)  buffer_len   (u32 truncation; caller responsibility to
+  //                             keep len <= cap and both < 4G; a spec
+  //                             for a > 4G buffer already lives outside
+  //                             the design-scope taxonomy)
+  //     [32..64)  cursor_byte  (u32 truncation)
+  //
+  //   scroll_and_mode bits:
+  //     [ 0..32)  scroll_col   (u32 truncation)
+  //     [32..64)  mode         (u32 truncation; only 0/1 are valid at v1)
+  //
+  //   styles is a u64 pair passed via the stack (7th SysV arg would
+  //   spill to [rsp+8] anyway). To keep the ABI compact, we split it
+  //   as follows: instead of taking BOTH style words as separate args,
+  //   we take a single `styles_packed` word that carries style_normal
+  //   in low 32 bits and style_cursor in high 32 bits -- but Style
+  //   is a 64-bit wire (fg + bg + mods = 56 bits, fits u56). A u32-
+  //   truncated Style would lose the top mods bit and half the bg
+  //   channels. So we instead accept the two Style words as separate
+  //   args, meaning this function DOES need 7 args: dst, rect,
+  //   buffer_ptr, buffer_cap, buffer_len_and_cursor, scroll_and_mode,
+  //   style_normal, style_cursor. That is 8 args, exceeding SysV.
+  //
+  // Resolution: accept 6 args fully in registers, fold the two Style
+  // words into a single styles-slot the caller stages ADJACENT in the
+  // spec after the register phase. That is, this function takes 6
+  // args as above but writes styles as 0/0; callers that need per-cell
+  // styling patch [dst+56] and [dst+64] with the two Style words
+  // directly after this returns.
+  //
+  // A cleaner alternative -- ship a companion text_input_spec_init_styles
+  // helper for the two style fields -- keeps the two-argument budget
+  // and lets a caller drop the styles set entirely if they are happy
+  // with default (0) styles. This landing ships both helpers.
+  //
+  // Register plan (spec_init proper): rdi=dst, rsi=rect,
+  // rdx=buffer_ptr, rcx=buffer_cap, r8=buffer_len_and_cursor,
+  // r9=scroll_and_mode, rax=extract scratch. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call. Effect `!{mem}` (nine 8-byte
+  // stores).
+  //
+  // Labels prefixed ti_si_ per docs fingerprint discipline (none needed
+  // -- straight-line body).
+  // ==========================================================================
+  pub let text_input_spec_init : (u64, u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (rect: u64) (buffer_ptr: u64) (buffer_cap: u64) (buffer_len_and_cursor: u64) (scroll_and_mode: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_spec_init writes the first 7 slots of TextInputSpec (rect / buffer_ptr / buffer_cap / buffer_len / cursor_byte / scroll_col / mode) as u64 stores at fixed offsets 0/8/16/24/32/40/48, then zeros the two style slots at +56 and +64 (caller uses text_input_spec_init_styles to fill them, or leaves them at 0 for default). Extract u32-packed pairs via the `mov rax, r; shl rax, 32; shr rax, 32` low-half trick (avoids the imm64 0xFFFFFFFF mask) and `mov rax, r; shr rax, 32` for the high half; every extracted value stores as a full qword so the u64 spec slot carries the u32 payload with the high 32 bits zero. Nine stores in straight-line order. Every offset (0, 8, 16, 24, 32, 40, 48, 56, 64) fits imm32; shift count 32 fits imm8. No `test`, no `imul`, no `and reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (9 qword stores). Labels: none (straight-line body).",
+      block: {
+        // ---- [dst + 0] = rect (verbatim u64) --------------------------------
+        mov [rdi + 0], rsi;
+
+        // ---- [dst + 8] = buffer_ptr -----------------------------------------
+        mov [rdi + 8], rdx;
+
+        // ---- [dst + 16] = buffer_cap ----------------------------------------
+        mov [rdi + 16], rcx;
+
+        // ---- [dst + 24] = buffer_len (low 32 of r8) -------------------------
+        mov rax, r8;
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdi + 24], rax;
+
+        // ---- [dst + 32] = cursor_byte (high 32 of r8) -----------------------
+        mov rax, r8;
+        shr rax, 32;
+        mov [rdi + 32], rax;
+
+        // ---- [dst + 40] = scroll_col (low 32 of r9) -------------------------
+        mov rax, r9;
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdi + 40], rax;
+
+        // ---- [dst + 48] = mode (high 32 of r9) ------------------------------
+        mov rax, r9;
+        shr rax, 32;
+        mov [rdi + 48], rax;
+
+        // ---- [dst + 56] = style_normal = 0 (caller patches via
+        //                   text_input_spec_init_styles) ---------------------
+        xor rax, rax;
+        mov [rdi + 56], rax;
+
+        // ---- [dst + 64] = style_cursor = 0 ---------------------------------
+        mov [rdi + 64], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_spec_init_styles(spec_ptr, style_normal, style_cursor) -> ()
+  //
+  // Companion helper: patch the two Style slots on an already-initialized
+  // TextInputSpec. Kept separate from spec_init to fit the SysV
+  // register-arg budget without spilling. Pure leaf: two 8-byte stores.
+  // ==========================================================================
+  pub let text_input_spec_init_styles : (u64, u64, u64) -> () !{mem} @{} =
+    fn (spec_ptr: u64) (style_normal: u64) (style_cursor: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_spec_init_styles patches the two Style slots of an already-initialized TextInputSpec. Two 8-byte stores at [rdi+56] (style_normal, rsi) and [rdi+64] (style_cursor, rdx). Every offset (56, 64) fits imm32. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (2 qword stores). Labels: none (straight-line body).",
+      block: {
+        mov [rdi + 56], rsi;
+        mov [rdi + 64], rdx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_insert(spec_ptr, byte) -> u64
+  //
+  // Insert one byte at cursor_byte, advance cursor_byte by 1, and shift
+  // bytes [cursor_byte..buffer_len) right by 1 to [cursor_byte+1..
+  // buffer_len+1). Returns 0 on success, TI_ERR_BUFFER_FULL if
+  // buffer_len >= buffer_cap on entry (the buffer is left unchanged in
+  // that case).
+  //
+  // The shift walks from the END of the buffer down to cursor_byte so
+  // the source byte is read BEFORE the destination byte is overwritten
+  // (a left-to-right walk would clobber the tail one byte at a time).
+  //
+  // Register plan: rdi=spec_ptr, rsi=byte (low byte used), rax=return
+  // scratch / buffer_len. rcx=buffer_cap, r8=buffer_ptr, r9=cursor_byte,
+  // rdx=shift index, r10=r-1 index temp, r11=byte-transit scratch. Pure
+  // leaf: no callee-save touched, no push/pop, no nested call. Effect
+  // `!{mem}` (spec loads + buffer byte stores + two qword bumps in the
+  // spec at +24 buffer_len and +32 cursor_byte).
+  //
+  // Labels prefixed ti_in_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let text_input_insert : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (byte: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_insert lays one byte at cursor_byte, advances cursor, shifts the tail right by 1. Load buffer_len (rax) from [rdi+24] and buffer_cap (rcx) from [rdi+16]; if rax >= rcx return TI_ERR_BUFFER_FULL (movabs 0xFFFFEBE0, imm > 0x7FFFFFFF -- legal for mov not cmp; cmp uses the register-to-register form). Otherwise load buffer_ptr (r8) from [rdi+8] and cursor_byte (r9) from [rdi+32]. Shift loop ti_in_shift walks i (rdx) from buffer_len DOWN to cursor_byte+1: at each step, load buffer[i-1] into r11 via `mov r10, rdx; sub r10, 1; xor r11, r11; mov_b r11, [r8 + r10 + 0]`, then store to buffer[i] via `mov_b [r8 + rdx + 0], r11`. Descending walk is load-bearing -- a left-to-right walk would overwrite the source of the next iteration. Exit when rdx <= cursor_byte. Then write the inserted byte at buffer[cursor_byte]: `mov_b [r8 + r9 + 0], rsi` (rsi's low byte carries the argument; the byte-store uses only the low 8 bits). Bump cursor_byte (add r9, 1; mov [rdi+32], r9) and buffer_len (add rax, 1; mov [rdi+24], rax). Return 0 via xor rax, rax. Every immediate (0, 1, 8, 16, 24, 32) fits imm32; no `test`, no `imul`, no `and reg, imm64`. mov_b byte-loads preceded by `xor r11, r11` (paideia-as pitfall #1248 zero-extension; byte-stores unaffected). Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` covers spec reads at [rdi+8], [rdi+16], [rdi+24], [rdi+32]; buffer byte-loads and byte-stores through r8; spec bumps at [rdi+24] and [rdi+32]. Labels prefixed ti_in_ per docs fingerprint discipline (ti_in_shift for the walk, ti_in_write for the insert store, ti_in_full for the buffer-full error arm).",
+      block: {
+        // ---- Capacity check: buffer_len >= buffer_cap -> TI_ERR_BUFFER_FULL
+        mov rax, [rdi + 24];              // rax = buffer_len
+        mov rcx, [rdi + 16];              // rcx = buffer_cap
+        cmp rax, rcx;
+        jae ti_in_full;
+
+        // ---- Cache buffer_ptr and cursor_byte -------------------------------
+        mov r8,  [rdi + 8];               // r8 = buffer_ptr
+        mov r9,  [rdi + 32];              // r9 = cursor_byte
+
+        // ---- Shift right: for i = buffer_len; i > cursor_byte; i-- ---------
+        //      buffer[i] = buffer[i-1]
+        mov rdx, rax;                     // rdx = i = buffer_len
+      ti_in_shift:
+        cmp rdx, r9;
+        jbe ti_in_write;                  // i <= cursor -> stop
+
+        mov r10, rdx;
+        sub r10, 1;
+        xor r11, r11;
+        mov_b r11, [r8 + r10 + 0];        // r11 = buffer[i-1]
+        mov_b [r8 + rdx + 0], r11;        // buffer[i] = r11
+        sub rdx, 1;
+        jmp ti_in_shift;
+
+      ti_in_write:
+        // buffer[cursor_byte] = byte (low 8 bits of rsi)
+        mov_b [r8 + r9 + 0], rsi;
+
+        // ---- Bump cursor_byte and buffer_len -------------------------------
+        add r9, 1;
+        mov [rdi + 32], r9;
+        add rax, 1;
+        mov [rdi + 24], rax;
+
+        xor rax, rax;
+        ret;
+
+      ti_in_full:
+        mov rax, 0xFFFFEBE0;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_delete(spec_ptr) -> u64
+  //
+  // Backspace: delete the byte at cursor_byte - 1 and shift bytes
+  // [cursor_byte..buffer_len) left by 1 to [cursor_byte-1..buffer_len-1).
+  // Decrement cursor_byte and buffer_len by 1. Returns 0 on success,
+  // TI_ERR_CURSOR_AT_START (0xFFFFEBE1) if cursor_byte == 0 (buffer
+  // left unchanged).
+  //
+  // The shift walks LEFT-to-RIGHT (from cursor_byte to buffer_len - 1)
+  // -- source byte is always AT or ABOVE the destination, so the walk
+  // direction preserves the source before it becomes destination.
+  //
+  // Register plan: rdi=spec_ptr, rax=cursor_byte / return scratch,
+  // rcx=buffer_len, r8=buffer_ptr, rdx=shift index, r10=r+1 index temp,
+  // r11=byte-transit scratch, r9=new cursor_byte. Pure leaf: no
+  // callee-save touched, no push/pop, no nested call. Effect `!{mem}`.
+  //
+  // Labels prefixed ti_dl_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let text_input_delete : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_delete removes the byte before cursor and shifts the tail left by 1. Load cursor_byte (rax) from [rdi+32]; cmp rax, 0; if equal return TI_ERR_CURSOR_AT_START (movabs 0xFFFFEBE1, imm > 0x7FFFFFFF -- legal for mov not cmp; cmp uses imm8 0). Otherwise load buffer_len (rcx) from [rdi+24] and buffer_ptr (r8) from [rdi+8]. Compute new cursor = cursor - 1 into r9. Shift loop ti_dl_shift walks i (rdx) from cursor-1 UP to buffer_len - 1: at each step, load buffer[i+1] into r11 via `mov r10, rdx; add r10, 1; xor r11, r11; mov_b r11, [r8 + r10 + 0]`, then store to buffer[i] via `mov_b [r8 + rdx + 0], r11`. Left-to-right walk is safe because source byte is always AT or ABOVE the destination. Loop bound: i < buffer_len - 1 (the last valid write is at buffer_len - 2 from source buffer_len - 1). Save cursor_byte (r9) to [rdi+32] and buffer_len - 1 (sub rcx, 1; mov [rdi+24], rcx). Return 0 via xor rax, rax. Every immediate (0, 1, 8, 24, 32) fits imm32; no `test`, no `imul`, no `and reg, imm64`. mov_b byte-loads preceded by `xor r11, r11`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` covers spec reads at [rdi+8], [rdi+24], [rdi+32]; buffer byte-loads and byte-stores through r8; spec bumps at [rdi+24] and [rdi+32]. Labels prefixed ti_dl_ per docs fingerprint discipline (ti_dl_shift for the walk, ti_dl_done for the epilogue, ti_dl_at_start for the error arm).",
+      block: {
+        // ---- Cursor-at-start guard -----------------------------------------
+        mov rax, [rdi + 32];              // rax = cursor_byte
+        cmp rax, 0;
+        je  ti_dl_at_start;
+
+        // ---- Cache buffer_len and buffer_ptr -------------------------------
+        mov rcx, [rdi + 24];              // rcx = buffer_len
+        mov r8,  [rdi + 8];               // r8 = buffer_ptr
+
+        // ---- new cursor = cursor - 1 into r9 -------------------------------
+        mov r9, rax;
+        sub r9, 1;
+
+        // ---- Shift left: for i = new_cursor; i < buffer_len - 1; i++ ------
+        //      buffer[i] = buffer[i+1]
+        //
+        // Loop condition below is `i + 1 < buffer_len` (i.e. i < len - 1).
+        mov rdx, r9;                      // rdx = i = new_cursor
+      ti_dl_shift:
+        // if (i + 1) >= buffer_len, done
+        mov r10, rdx;
+        add r10, 1;
+        cmp r10, rcx;
+        jae ti_dl_done;
+
+        xor r11, r11;
+        mov_b r11, [r8 + r10 + 0];        // r11 = buffer[i+1]
+        mov_b [r8 + rdx + 0], r11;        // buffer[i] = r11
+        add rdx, 1;
+        jmp ti_dl_shift;
+
+      ti_dl_done:
+        // Update cursor_byte and buffer_len
+        mov [rdi + 32], r9;
+        sub rcx, 1;
+        mov [rdi + 24], rcx;
+
+        xor rax, rax;
+        ret;
+
+      ti_dl_at_start:
+        mov rax, 0xFFFFEBE1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_cursor_left(spec_ptr) -> u64
+  //
+  // Move cursor_byte back by one UTF-8 codepoint. Starting from
+  // cursor_byte - 1, walks back through any contiguous UTF-8
+  // continuation bytes (0x80..0xBF) until landing on a lead byte or
+  // a lone ASCII byte (< 0x80). If cursor_byte == 0 on entry, no-op.
+  //
+  // Register plan: rdi=spec_ptr, rax=cursor_byte / return, r8=buffer_ptr,
+  // r9=byte scratch. Pure leaf: no callee-save touched, no push/pop, no
+  // nested call. Effect `!{mem}`.
+  //
+  // Labels prefixed ti_cl_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let text_input_cursor_left : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_cursor_left walks cursor_byte back one UTF-8 codepoint. Load cursor_byte (rax) from [rdi+32]; if 0, jump ti_cl_ret (no-op success). Load buffer_ptr (r8) from [rdi+8]. Decrement rax by 1 (step onto the byte just before the cursor). Continuation-scan loop ti_cl_walk: if rax == 0, stop (can't walk further); load byte at [r8+rax] into r9 via `xor r9, r9; mov_b r9, [r8 + rax + 0]`; if r9 < 0x80 or r9 >= 0xC0, stop (lead byte or ASCII -- codepoint boundary reached); else decrement rax by 1 and continue. Store final rax to [rdi+32]. Return 0. Every immediate (0, 1, 8, 32, 0x80, 0xC0) fits imm32; no shift, no `test`, no `imul`, no `and reg, imm64`. mov_b byte-load preceded by `xor r9, r9`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (spec load at [rdi+8], [rdi+32]; buffer byte-load through r8; spec store at [rdi+32]). Labels prefixed ti_cl_ per docs fingerprint discipline (ti_cl_walk, ti_cl_done, ti_cl_ret).",
+      block: {
+        mov rax, [rdi + 32];              // rax = cursor_byte
+        cmp rax, 0;
+        je  ti_cl_ret;                    // already at start
+
+        mov r8, [rdi + 8];                // r8 = buffer_ptr
+        sub rax, 1;                       // step back to byte before cursor
+
+      ti_cl_walk:
+        // If we've reached position 0, stop.
+        cmp rax, 0;
+        je  ti_cl_done;
+
+        // Load byte at [buffer_ptr + rax]
+        xor r9, r9;
+        mov_b r9, [r8 + rax + 0];
+
+        // If byte < 0x80 (ASCII) or byte >= 0xC0 (lead), stop -- codepoint
+        // boundary.
+        cmp r9, 0x80;
+        jb  ti_cl_done;
+        cmp r9, 0xC0;
+        jae ti_cl_done;
+
+        // Continuation byte (0x80..0xBF): step back one more.
+        sub rax, 1;
+        jmp ti_cl_walk;
+
+      ti_cl_done:
+        mov [rdi + 32], rax;
+      ti_cl_ret:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_cursor_right(spec_ptr) -> u64
+  //
+  // Move cursor_byte forward by one UTF-8 codepoint. Reads the byte at
+  // cursor_byte, dispatches on the lead-byte class:
+  //   b < 0x80  -> +1 (ASCII)
+  //   b < 0xC0  -> +1 (stray continuation; defensive)
+  //   b < 0xE0  -> +2 (2-byte lead)
+  //   b < 0xF0  -> +3 (3-byte lead)
+  //   b < 0xF8  -> +4 (4-byte lead)
+  //   else      -> +1 (invalid lead 0xF8+, U+FFFD)
+  // Clamped against buffer_len. If cursor_byte >= buffer_len on entry,
+  // no-op.
+  //
+  // Register plan: rdi=spec_ptr, rax=cursor_byte / return, rcx=buffer_len,
+  // r8=buffer_ptr, r9=lead byte. Pure leaf. Effect `!{mem}`.
+  //
+  // Labels prefixed ti_cr_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let text_input_cursor_right : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_cursor_right advances cursor_byte one UTF-8 codepoint. Load cursor_byte (rax) from [rdi+32] and buffer_len (rcx) from [rdi+24]; if rax >= rcx jump ti_cr_ret (no-op). Load buffer_ptr (r8) from [rdi+8]; load lead byte into r9 via `xor r9, r9; mov_b r9, [r8 + rax + 0]`. Classify: cmp r9, 0x80 / jb ti_cr_adv1 (ASCII); cmp r9, 0xC0 / jb ti_cr_adv1 (defensive stray continuation); cmp r9, 0xE0 / jb ti_cr_adv2 (2-byte); cmp r9, 0xF0 / jb ti_cr_adv3 (3-byte); cmp r9, 0xF8 / jb ti_cr_adv4 (4-byte); else fall through to ti_cr_adv1 (invalid lead 0xF8+). ti_cr_advN adds N to rax and jumps to ti_cr_clamp. ti_cr_clamp: cmp rax, rcx; jbe ti_cr_store; mov rax, rcx (clamp). ti_cr_store: mov [rdi+32], rax. ti_cr_ret: xor rax, rax; ret. Every immediate (1, 2, 3, 4, 8, 24, 32, 0x80, 0xC0, 0xE0, 0xF0, 0xF8) fits imm32. No shift, no `test`, no `imul`, no `and reg, imm64`. mov_b byte-load preceded by `xor r9, r9`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (spec loads at [rdi+8], [rdi+24], [rdi+32]; buffer byte-load; spec store). Labels prefixed ti_cr_ per docs fingerprint discipline.",
+      block: {
+        mov rax, [rdi + 32];              // rax = cursor_byte
+        mov rcx, [rdi + 24];              // rcx = buffer_len
+        cmp rax, rcx;
+        jae ti_cr_ret;                    // at or past end
+
+        mov r8, [rdi + 8];                // r8 = buffer_ptr
+
+        xor r9, r9;
+        mov_b r9, [r8 + rax + 0];         // r9 = lead byte
+
+        // Classify lead byte -> advance count.
+        cmp r9, 0x80;
+        jb  ti_cr_adv1;
+        cmp r9, 0xC0;
+        jb  ti_cr_adv1;                   // stray continuation, defensive
+        cmp r9, 0xE0;
+        jb  ti_cr_adv2;
+        cmp r9, 0xF0;
+        jb  ti_cr_adv3;
+        cmp r9, 0xF8;
+        jb  ti_cr_adv4;
+        // Invalid lead >= 0xF8, treat as replacement (advance 1).
+        jmp ti_cr_adv1;
+
+      ti_cr_adv1:
+        add rax, 1;
+        jmp ti_cr_clamp;
+      ti_cr_adv2:
+        add rax, 2;
+        jmp ti_cr_clamp;
+      ti_cr_adv3:
+        add rax, 3;
+        jmp ti_cr_clamp;
+      ti_cr_adv4:
+        add rax, 4;
+
+      ti_cr_clamp:
+        cmp rax, rcx;
+        jbe ti_cr_store;
+        mov rax, rcx;
+
+      ti_cr_store:
+        mov [rdi + 32], rax;
+
+      ti_cr_ret:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (postui.M1-007 WidgetKind dispatch keys
+  // against this exact shape when routing WK_TEXTINPUT). `rows` is not
+  // read (buffer indexing uses cols); kept for signature uniformity.
+  //
+  // Branches once on mode (spec+48): SingleLine (0) renders one visible
+  // row honouring scroll_col; MultiLine (non-0) word-wraps via
+  // Text::line_break_positions and stamps into successive rows. See
+  // DRAW ALGORITHM in the module header for the full sketch.
+  //
+  // Returns 0 in every case at v1 (no draw-time validation trap; a
+  // future revision may return TI_ERR_BAND for e.g. cursor_byte >
+  // buffer_len, which is treated as "cursor at end" today).
+  //
+  // Register plan (5 SysV callee-save pushes = 40 B; entry rsp%16==8,
+  // +40==0; sub rsp, 736 keeps rsp aligned for the nested call to
+  // line_break_positions):
+  //   rbx = buf_ptr          r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect      r15 = (varies)
+  //
+  // Stack scratch (736 bytes) -- offsets relative to rsp AFTER the
+  // sub rsp, 736:
+  //   [+  0.. 512)  break_positions[64]   (64-slot u64 array,
+  //                                        line_break_positions out)
+  //   [+512.. 536)  span_slot             (synthetic 24-B Span for ML)
+  //   [+536.. 560)  line_slot             (synthetic 24-B Line for ML)
+  //   [+560.. 568)  bx
+  //   [+568.. 576)  by
+  //   [+576.. 584)  bw
+  //   [+584.. 592)  bh
+  //   [+592.. 600)  xe = bx + bw
+  //   [+600.. 608)  ye = by + bh
+  //   [+608.. 616)  buffer_ptr
+  //   [+616.. 624)  buffer_len
+  //   [+624.. 632)  cursor_byte
+  //   [+632.. 640)  scroll_col
+  //   [+640.. 648)  mode
+  //   [+648.. 656)  style_normal
+  //   [+656.. 664)  style_cursor
+  //   [+664.. 672)  break_count
+  //   [+672.. 680)  seg_idx
+  //   [+680.. 688)  seg_start
+  //   [+688.. 696)  seg_end
+  //   [+696.. 704)  cur_y
+  //   [+704.. 712)  byte_off       (byte offset within current segment)
+  //   [+712.. 720)  col            (visual column within row)
+  //   [+720.. 728)  cursor_seg_start (post-pass: seg_start of cursor's
+  //                                  segment)
+  //   [+728.. 736)  (unused; padding to 16-B alignment)
+  //
+  //   Alignment: entry rsp%16==8; +40 (5 pushes) == 48; +736 == 784; both
+  //   aligned to 16. No `lea` in this module -- r11 LEA-scratch never
+  //   collides with the r11 = dst address usage in the cell-write path.
+  //
+  // Labels prefixed ti_dr_ per docs fingerprint discipline
+  // (ti_dr_sl_ for SingleLine, ti_dr_ml_ for MultiLine, ti_dr_done for
+  //  the shared success epilogue).
+  // ==========================================================================
+  pub let text_input_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_draw is the widget_draw entry for WK_TEXTINPUT (13). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B; rsp entry %16 == 8, +40 == 48, rsp %16 == 0). sub rsp, 736 (32-slot state area + 24-B span slot + 24-B line slot + 512-B break array; 736 %16 == 0, rsp remains aligned for the nested line_break_positions call). Phase 0 (prologue): cache buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (from [r13+0]). Extract rect fields (bx/by/bw/bh) into stack slots [rsp+560..584) via mov/shr/and 0xFFFF chains; precompute xe = bx+bw and ye = by+bh into [rsp+592..600). Load buffer_ptr / buffer_len / cursor_byte / scroll_col / mode / style_normal / style_cursor from spec into [rsp+608..664). Early exits: bw == 0 or bh == 0 -> jmp ti_dr_done (rax = 0). Load mode from [rsp+640]; if != 1, dispatch to ti_dr_sl_ (SingleLine); else ti_dr_ml_ (MultiLine). SingleLine (ti_dr_sl_): initialize c (rcx) = 0. ti_dr_sl_loop: cmp rcx, bw ([rsp+576]); jae ti_dr_sl_end. Compute abs = scroll_col ([rsp+632]) + c into rax. If abs < buffer_len ([rsp+616]): load byte = buffer[abs] via `xor r15, r15; mov_b r15, [buffer_ptr + rax + 0]`; compute style = (abs == cursor_byte ([rsp+624])) ? style_cursor : style_normal; stamp cell at (bx+c, by) via `mov r11, by ([rsp+568]); imul r11, r12; add r11, bx ([rsp+560]); add r11, rcx; shl r11, 4; add r11, rbx`; mov_d [r11+0], r15 (byte in low byte, upper 3 zero); shl r15_style, 8; shr r15_style, 8 (defensively zero pad byte per cell_set_style discipline); mov [r11+4], r15_style. Else: skip (cell stays as buffer_init zeroed it). add rcx, 1; jmp ti_dr_sl_loop. ti_dr_sl_end: cursor-at-end post-pass -- if cursor_byte == buffer_len AND cursor_byte >= scroll_col AND (cursor_byte - scroll_col) < bw, stamp space (0x20) at (bx + cursor_col, by) with style_cursor. jmp ti_dr_done. MultiLine (ti_dr_ml_): build synthetic Span at [rsp+512..536): mov rax, buffer_ptr; mov [rsp+512], rax; mov rax, buffer_len; mov [rsp+520], rax; xor rax, rax; mov [rsp+528], rax. Build synthetic Line at [rsp+536..560): lea r15, [rsp+512] (WAIT -- no `lea` per module conformance; use mov r15, rsp; add r15, 512 instead); mov [rsp+536], r15; mov rax, 1; mov [rsp+544], rax; xor rax, rax; mov [rsp+552], rax. Wait -- lea is documented not-used; the `lea r15, [rsp+512]` was in the draft but per module header 'No lea in this module', we use mov+add. Compute line_slot addr similarly: mov rdi, rsp; add rdi, 536 (arg1 for line_break_positions). mov rsi, bw (arg2 max_width). mov rdx, rsp (arg3 out_positions_ptr; break array is at rsp+0). mov rcx, 64 (arg4 out_max). call line_break_positions. Return in rax; if rax > 64 (sentinel or over-cap), degrade to break_count = 0; else use rax. Store break_count to [rsp+664]. Initialize seg_idx = 0 [rsp+672], seg_start = 0 [rsp+680], cur_y = by [rsp+696]. Segment loop ti_dr_ml_seg: cmp cur_y >= ye -> jmp ti_dr_ml_end; compute seg_end: if seg_idx < break_count, seg_end = break[seg_idx] via `mov rdi, seg_idx; shl rdi, 3; mov r15, rsp; add r15, rdi; mov rax, [r15+0]`; else seg_end = buffer_len. Store to [rsp+688]. Byte loop ti_dr_ml_byte: byte_off (rax) = seg_start; col (rcx) = 0. ti_dr_ml_bloop: cmp byte_off, seg_end; jae ti_dr_ml_bend. cmp col, bw; jae ti_dr_ml_bend (right-edge trunc). Load byte, compute style (cursor overlay in place same as SingleLine), stamp at (bx+col, cur_y). add byte_off, 1; add col, 1; jmp ti_dr_ml_bloop. ti_dr_ml_bend: mov seg_start = seg_end; add cur_y, 1; add seg_idx, 1. cmp seg_idx <= break_count (i.e. seg_idx < break_count + 1) -> loop ti_dr_ml_seg. ti_dr_ml_end: cursor-at-end post-pass -- if cursor_byte == buffer_len, compute cursor_seg_start: if break_count == 0, cursor_seg_start = 0; else cursor_seg_start = break[break_count - 1]. cursor_row = by + break_count; cursor_col = buffer_len - cursor_seg_start. If cursor_row < ye AND cursor_col < bw, stamp space with style_cursor. jmp ti_dr_done. ti_dr_done: xor rax, rax; add rsp, 736; pop 5 callee-save; ret. Every immediate (0, 1, 8, 16, 24, 32, 40, 48, 56, 64, 512, 520, 528, 536, 544, 552, 560..728, 0xFF, 0xFFFF, 0x20) fits imm32; shift counts (3, 4, 8, 16, 32, 48) fit imm8. No `test`. 2-op imul is only ever reg,reg (imul r11, r12 for the y*cols product, no imul reg,imm). No `and reg, imm64`. No `lea` -- the two synthetic-struct address computes use mov+add instead. One nested call (line_break_positions), rsp aligned before the call. Effect `!{mem}` covers spec + buffer reads, cell writes through buf_ptr + rbx, and the stack scratch reads/writes. Labels prefixed ti_dr_ per docs fingerprint discipline (ti_dr_sl_ / ti_dr_ml_ / ti_dr_done and sub-labels).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 736;
+
+        // ---- Phase 0: cache args --------------------------------------------
+        mov r13, rdi;                     // r13 = spec_ptr
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r14, [r13 + 0];               // r14 = packed rect
+
+        // ---- Extract rect fields to stack -----------------------------------
+        mov rax, r14;
+        and rax, 0xFFFF;
+        mov [rsp + 560], rax;             // bx
+
+        mov rax, r14;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 568], rax;             // by
+
+        mov rax, r14;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 576], rax;             // bw
+
+        mov rax, r14;
+        shr rax, 48;
+        mov [rsp + 584], rax;             // bh
+
+        // xe = bx + bw
+        mov rax, [rsp + 560];
+        add rax, [rsp + 576];
+        mov [rsp + 592], rax;
+
+        // ye = by + bh
+        mov rax, [rsp + 568];
+        add rax, [rsp + 584];
+        mov [rsp + 600], rax;
+
+        // ---- Early exits on zero-sized rect ---------------------------------
+        mov rax, [rsp + 576];
+        cmp rax, 0;
+        je  ti_dr_done;
+        mov rax, [rsp + 584];
+        cmp rax, 0;
+        je  ti_dr_done;
+
+        // ---- Cache spec fields to stack -------------------------------------
+        mov rax, [r13 + 8];               // buffer_ptr
+        mov [rsp + 608], rax;
+        mov rax, [r13 + 24];              // buffer_len
+        mov [rsp + 616], rax;
+        mov rax, [r13 + 32];              // cursor_byte
+        mov [rsp + 624], rax;
+        mov rax, [r13 + 40];              // scroll_col
+        mov [rsp + 632], rax;
+        mov rax, [r13 + 48];              // mode
+        mov [rsp + 640], rax;
+        mov rax, [r13 + 56];              // style_normal
+        mov [rsp + 648], rax;
+        mov rax, [r13 + 64];              // style_cursor
+        mov [rsp + 656], rax;
+
+        // ---- Dispatch on mode -----------------------------------------------
+        mov rax, [rsp + 640];
+        cmp rax, 1;
+        je  ti_dr_ml_enter;
+        // Fall through to SingleLine.
+
+        // =====================================================================
+        // SingleLine draw
+        // =====================================================================
+      ti_dr_sl_enter:
+        xor rcx, rcx;                     // c = 0
+
+      ti_dr_sl_loop:
+        // cmp c, bw
+        mov rax, [rsp + 576];
+        cmp rcx, rax;
+        jae ti_dr_sl_end;
+
+        // abs = scroll_col + c
+        mov rax, [rsp + 632];
+        add rax, rcx;
+
+        // If abs >= buffer_len, skip stamping (cell stays as buffer_init).
+        mov rdx, [rsp + 616];
+        cmp rax, rdx;
+        jae ti_dr_sl_next;
+
+        // Load buffer[abs] into r15
+        mov rdx, [rsp + 608];             // buffer_ptr
+        xor r15, r15;
+        mov_b r15, [rdx + rax + 0];
+
+        // Select style: (abs == cursor_byte) ? style_cursor : style_normal
+        mov rdi, [rsp + 624];             // cursor_byte
+        mov rsi, [rsp + 648];             // default = style_normal
+        cmp rax, rdi;
+        jne ti_dr_sl_style_ready;
+        mov rsi, [rsp + 656];             // style_cursor
+      ti_dr_sl_style_ready:
+
+        // Compute dst = buf_ptr + (by*cols + bx + c)*16
+        mov r11, [rsp + 568];             // by
+        imul r11, r12;                    // by * cols
+        add  r11, [rsp + 560];            // + bx
+        add  r11, rcx;                    // + c
+        shl  r11, 4;                      // * CELL_BYTES
+        add  r11, rbx;                    // + buf_ptr
+
+        // Stamp cell: symbol slot (byte in low, upper 3 zero)
+        mov_d [r11 + 0], r15;
+
+        // Style word: defensively zero pad byte (shl 8; shr 8), store at +4
+        shl rsi, 8;
+        shr rsi, 8;
+        mov [r11 + 4], rsi;
+
+      ti_dr_sl_next:
+        add rcx, 1;
+        jmp ti_dr_sl_loop;
+
+      ti_dr_sl_end:
+        // Cursor-at-end post-pass: if cursor_byte == buffer_len AND
+        // cursor is visible in the SingleLine window, stamp a space with
+        // style_cursor at (bx + cursor_col, by).
+        mov rax, [rsp + 624];             // cursor_byte
+        mov rdx, [rsp + 616];             // buffer_len
+        cmp rax, rdx;
+        jne ti_dr_done;                   // cursor was in body, already stamped
+
+        // Compute visible cursor column: cursor_byte - scroll_col
+        mov rdx, [rsp + 632];             // scroll_col
+        cmp rax, rdx;
+        jb  ti_dr_done;                   // cursor is left of window -> invisible
+        sub rax, rdx;                     // rax = visible column
+        mov rdx, [rsp + 576];             // bw
+        cmp rax, rdx;
+        jae ti_dr_done;                   // cursor past right edge -> invisible
+
+        // Stamp space (0x20) with style_cursor at (bx + rax, by)
+        mov rcx, rax;                     // rcx = c
+        mov r11, [rsp + 568];             // by
+        imul r11, r12;
+        add  r11, [rsp + 560];
+        add  r11, rcx;
+        shl  r11, 4;
+        add  r11, rbx;
+
+        mov r15, 0x20;
+        mov_d [r11 + 0], r15;
+        mov rsi, [rsp + 656];             // style_cursor
+        shl rsi, 8;
+        shr rsi, 8;
+        mov [r11 + 4], rsi;
+        jmp ti_dr_done;
+
+        // =====================================================================
+        // MultiLine draw
+        // =====================================================================
+      ti_dr_ml_enter:
+        // ---- Build synthetic Span at [rsp+512..536): (ptr, len, style=0)
+        mov rax, [rsp + 608];             // buffer_ptr
+        mov [rsp + 512], rax;
+        mov rax, [rsp + 616];             // buffer_len
+        mov [rsp + 520], rax;
+        xor rax, rax;
+        mov [rsp + 528], rax;             // style = 0
+
+        // ---- Build synthetic Line at [rsp+536..560):
+        //   spans_ptr = &span_slot (rsp + 512)
+        //   span_count = 1
+        //   alignment = 0
+        mov r15, rsp;
+        add r15, 512;
+        mov [rsp + 536], r15;
+        mov rax, 1;
+        mov [rsp + 544], rax;
+        xor rax, rax;
+        mov [rsp + 552], rax;
+
+        // ---- Call line_break_positions(line_ptr, bw, rsp, 64) --------------
+        mov rdi, rsp;
+        add rdi, 536;                     // line_slot address
+        mov rsi, [rsp + 576];             // bw = max_width
+        mov rdx, rsp;                     // out_positions_ptr = break_array base
+        mov rcx, 64;                      // out_max
+        call line_break_positions;
+
+        // Degrade if rax > 64 (sentinel or over-cap): treat as break_count = 0.
+        cmp rax, 64;
+        jbe ti_dr_ml_bp_ok;
+        xor rax, rax;
+      ti_dr_ml_bp_ok:
+        mov [rsp + 664], rax;             // break_count
+
+        // ---- Init seg_idx, seg_start, cur_y --------------------------------
+        xor rax, rax;
+        mov [rsp + 672], rax;             // seg_idx = 0
+        mov [rsp + 680], rax;             // seg_start = 0
+        mov rax, [rsp + 568];             // by
+        mov [rsp + 696], rax;             // cur_y = by
+
+        // ---- Segment loop --------------------------------------------------
+      ti_dr_ml_seg:
+        // cur_y >= ye?
+        mov rax, [rsp + 696];
+        mov rdx, [rsp + 600];
+        cmp rax, rdx;
+        jae ti_dr_ml_end;
+
+        // Compute seg_end: (seg_idx < break_count) ? break[seg_idx] : buffer_len
+        mov rax, [rsp + 672];             // seg_idx
+        mov rdx, [rsp + 664];             // break_count
+        cmp rax, rdx;
+        jae ti_dr_ml_seg_last;
+
+        // seg_end = break_positions[seg_idx]
+        mov rdi, rax;
+        shl rdi, 3;                       // rdi = seg_idx * 8
+        mov r15, rsp;
+        add r15, rdi;
+        mov rax, [r15 + 0];
+        jmp ti_dr_ml_seg_end_ready;
+
+      ti_dr_ml_seg_last:
+        mov rax, [rsp + 616];             // buffer_len
+
+      ti_dr_ml_seg_end_ready:
+        mov [rsp + 688], rax;             // seg_end
+
+        // ---- Byte loop within segment --------------------------------------
+        mov rax, [rsp + 680];             // byte_off = seg_start
+        xor rcx, rcx;                     // col = 0
+
+      ti_dr_ml_bloop:
+        // byte_off >= seg_end?
+        mov rdx, [rsp + 688];
+        cmp rax, rdx;
+        jae ti_dr_ml_bend;
+
+        // col >= bw? (right-edge truncation)
+        mov rdx, [rsp + 576];
+        cmp rcx, rdx;
+        jae ti_dr_ml_bend;
+
+        // Load byte = buffer[byte_off]
+        mov rdx, [rsp + 608];             // buffer_ptr
+        xor r15, r15;
+        mov_b r15, [rdx + rax + 0];
+
+        // Select style: (byte_off == cursor_byte) ? style_cursor : style_normal
+        mov rdi, [rsp + 624];             // cursor_byte
+        mov rsi, [rsp + 648];             // default = style_normal
+        cmp rax, rdi;
+        jne ti_dr_ml_style_ready;
+        mov rsi, [rsp + 656];
+      ti_dr_ml_style_ready:
+
+        // Compute dst = buf_ptr + (cur_y*cols + bx + col)*16
+        mov r11, [rsp + 696];             // cur_y
+        imul r11, r12;
+        add  r11, [rsp + 560];            // + bx
+        add  r11, rcx;                    // + col
+        shl  r11, 4;
+        add  r11, rbx;
+
+        mov_d [r11 + 0], r15;
+        shl rsi, 8;
+        shr rsi, 8;
+        mov [r11 + 4], rsi;
+
+        // Advance byte_off and col
+        add rax, 1;
+        add rcx, 1;
+        jmp ti_dr_ml_bloop;
+
+      ti_dr_ml_bend:
+        // Advance segment: seg_start = seg_end; cur_y++; seg_idx++.
+        mov rax, [rsp + 688];             // seg_end
+        mov [rsp + 680], rax;             // seg_start = seg_end
+
+        mov rax, [rsp + 696];
+        add rax, 1;
+        mov [rsp + 696], rax;
+
+        mov rax, [rsp + 672];
+        add rax, 1;
+        mov [rsp + 672], rax;
+
+        // Total segments = break_count + 1
+        mov rdx, [rsp + 664];
+        add rdx, 1;
+        cmp rax, rdx;
+        jb  ti_dr_ml_seg;
+        // Fall through.
+
+      ti_dr_ml_end:
+        // Cursor-at-end post-pass: if cursor_byte == buffer_len, compute
+        // cursor_row / cursor_col and stamp a space with style_cursor.
+        mov rax, [rsp + 624];             // cursor_byte
+        mov rdx, [rsp + 616];             // buffer_len
+        cmp rax, rdx;
+        jne ti_dr_done;                   // cursor in body, already stamped
+
+        // Compute cursor_seg_start: (break_count == 0) ? 0 : break[break_count - 1]
+        mov rdx, [rsp + 664];             // break_count
+        xor r8,  r8;                      // r8 = cursor_seg_start default 0
+        cmp rdx, 0;
+        je  ti_dr_ml_cs_ready;
+        mov rdi, rdx;
+        sub rdi, 1;
+        shl rdi, 3;
+        mov r15, rsp;
+        add r15, rdi;
+        mov r8, [r15 + 0];
+      ti_dr_ml_cs_ready:
+        mov [rsp + 720], r8;              // cursor_seg_start
+
+        // cursor_row = by + break_count
+        mov r9, [rsp + 568];              // by
+        add r9, rdx;                      // + break_count
+
+        // cursor_col = buffer_len - cursor_seg_start
+        mov r10, [rsp + 616];             // buffer_len
+        sub r10, r8;
+
+        // Visibility checks: cursor_row < ye AND cursor_col < bw
+        mov rdi, [rsp + 600];             // ye
+        cmp r9, rdi;
+        jae ti_dr_done;
+        mov rdi, [rsp + 576];             // bw
+        cmp r10, rdi;
+        jae ti_dr_done;
+
+        // Stamp space with style_cursor at (bx + cursor_col, cursor_row).
+        mov r11, r9;                      // cursor_row
+        imul r11, r12;
+        add  r11, [rsp + 560];            // + bx
+        add  r11, r10;                    // + cursor_col
+        shl  r11, 4;
+        add  r11, rbx;
+
+        mov r15, 0x20;
+        mov_d [r11 + 0], r15;
+        mov rsi, [rsp + 656];             // style_cursor
+        shl rsi, 8;
+        shr rsi, 8;
+        mov [r11 + 4], rsi;
+
+      ti_dr_done:
+        xor rax, rax;
+        add rsp, 736;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_input_view_pack(spec_ptr, dst) -> u64 (record_len = 40)
+  //
+  // Pack a TextInputView@0.1 record into [dst..dst+40). Fixed size; no
+  // variable-length payload (buffer bytes live behind buffer_ptr and
+  // are per-process, not stream-copyable through the semantic pipe --
+  // matches ParagraphView / GaugeView / ScrollbarView posture).
+  //
+  // Field marshalling per the wire block in the module header:
+  //   +0   magic       (u32) = TIVW_MAGIC = 0x57564954
+  //   +4   record_len  (u32) = 40
+  //   +8   rect        (u64) from spec+0  verbatim
+  //   +16  cursor_byte (u64) from spec+32 verbatim
+  //   +24  buffer_len  (u64) from spec+24 verbatim
+  //   +32  mode        (u64) from spec+48 verbatim
+  //
+  // Register plan: rdi=spec_ptr (read-only), rsi=dst (write-only until
+  // return), rax=scratch/return. Pure leaf: no callee-save touched, no
+  // push/pop, no nested call. Effect `!{mem}` (reads through rdi;
+  // writes through rsi). Labels prefixed ti_vp_ per docs fingerprint
+  // discipline (none needed -- straight-line body).
+  // ==========================================================================
+  pub let text_input_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-001 (postui#27): text_input_view_pack lays a TextInputView@0.1 record at [rsi..rsi+40). Fixed size; NO variable-length payload (buffer bytes are per-process behind buffer_ptr, not stream-copyable). Header phase: `mov rax, 0x57564954` (TIVW_MAGIC, fits imm32 so paideia-as emits the compact 5-byte mov r32, imm32 form, not a 10-byte movabs), mov_d [rsi+0], rax; `mov rax, 40`, mov_d [rsi+4], rax. Payload phase: four verbatim u64 copies from spec fields to view slots: [rdi+0] -> [rsi+8] (rect), [rdi+32] -> [rsi+16] (cursor_byte), [rdi+24] -> [rsi+24] (buffer_len), [rdi+48] -> [rsi+32] (mode). Each copy is `mov rax, [rdi+off]; mov [rsi+off_out], rax`. Return record_len = 40. Every immediate (0, 4, 8, 16, 24, 32, 40, 48, 0x57564954) fits imm32. No `test`, no `imul`, no `and reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (reads through rdi at four offsets; writes through rsi at six offsets). Labels prefixed ti_vp_ per docs fingerprint discipline (none needed -- straight-line body).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564954;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- rect (u64) at [rsi + 8] verbatim ------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- cursor_byte (u64) at [rsi + 16] verbatim ----------------------
+        mov rax, [rdi + 32];
+        mov [rsi + 16], rax;
+
+        // ---- buffer_len (u64) at [rsi + 24] verbatim -----------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 24], rax;
+
+        // ---- mode (u64) at [rsi + 32] verbatim -----------------------------
+        mov rax, [rdi + 48];
+        mov [rsi + 32], rax;
+
+        // ---- Return record_len = 40 ----------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
