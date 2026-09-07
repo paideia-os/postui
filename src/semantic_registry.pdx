@@ -1,0 +1,349 @@
+// src/semantic_registry.pdx -- postui.M2-009 (paideia-os/postui#18)
+//
+// SemanticRegistry: per-widget schema-hash constants + libpdx-semantic-
+// pipe Send/Binding glue.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.3 Semantic-pipe integration, §5.1 M2-009)
+// =============================================================================
+//
+// Every widget in the M2 catalog exports a `<w>_view_pack` function that
+// lays a fixed-schema semantic-pipe record into caller-provided memory.
+// The packers exist since M1-006 (block_view_pack) / M2-004..M2-008
+// (paragraph/list/table/tabs/scrollbar); this module ships the LAST
+// hop -- the schema-hash constant table + the Send/Binding primitives
+// that route packed records to a subscriber's callback.
+//
+// This landing is deliberately the SMALLEST thing that satisfies the
+// M2-009 contract of docs/design.md §2.3 without pretending
+// libpdx-semantic-pipe already exists in userspace. Concretely:
+//
+//   - SEMANTIC_SCHEMA_<TAG> : u64 constants, one per widget-view
+//     schema. At v1 the "hash" IS the widget's four-byte MAGIC from
+//     the view record's header (BLKV, PGVW, LSVW, TBVW, TABV, SBVW).
+//     A real content-addressable BLAKE3 hash over each widget's frozen
+//     schema-name+field-layout string is deferred to postui.M2-010's
+//     boot smoke or a later hardening pass -- swapping the constant
+//     values here does NOT change any call site (call sites reference
+//     the SEMANTIC_SCHEMA_<TAG> symbol, not the literal).
+//
+//   - semantic_send(schema, record_ptr, record_len) -> u64: a STUB.
+//     The kernel-side sys_semantic_send syscall does not exist yet
+//     (design/user/syscall-table.md high-water mark at this landing
+//     is sysno 517 sys_cwd_resolve; no semantic-pipe primitive is
+//     assigned a slot). Returns 0 (OK) so a widget's draw path can
+//     already invoke it without a runtime guard. Follow-up: file
+//     postui issue once paideia-os stands up the syscall (issue body
+//     staged in this landing's PR message so main only has to
+//     `gh issue create` it).
+//
+//   - semantic_binding_init(binding_slot, schema, callback) -> u64:
+//     writes a 24-byte Binding record into caller-provided memory. This
+//     is the shape a downstream subscriber holds in its static
+//     subscription table so semantic_binding_dispatch can walk it.
+//
+//   - semantic_binding_dispatch(binding_ptr, incoming_schema,
+//     record_ptr, record_len) -> u64: schema-match test; on hit,
+//     tail-calls the callback with (record_ptr, record_len); on miss,
+//     returns 0. Enables consumer-side subscription via a static
+//     dispatch table walk, no allocator, no runtime registry lookup.
+//
+// =============================================================================
+// BINDING WIRE (24 bytes, SEM_BINDING_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   schema      u64 (SEMANTIC_SCHEMA_<TAG> the binding filters on)
+//   [+8..+16)  callback    u64 (SysV function pointer:
+//                              fn (record_ptr: u64, record_len: u64) -> u64)
+//   [+16..+24) _reserved   u64 (zero on init; RESERVED for a future
+//                              "next-in-chain" slot when M2-010's boot
+//                              smoke wires a static linked-list of
+//                              bindings per fd -- kept at 24 B so that
+//                              landing is a wire-preserving field
+//                              rename, not a layout bump)
+//
+// 24 bytes is 3 u64 slots, natural 8-byte alignment throughout, and
+// avoids the 16-B pad a 32-B "next-slot-reserved" layout would carry
+// for no marginal benefit at v1. Every field is a u64 so no byte-load
+// dance is needed to read them back -- dispatch is 2 qword loads.
+//
+// =============================================================================
+// ERROR-BAND POLICY (issue #18 option (b))
+// =============================================================================
+//
+// This module ships NO error sentinels. The M2 error band 0xFFFFEBC0..
+// 0xFFFFEBCF is already fully allocated across Layout / Text / Scrollbar
+// (see src/layout.pdx / src/text.pdx / src/widgets/scrollbar.pdx); the
+// Lib POSTUI_ERR_BAND anchor 0xFFFFEB80..0xFFFFEB8F is reserved for the
+// wave-scoped identity slot and would collide with a future Lib
+// expansion. Per issue #18 acceptance list, the semantic-pipe primitives
+// return the u64 status their underlying operation produces:
+//
+//   - semantic_send returns whatever the (future) syscall returns; at
+//     v1 the stub returns 0 (OK).
+//   - semantic_binding_init returns 0 on success. It cannot fail -- the
+//     three fields all write unconditionally to caller-provided memory
+//     and no runtime state is consulted. A future revision that
+//     rejects a null binding_slot could return a POSTUI_ERR_BAND-anchored
+//     sentinel once the band's overflow-page allocation lands.
+//   - semantic_binding_dispatch passes through the callback's own return
+//     value on a schema hit, or returns 0 on a schema miss. A caller
+//     that needs to distinguish "no subscriber" from "subscriber
+//     returned 0" walks its own static table and inspects the miss
+//     directly rather than asking dispatch to invent a discriminator.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SemanticRegistry`), matches
+//     file basename `semantic_registry.pdx` (snake_case -> PascalCase
+//     via the paideia-as module-registry rule the M1-001 scaffold's
+//     compliance list pinned).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every schema-hash constant (0x56424154 max) fits imm32 signed
+//     positive (< 0x7FFFFFFF = 2_147_483_647); a load site emits the
+//     compact 5-byte `mov r32, imm32` form, not the 10-byte movabs.
+//     Matches the SBVW magic load in scrollbar_view_pack line 687.
+//   - No 2-op `imul reg, imm` (none needed; no address arithmetic).
+//   - No `and reg, imm64` (no masks in this module).
+//   - Reserved-label prefix `sr_` throughout (sr_bd_ for
+//     semantic_binding_dispatch's miss/hit arms).
+//   - Effect row `!{mem}` on every function that touches memory
+//     (semantic_binding_init writes 3 qwords through rdi;
+//     semantic_binding_dispatch reads 2 qwords through rdi). The
+//     STUB semantic_send declares `!{}` -- no memory access, no
+//     syscall, no side effect until its body is filled in.
+//   - semantic_binding_dispatch's `call rax` invokes the caller's
+//     callback function pointer. Entry rsp%16 == 8; `call` pushes an
+//     8-byte return address -> callee sees rsp%16 == 0 as SysV
+//     requires. No push/pop, no `sub rsp, N` needed. The callback's
+//     own effect set is the caller's responsibility (dispatch is
+//     effect-transparent -- same posture the shell's own
+//     completion.pdx dispatch primitives take).
+//   - No callee-save touched in ANY body; every function is a leaf or
+//     a tail-call. rsp is unchanged across every entry point except
+//     the +8 that `call rax` transiently adds in dispatch.
+
+module SemanticRegistry = structure {
+
+  // ==========================================================================
+  // Schema-hash constants (docs/design.md §2.3)
+  //
+  // Six u64 constants, one per widget-view schema shipping in postui M1..M2.
+  // At v1 the "hash" is the widget's four-byte little-endian MAGIC
+  // packed as a u32-in-u64 -- exactly the byte sequence a subscriber
+  // reads from the record header at [+0..+4). This makes the schema-
+  // hash equal to a full-record-header read on the subscriber side,
+  // so bind_by_hash and read-magic-and-compare are identical operations.
+  //
+  // The full BLAKE3-over-schema-name hash contract docs/design.md §2.3
+  // describes lands with libpdx-semantic-pipe's registry glue. Swapping
+  // the values here (e.g. replacing the MAGIC with the first 8 bytes
+  // of BLAKE3("BlockView@0.1")) is a WIRE-COMPATIBLE change for every
+  // consumer that references the SEMANTIC_SCHEMA_<TAG> symbol rather
+  // than the literal -- the symbol is the compile-time authority, the
+  // value is a v1 placeholder documented as such.
+  //
+  // Each MAGIC fits imm32 signed positive (< 0x7FFFFFFF = 2_147_483_647)
+  // so a load-site `mov rax, imm` emits the compact 5-byte
+  // `mov r32, imm32` form, not the 10-byte movabs.
+  //
+  //   BLKV = 'V' 'K' 'L' 'B' little-endian     = 0x564B4C42
+  //   PGVW = 'W' 'V' 'G' 'P'                   = 0x57564750
+  //   LSVW = 'W' 'V' 'S' 'L'                   = 0x5756534C
+  //   TBVW = 'W' 'V' 'B' 'T'                   = 0x57564254
+  //   TABV = 'V' 'B' 'A' 'T'                   = 0x56424154
+  //   SBVW = 'W' 'V' 'B' 'S'                   = 0x57564253
+  //
+  // Cross-referenced to the packer that emits each header:
+  //   BLKV -> src/block.pdx block_view_pack, BLKV_MAGIC L205.
+  //   PGVW -> src/widgets/paragraph.pdx paragraph_view_pack.
+  //   LSVW -> src/widgets/list.pdx list_view_pack.
+  //   TBVW -> src/widgets/table.pdx table_view_pack.
+  //   TABV -> src/widgets/tabs.pdx tabs_view_pack.
+  //   SBVW -> src/widgets/scrollbar.pdx scrollbar_view_pack L680.
+  // ==========================================================================
+  pub let SEMANTIC_SCHEMA_BLKV : u64 = 0x564B4C42
+  pub let SEMANTIC_SCHEMA_PGVW : u64 = 0x57564750
+  pub let SEMANTIC_SCHEMA_LSVW : u64 = 0x5756534C
+  pub let SEMANTIC_SCHEMA_TBVW : u64 = 0x57564254
+  pub let SEMANTIC_SCHEMA_TABV : u64 = 0x56424154
+  pub let SEMANTIC_SCHEMA_SBVW : u64 = 0x57564253
+
+  // ==========================================================================
+  // Binding wire layout (24 bytes)
+  //
+  // Offset constants are named so a downstream subscriber can pattern-
+  // match against them rather than tracking magic 0/8/16 literals.
+  // Matches the BLOCK_OFF_* / TABS_OFF_* / SBVW_OFF_* discipline every
+  // other postui module already establishes.
+  // ==========================================================================
+  pub let SEM_BINDING_BYTES     : u64 = 24
+  pub let SEM_BINDING_OFF_SCHEMA   : u64 = 0
+  pub let SEM_BINDING_OFF_CALLBACK : u64 = 8
+  pub let SEM_BINDING_OFF_RESERVED : u64 = 16
+
+  // ==========================================================================
+  // Stub-vs-real-body marker for semantic_send.
+  //
+  // Flipped to 1 when the libpdx-semantic-pipe syscall lands and this
+  // module's semantic_send is rewritten to issue it. Kept as a public
+  // constant so a caller can log its telemetry with "sent" vs "stubbed"
+  // once the wiring is real. The 0 -> 1 flip is a WIRE-PRESERVING
+  // change: semantic_send's signature is unchanged; only its body body
+  // gains a syscall instruction.
+  // ==========================================================================
+  pub let SEMANTIC_SEND_LIVE : u64 = 0
+
+  // ==========================================================================
+  // semantic_send(schema, record_ptr, record_len) -> u64
+  //
+  // STUB. Returns 0 (OK) at v1. Documented deferred wire: when
+  // paideia-os stands up sys_semantic_send (candidate sysno TBD; issue
+  // #18 landed no reservation because design/user/syscall-table.md is
+  // still under an active R90-XREPO refresh), this body becomes:
+  //
+  //     mov rdx, rsi;      // record_ptr into SYSCALL arg2 slot
+  //     mov r10, rcx;      // wait -- no; direct 3-arg SysV->SYSCALL
+  //                        // shuffle: rdi=schema stays, rsi=record_ptr
+  //                        // stays, rdx=record_len stays. Only rax needs
+  //                        // the sysno.
+  //     mov rax, <sysno>;
+  //     syscall;
+  //     ret
+  //
+  // The three SysV arg regs (rdi/rsi/rdx) map identically to the first
+  // three SYSCALL arg regs (rdi/rsi/rdx), so no register shuffle is
+  // needed at all -- the future body is literally `mov rax, SYSNO;
+  // syscall; ret`. See tui_canvas_client.pdx tcc_present (L169..179)
+  // for the 2-arg shape and tcc_resize (L260..272) for the shape with
+  // shuffle when SysV arity > 3.
+  //
+  // Register plan: rdi=schema (unread at v1), rsi=record_ptr (unread),
+  // rdx=record_len (unread), rax=return. Pure leaf: no callee-save
+  // touched, no push/pop, no memory access, no syscall. Effect `!{}`
+  // (empty) matches the stub's actual behavior -- the future wiring
+  // will widen this to `!{sysreg}` in the same edit that adds the
+  // syscall instruction.
+  // ==========================================================================
+  pub let semantic_send : (u64, u64, u64) -> u64 !{} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M2-009 (postui#18): semantic_send is a STUB at v1 pending paideia-os sys_semantic_send. design/user/syscall-table.md high-water mark at this landing is sysno 517 (sys_cwd_resolve, R90-XREPO.010.M1-007) with no semantic-pipe primitive assigned. Returning 0 unconditionally so a widget draw path can already invoke this without a runtime guard -- when the syscall lands, this body gains `mov rax, <sysno>; syscall; ret` and the effect row widens from !{} to !{sysreg}; the three SysV arg regs (rdi=schema, rsi=record_ptr, rdx=record_len) already map identically to the first three SYSCALL arg registers so no shuffle is needed at that landing (unlike tcc_resize's 4-arg case at src/tui_canvas_client.pdx L260-272). Pure leaf: xor rax, rax; ret. No callee-save touched, no memory access, no syscall. Effect !{} matches the stub's actual behavior at v1. No `test` mnemonic; no immediate literal in the body (xor rax, rax needs no immediate). Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body).",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // semantic_binding_init(binding_slot, schema, callback) -> u64
+  //
+  // Write a 24-byte Binding record into [rdi..rdi+24):
+  //   [+0]  = schema     (rsi)
+  //   [+8]  = callback   (rdx)
+  //   [+16] = 0          (reserved; future next-slot pointer)
+  //
+  // Returns 0 (OK) unconditionally. A null binding_slot (rdi == 0)
+  // would fault the first store; callers are expected to provide a
+  // writable 24-byte slot -- the same posture every postui packer takes
+  // (block_view_pack, scrollbar_view_pack). A future revision that
+  // returns a POSTUI_ERR_BAND-anchored sentinel on rdi == 0 is a
+  // signature-preserving change (the u64 return already exists).
+  //
+  // Register plan: rdi=binding_slot (write-only until return), rsi=schema
+  // (read once), rdx=callback (read once), rax=return + zeroing scratch.
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (3 qword-stores through rdi).
+  // Labels prefixed sr_ per docs fingerprint discipline (none needed
+  // here -- straight-line body).
+  // ==========================================================================
+  pub let semantic_binding_init : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (binding_slot: u64) (schema: u64) (callback: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-009 (postui#18): semantic_binding_init writes 24 bytes of Binding into [rdi..rdi+24) then returns 0. Three qword stores in straight-line order: [rdi+0] = rsi (schema), [rdi+8] = rdx (callback), [rdi+16] = 0 (reserved; written via xor rax, rax; mov [rdi+16], rax so a caller re-initing over dirty memory does not leave a stale next-slot pointer in the reserved slot -- matches the reserved-byte zeroing block_spec_init does at [rdi+13..16), src/block.pdx L308-312). Return value 0 = OK; xor rax, rax already sits in rax at ret. Every offset (0, 8, 16) fits imm32. No `test`, no `imul`, no `and`, no `cmp`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 3 qword-stores through rdi. Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body, no jumps).",
+      block: {
+        mov [rdi + 0], rsi;
+        mov [rdi + 8], rdx;
+        xor rax, rax;
+        mov [rdi + 16], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // semantic_binding_dispatch(binding_ptr, incoming_schema, record_ptr,
+  //                            record_len) -> u64
+  //
+  // If the binding's stored schema (at [rdi+0]) matches incoming_schema
+  // (rsi) AND the callback (at [rdi+8]) is non-null, invoke:
+  //     callback(record_ptr, record_len)
+  // as a tail-call and return whatever the callback returned. On a
+  // schema miss or a null callback, return 0.
+  //
+  // Consumer-side dispatch pattern: a subscriber holds an array of
+  // Binding records in .rodata (or in a static allocator slot). Its
+  // on-receive handler walks the array once per incoming frame:
+  //
+  //     for i in 0..NBINDINGS {
+  //       let r = semantic_binding_dispatch(
+  //           bindings[i], frame.schema, frame.data, frame.len);
+  //       // r == 0 iff this binding did not fire; a real callback
+  //       // that returns 0 is indistinguishable, which is fine
+  //       // because the walk fires every matching binding regardless
+  //       // of return value.
+  //     }
+  //
+  // The tail-call idiom (`call rax` then `ret`, with no local frame or
+  // stack shuffle) preserves the caller's stack layout end-to-end so
+  // this function is effectively a jump table entry -- the callee's
+  // return address is the caller's, not this dispatcher's.
+  //
+  // Register plan: rdi=binding_ptr, rsi=incoming_schema, rdx=record_ptr,
+  // rcx=record_len, rax=stored_schema then callback then return. Two
+  // qword loads through rdi ([rdi+0], [rdi+8]) then a 2-mov arg shuffle
+  // (rdi <- rdx, rsi <- rcx) then `call rax`. Entry rsp%16 == 8; `call
+  // rax` pushes an 8-byte return address so the callee sees rsp%16 == 0
+  // as SysV requires. No push/pop, no `sub rsp, N` needed. No callee-
+  // save touched.
+  //
+  // Effect `!{mem}` covers the two binding-slot loads. The callback's
+  // own effect set is the caller's responsibility -- dispatch is
+  // effect-transparent (same posture the shell's completion.pdx dispatch
+  // primitives take when they route input through a caller-provided
+  // handler).
+  //
+  // Labels prefixed sr_bd_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let semantic_binding_dispatch : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (binding_ptr: u64) (incoming_schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-009 (postui#18): semantic_binding_dispatch tail-calls the caller's callback iff the binding's stored schema matches. Phase 1 (schema match): load stored schema from [rdi+0] into rax; cmp rax, rsi; jne sr_bd_miss. Phase 2 (null-callback guard): load callback from [rdi+8] into rax; cmp rax, 0; je sr_bd_miss. Phase 3 (arg shuffle + tail call): mov rdi, rdx (record_ptr into SysV arg1); mov rsi, rcx (record_len into SysV arg2); call rax -- entry rsp%16 == 8, `call` pushes an 8-byte return address making callee-side rsp%16 == 0 which SysV requires. NO push/pop / NO sub rsp, N needed at this landing because the dispatcher has no callee-save writes and no local frame. Callback's return value stays in rax; ret returns to our caller with rax passed through verbatim. Phase 4 (miss arm sr_bd_miss): xor rax, rax; ret. The two `cmp reg, 0` are imm32-safe (0 is the smallest imm8). No `test` mnemonic. No `imul`, no `and`, no `cmp reg, imm64`. No callee-save touched -- rdi/rsi/rdx/rcx are all SysV caller-save (already-dead across our return); rax carries the return. Effect `!{mem}` covers the 2 qword loads through rdi; the callback's own effect set is the caller's responsibility (dispatch is effect-transparent -- same posture completion.pdx's dispatch primitives take when routing input through a caller-provided handler). Labels prefixed sr_bd_ per docs fingerprint discipline (sr_bd_miss for the schema-miss / null-callback arm; the tail-call arm is fall-through).",
+      block: {
+        // ---- Phase 1: schema match ----------------------------------------
+        mov rax, [rdi + 0];
+        cmp rax, rsi;
+        jne sr_bd_miss;
+
+        // ---- Phase 2: null-callback guard ---------------------------------
+        mov rax, [rdi + 8];
+        cmp rax, 0;
+        je sr_bd_miss;
+
+        // ---- Phase 3: arg shuffle + tail call -----------------------------
+        mov rdi, rdx;
+        mov rsi, rcx;
+        call rax;
+        ret;
+
+      sr_bd_miss:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+}

@@ -46,6 +46,7 @@ sources:
   - src/widgets/table.pdx         # M2-006: Table + TableState + TableView@0.1
   - src/widgets/tabs.pdx          # M2-007: Tabs + TabsView@0.1
   - src/widgets/scrollbar.pdx     # M2-008: Scrollbar + ScrollbarView@0.1
+  - src/semantic_registry.pdx     # M2-009: schema-hash constants + Send/Binding glue
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at
