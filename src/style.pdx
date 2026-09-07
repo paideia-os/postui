@@ -1,20 +1,60 @@
-// src/style.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/style.pdx -- postui.M1-002 (paideia-os/postui#2)
 //
-// Style module: placeholder for the Style aggregate landing at M1-002.
+// Style: fg color + bg color + modifier bitflags aggregate.
 //
-// A Style is the (fg Color, bg Color, mods u8) triple every Cell
-// carries (docs/design.md §2.1 Cell wire format). At M1-002 this
-// module ships the Style struct plus the modifier bitflag constants;
-// at M1-001 it exposes only the bitflag layout so a downstream Cell
-// scaffold (M1-003) can size its `mods` slot without waiting for the
-// struct body.
+// =============================================================================
+// PACKED WIRE
+// =============================================================================
+//
+// Style is packed into ONE u64 (STYLE_BYTES = 8) mirroring the fg/bg/mods
+// tail of the Cell wire format (docs/design.md §2.1 Cell wire):
+//
+//   bytes [0..3)   fg    24-bit truecolor (r, g, b) -- see Color module
+//   bytes [3..6)   bg    24-bit truecolor (r, g, b)
+//   byte  [6]      mods  bitflags (STYLE_MOD_* below)
+//   byte  [7]      pad   reserved; zero at v1; a future STYLE_MOD_HIDDEN
+//                        or hyperlink-id byte can extend here without
+//                        breaking the 8-byte wire width.
+//
+// In bit terms on the packed u64:
+//
+//   bits [ 0..24)  fg  (Color::COLOR_BYTES = 3 bytes = 24 bits)
+//   bits [24..48)  bg
+//   bits [48..56)  mods
+//   bits [56..64)  pad (0)
+//
+// The packed shape lets every helper take and return a Style in a single
+// register, and lets Cell (M1-003) copy a Style into a cell's fg/bg/mods
+// slot with a single 6-byte store rather than three field-by-field
+// writes.
+//
+// docs/design.md §2.1 reconciliation: the design.md wire freezes on 24-bit
+// truecolor only -- no 16-color or 256-palette tier is stored -- so Style
+// carries two 3-byte tuples, not two palette indices. STYLE_BYTES = 8
+// matches the scaffold's aspirational constant exactly.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Style`), matches file basename.
+//   - No `test` mnemonic; no memory accesses (pure leaf functions).
+//   - All immediates fit imm32: 0xFFFFFF = 16_777_215, 0xFF = 255, both
+//     well within the cmp/and imm32 0x7FFFFFFF bound.
+//   - `!{} @{}` effect/capability row throughout.
+//   - Labels prefixed `style_` per docs/design.md fingerprint discipline
+//     (none needed at M1-002 -- every function is straight-line).
 
 module Style = structure {
 
-  // Modifier bitflag layout (docs/design.md §2.1 mods u8). Matches
-  // the Ratatui set minus HIDDEN (dropped from v1 per design.md
-  // §2.1 note; the 9th flag slot is reserved for a future revision
-  // in the Cell's reserved[5] tail without breaking the wire).
+  // ==========================================================================
+  // Modifier bitflags (docs/design.md §2.1 mods u8). Ratatui's 9-flag
+  // set minus HIDDEN (v1 scope note in design.md §2.1); the 9th slot
+  // stays reserved in the pad byte for a future revision without
+  // breaking the 8-byte wire width. Every bit is single-set so a
+  // caller can compose a mask with `|`.
+  // ==========================================================================
+
   pub let STYLE_MOD_BOLD        : u64 = 0x01
   pub let STYLE_MOD_ITALIC      : u64 = 0x02
   pub let STYLE_MOD_UNDERLINE   : u64 = 0x04
@@ -24,9 +64,119 @@ module Style = structure {
   pub let STYLE_MOD_RAPID_BLINK : u64 = 0x40
   pub let STYLE_MOD_REVERSED    : u64 = 0x80
 
-  // Aggregate byte width once M1-002 lands the Style struct: 3
-  // (fg) + 3 (bg) + 1 (mods) + 1 (pad) = 8 bytes on a natural
-  // 8-byte boundary.
+  // Aggregate byte width. Locked at 8 (three-byte fg + three-byte bg +
+  // one-byte mods + one-byte pad). Any drift here would corrupt Cell's
+  // 16-byte wire alignment at M1-003.
   pub let STYLE_BYTES : u64 = 8
+
+  // ==========================================================================
+  // style_new(fg, bg, mods) -> u64 (packed Style)
+  //
+  // Both fg and bg are 24-bit truecolor values in the Color module's
+  // packed form (r | g<<8 | b<<16). mods is a bitmask combining any
+  // STYLE_MOD_* constants above.
+  //
+  // Every input is masked to its declared width before shifting so an
+  // out-of-bound field truncates deterministically rather than
+  // corrupting a neighbour: fg/bg mask to 24 bits, mods to 8 bits.
+  // ==========================================================================
+
+  pub let style_new : (u64, u64, u64) -> u64 !{} @{} =
+    fn (fg: u64) (bg: u64) (mods: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): style_new packs (fg, bg, mods) into a u64 Style mirroring the Cell wire's fg/bg/mods tail. Mask fg/bg to 0xFFFFFF (24 bits) and mods to 0xFF (8 bits); shift bg to bit 24 and mods to bit 48; OR into rax. Pure leaf, no memory, no push/pop, no callee-save touched. Register plan: rdi=fg, rsi=bg, rdx=mods (all caller-save, freely modified); rax = accumulator/return. Immediates 0xFFFFFF and 0xFF fit imm32.",
+      block: {
+        and rdi, 0xFFFFFF;
+        and rsi, 0xFFFFFF;
+        and rdx, 0xFF;
+
+        shl rsi, 24;
+        shl rdx, 48;
+
+        mov rax, rdi;
+        or  rax, rsi;
+        or  rax, rdx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // style_with_fg(style, color) -> u64
+  //
+  // Replace the fg color of a Style, preserving bg/mods/pad.
+  // Strategy: shift off the low 24 bits then shift them back to zero
+  // the fg slot without needing an imm-negate; OR the new (masked) fg in.
+  // ==========================================================================
+
+  pub let style_with_fg : (u64, u64) -> u64 !{} @{} =
+    fn (style: u64) (color: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): style_with_fg zeroes bits [0..24) via shr/shl 24 (avoids `and reg, ~0xFFFFFF` which would need an imm64), masks color to 24 bits, ORs in. Pure leaf; no push/pop; no callee-save touched. Register plan: rdi=style, rsi=color (both caller-save, freely modified); rax = accumulator/return.",
+      block: {
+        mov rax, rdi;
+        shr rax, 24;
+        shl rax, 24;
+
+        and rsi, 0xFFFFFF;
+        or  rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // style_with_bg(style, color) -> u64
+  //
+  // Replace the bg color of a Style, preserving fg/mods/pad.
+  // Strategy: fg is the low 24 bits; mods+pad is the top 16 bits; keep
+  // both, insert (color << 24) between them. Avoiding an imm64 mask
+  // means computing the two preserved slabs separately and ORing.
+  // ==========================================================================
+
+  pub let style_with_bg : (u64, u64) -> u64 !{} @{} =
+    fn (style: u64) (color: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): style_with_bg preserves the low 24 bits (fg) via `and rax, 0xFFFFFF` and preserves the top 16 bits (mods+pad) via `shr r8, 48; shl r8, 48`; combines with a shifted-and-masked new color at bit 24. Two 32-bit-safe imm operations (0xFFFFFF, plus shift counts <= 48). Pure leaf; no push/pop; no callee-save touched. Register plan: rdi=style, rsi=color (caller-save); rax = fg accumulator + return; r8 = mods+pad scratch.",
+      block: {
+        // fg slab (low 24 bits) into rax
+        mov rax, rdi;
+        and rax, 0xFFFFFF;
+
+        // mods+pad slab (top 16 bits, kept in-place at bits [48..64))
+        mov r8,  rdi;
+        shr r8,  48;
+        shl r8,  48;
+        or  rax, r8;
+
+        // new bg shifted to bit 24
+        and rsi, 0xFFFFFF;
+        shl rsi, 24;
+        or  rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // style_add_modifier(style, mod) -> u64
+  //
+  // Set (OR-in) one or more STYLE_MOD_* bits on a Style. mod may be a
+  // single constant (STYLE_MOD_BOLD) or a bitwise-OR of several
+  // (STYLE_MOD_BOLD | STYLE_MOD_UNDERLINE). Every high bit above the
+  // low 8 is dropped by the pre-mask so a caller cannot accidentally
+  // stomp on the pad byte or bleed into bg via an unmasked shift.
+  // ==========================================================================
+
+  pub let style_add_modifier : (u64, u64) -> u64 !{} @{} =
+    fn (style: u64) (mod: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): style_add_modifier ORs a mod byte into the mods slot at bit 48. Mask mod to 8 bits before shifting so nothing bleeds into the pad byte or bg. Pure leaf; no push/pop; no callee-save touched. Register plan: rdi=style, rsi=mod (caller-save); rax = return.",
+      block: {
+        and rsi, 0xFF;
+        shl rsi, 48;
+
+        mov rax, rdi;
+        or  rax, rsi;
+        ret;
+      }
+    }
 
 }

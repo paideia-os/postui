@@ -1,29 +1,381 @@
-// src/rect.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/rect.pdx -- postui.M1-002 (paideia-os/postui#2)
 //
-// Rect module: placeholder for the Rect primitive landing at M1-002.
+// Rect: integer terminal-cell geometry primitive.
 //
-// This file exists at M1-001 so manifest.pdxproj can register every
-// M1 source without touching the manifest again as each M1-00x issue
-// lands its body. The Rect primitive itself -- a plain struct
-// carrying (x, y, rows, cols) integer geometry plus the split/inset
-// helpers docs/design.md §2.4 layout engine consumes -- lands with
-// postui.M1-002. Until then this module exposes only the size and
-// alignment invariants a downstream module can reference statically.
+// =============================================================================
+// PACKED WIRE
+// =============================================================================
+//
+// Rect is packed into ONE u64 (RECT_BYTES = 8) with four u16 fields:
+//
+//   bits [ 0..16)  x    column of the top-left cell           (0..RECT_DIM_MAX)
+//   bits [16..32)  y    row of the top-left cell              (0..RECT_DIM_MAX)
+//   bits [32..48)  w    width in cells                         (0..RECT_DIM_MAX)
+//   bits [48..64)  h    height in cells                        (0..RECT_DIM_MAX)
+//
+// The packed shape lets every helper pass and return a Rect in a single
+// register with no memory traffic -- the same discipline libpdx-elevate's
+// elevate_request_pack_op_word uses for its (op | caps << 8) composite,
+// and the same shape docs/design.md §2.4's layout engine consumes at M2
+// (a Rect[] output slice is a plain array of packed u64 words).
+//
+// =============================================================================
+// FIELD BOUND
+// =============================================================================
+//
+// Every field is masked to 16 bits (0xFFFF) on both pack (rect_new) and
+// unpack (rect_x/rect_y/rect_w/rect_h) so a caller that passes a value
+// greater than 0xFFFF gets deterministic truncation rather than silent
+// high-bit corruption of an adjacent field. RECT_DIM_MAX = 4096 is a
+// tighter semantic ceiling (matching TUI_DIM_MAX in the kernel-side cap
+// row, docs/design.md §2.1) which higher layers enforce -- this module
+// only enforces the wire-shape bound.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Rect`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - r11 reserved as LEA scratch (not used in this leaf module).
+//   - All immediates in `cmp reg, imm` and `and reg, imm` fit imm32 (<=
+//     0x7FFFFFFF: 0xFFFF = 65535, 0 are the only two used).
+//   - Every function is a pure leaf (no memory, no syscall, no cap):
+//     `!{} @{}` effect/capability row. All state lives in registers.
+//   - Labels prefixed `rect_` per docs/design.md fingerprint discipline.
 
 module Rect = structure {
 
-  // Byte width of the Rect struct once M1-002 lands its fields.
-  // Locked at scaffold time so a downstream .bss reservation
-  // (Buffer, Frame) can size its Rect-carrying slots without waiting
-  // for the struct body. Four u16 fields packed = 8 bytes; kept at
-  // that ceiling in the scaffold as an aspirational constant the
-  // M1-002 struct definition must match.
-  pub let RECT_BYTES : u64 = 8
+  // ==========================================================================
+  // Sizing / bound constants (locked at M1-001 scaffold; kept here so
+  // there is one authoritative source of both the wire width and the
+  // semantic dimension ceiling in the same module the helpers live in).
+  // ==========================================================================
 
-  // Maximum rows/cols any Rect can encode. Same ceiling docs/design
-  // .md §2.1 sets on canvas dimensions (TUI_DIM_MAX = 4096); a Rect
-  // that layouts against a canvas cannot address beyond the canvas
-  // grid.
+  pub let RECT_BYTES   : u64 = 8
   pub let RECT_DIM_MAX : u64 = 4096
+
+  // ==========================================================================
+  // rect_new(x, y, w, h) -> u64 (packed Rect)
+  //
+  // Packs four u16 fields into a single u64. Every input is masked to
+  // 16 bits before being shifted into place, so an out-of-bound field
+  // truncates (deterministic) rather than corrupting a neighbour.
+  // ==========================================================================
+
+  pub let rect_new : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (x: u64) (y: u64) (w: u64) (h: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_new packs four u16 fields (x,y,w,h) into one u64 Rect. Mask every arg to 16 bits (and reg, 0xFFFF -- 0xFFFF = 65535 sign-extends safely, well within imm32 bound), shift y/w/h into their slots (16/32/48), OR into rax. Pure leaf: no memory access, no push/pop, no callee-save touched. Register plan: rdi/rsi/rdx/rcx = x/y/w/h args (caller-save, freely modified); rax = accumulator/return. No labels needed.",
+      block: {
+        and rdi, 0xFFFF;
+        and rsi, 0xFFFF;
+        and rdx, 0xFFFF;
+        and rcx, 0xFFFF;
+
+        shl rsi, 16;
+        shl rdx, 32;
+        shl rcx, 48;
+
+        mov rax, rdi;
+        or  rax, rsi;
+        or  rax, rdx;
+        or  rax, rcx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // rect_x(r) -> u64
+  // rect_y(r) -> u64
+  // rect_w(r) -> u64
+  // rect_h(r) -> u64
+  //
+  // Field accessors. Not strictly required by postui#2's helper list but
+  // included because every rect_contains / rect_intersect body inlines
+  // the same four unpack sequences -- exposing them keeps M1-003+ (Cell,
+  // Buffer, Block) from re-deriving the wire layout independently. Each
+  // is a two-instruction leaf.
+  // ==========================================================================
+
+  pub let rect_x : (u64) -> u64 !{} @{} =
+    fn (r: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_x extracts the x field (bits [0..16)) of a packed Rect. Copy arg to rax, mask to 16 bits, return. Pure leaf; no push/pop.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        ret;
+      }
+    }
+
+  pub let rect_y : (u64) -> u64 !{} @{} =
+    fn (r: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_y extracts the y field (bits [16..32)) of a packed Rect. Copy arg to rax, shift right 16, mask to 16 bits, return. Pure leaf; no push/pop.",
+      block: {
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret;
+      }
+    }
+
+  pub let rect_w : (u64) -> u64 !{} @{} =
+    fn (r: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_w extracts the w field (bits [32..48)) of a packed Rect. Copy arg to rax, shift right 32, mask to 16 bits, return. Pure leaf; no push/pop.",
+      block: {
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        ret;
+      }
+    }
+
+  pub let rect_h : (u64) -> u64 !{} @{} =
+    fn (r: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_h extracts the h field (bits [48..64)) of a packed Rect. Copy arg to rax, shift right 48 (top bits, already 16-bit range so no mask needed), return. Pure leaf; no push/pop.",
+      block: {
+        mov rax, rdi;
+        shr rax, 48;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // rect_contains(r, px, py) -> u64 (1 if inside, 0 otherwise)
+  //
+  // Half-open containment: returns 1 iff px in [x, x+w) AND py in [y, y+h).
+  // A zero-area rect (w==0 or h==0) contains nothing -- the `jae` branch
+  // on `cmp px, x+w` catches px == x when w == 0 and correctly returns 0.
+  //
+  // Register plan: rax = extract scratch / return; r8 = second unpack
+  // scratch (for w then h). rdi/rsi/rdx = args (caller-save, modified
+  // freely to mask into u16 range before compare so a caller with garbage
+  // high bits is not silently mis-classified). Pure leaf; no push/pop.
+  // ==========================================================================
+
+  pub let rect_contains : (u64, u64, u64) -> u64 !{} @{} =
+    fn (r: u64) (px: u64) (py: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_contains tests half-open [x,x+w) x [y,y+h) membership. Mask px/py to 16 bits so a caller with garbage high bits is not mis-classified by an unsigned compare. Extract x -> rax; if px < x jump rc_no. Extract w -> r8; add x+w -> rax; if px >= x+w jump rc_no. Extract y -> rax; if py < y jump rc_no. Extract h -> r8; add y+h -> rax; if py >= y+h jump rc_no. Fall through: rax = 1. Every cmp uses cmp reg, reg (no imm-gate concern). Immediates: 0xFFFF (mask), 1 (positive return) -- both within imm32. No callee-save touched, no push/pop. Labels prefixed rc_ per docs fingerprint discipline.",
+      block: {
+        and rsi, 0xFFFF;
+        and rdx, 0xFFFF;
+
+        // Extract x, compare px >= x.
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        cmp rsi, rax;
+        jb  rc_no;
+
+        // Extract w, form x + w, compare px < x + w.
+        mov r8,  rdi;
+        shr r8,  32;
+        and r8,  0xFFFF;
+        add rax, r8;
+        cmp rsi, rax;
+        jae rc_no;
+
+        // Extract y, compare py >= y.
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        cmp rdx, rax;
+        jb  rc_no;
+
+        // Extract h, form y + h, compare py < y + h.
+        mov r8,  rdi;
+        shr r8,  48;
+        add rax, r8;
+        cmp rdx, rax;
+        jae rc_no;
+
+        mov rax, 1;
+        ret;
+
+      rc_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // rect_intersect(a, b) -> u64 (packed Rect)
+  //
+  // Returns the axis-aligned intersection of two Rects. If the rects do
+  // not overlap the return is the zero-Rect (0). A zero-Rect result is
+  // distinguishable from a legitimate (0,0,0,0) Rect only by inspection
+  // -- callers that need "did they overlap?" should test rect_w and
+  // rect_h of the return, not the packed word.
+  //
+  // Algorithm:
+  //   x  = max(a.x, b.x)
+  //   y  = max(a.y, b.y)
+  //   rx = min(a.x + a.w, b.x + b.w)      -- right edge (exclusive)
+  //   ry = min(a.y + a.h, b.y + b.h)      -- bottom edge (exclusive)
+  //   if rx < x or ry < y: return 0
+  //   else: return rect_new(x, y, rx - x, ry - y)
+  //
+  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  //   rbx = bx    r12 = by    r13 = bx+bw    r14 = by+bh
+  //   r8  = ax    r9  = ay    r10 = ax+aw    r11 = ay+ah
+  //   rax = extract scratch then final pack accumulator/return.
+  // rdi = a, rsi = b (both caller-save; treated read-only in the body).
+  // ==========================================================================
+
+  pub let rect_intersect : (u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_intersect returns the axis-aligned intersection of two packed Rects. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Extract a into r8=ax, r9=ay, r10=ax+aw, r11=ay+ah (compute the right/bottom edges BEFORE clobbering the base coords). Extract b into rbx=bx, r12=by, r13=bx+bw, r14=by+bh. Compute x=max(r8,rbx) into r8 via cmp+cmov-shape branch. y=max(r9,r12) into r9. rx=min(r10,r13) into r10. ry=min(r11,r14) into r11. Empty test: rx < x or ry < y -> jump ri_empty. Otherwise sub r8 from r10 (w = rx - x), sub r9 from r11 (h = ry - y), mask/shift/OR pack into rax exactly as rect_new does (bit slots 0/16/32/48). Every cmp is cmp reg, reg; every imm is 16 (shift) or 32 (shift) or 48 (shift) or 0xFFFF (mask) -- all imm32-safe. Labels prefixed ri_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        // ---- Extract a -----------------------------------------------------
+        // r8 = a.x
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        mov r8,  rax;
+
+        // r10 = a.x + a.w (form right edge before we clobber ax)
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        add rax, r8;
+        mov r10, rax;
+
+        // r9 = a.y
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov r9,  rax;
+
+        // r11 = a.y + a.h
+        mov rax, rdi;
+        shr rax, 48;
+        add rax, r9;
+        mov r11, rax;
+
+        // ---- Extract b -----------------------------------------------------
+        // rbx = b.x
+        mov rax, rsi;
+        and rax, 0xFFFF;
+        mov rbx, rax;
+
+        // r13 = b.x + b.w
+        mov rax, rsi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        add rax, rbx;
+        mov r13, rax;
+
+        // r12 = b.y
+        mov rax, rsi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov r12, rax;
+
+        // r14 = b.y + b.h
+        mov rax, rsi;
+        shr rax, 48;
+        add rax, r12;
+        mov r14, rax;
+
+        // ---- x = max(a.x, b.x) into r8 -------------------------------------
+        cmp r8, rbx;
+        jae ri_x_done;
+        mov r8, rbx;
+      ri_x_done:
+
+        // ---- y = max(a.y, b.y) into r9 -------------------------------------
+        cmp r9, r12;
+        jae ri_y_done;
+        mov r9, r12;
+      ri_y_done:
+
+        // ---- rx = min(ax+aw, bx+bw) into r10 -------------------------------
+        cmp r10, r13;
+        jbe ri_rx_done;
+        mov r10, r13;
+      ri_rx_done:
+
+        // ---- ry = min(ay+ah, by+bh) into r11 -------------------------------
+        cmp r11, r14;
+        jbe ri_ry_done;
+        mov r11, r14;
+      ri_ry_done:
+
+        // ---- Empty test: rx < x OR ry < y ----------------------------------
+        cmp r10, r8;
+        jb  ri_empty;
+        cmp r11, r9;
+        jb  ri_empty;
+
+        // ---- Form (w, h) in-place: r10 = rx - x, r11 = ry - y -------------
+        sub r10, r8;
+        sub r11, r9;
+
+        // ---- Pack (x | y<<16 | w<<32 | h<<48) into rax --------------------
+        and r8,  0xFFFF;
+        and r9,  0xFFFF;
+        and r10, 0xFFFF;
+        and r11, 0xFFFF;
+
+        shl r9,  16;
+        shl r10, 32;
+        shl r11, 48;
+
+        mov rax, r8;
+        or  rax, r9;
+        or  rax, r10;
+        or  rax, r11;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ri_empty:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // rect_area(r) -> u64
+  //
+  // Returns w * h. Widest possible result at RECT_DIM_MAX bounds:
+  // 4096 * 4096 = 16_777_216 (~2^24), well within u32 (and u64) range;
+  // even with the pathological 0xFFFF * 0xFFFF = 0xFFFE0001, the product
+  // still fits u32. Return type is u64 for uniform ABI shape across the
+  // module; a caller narrowing to u32 loses no information.
+  // ==========================================================================
+
+  pub let rect_area : (u64) -> u64 !{} @{} =
+    fn (r: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): rect_area returns w * h. Extract w into rax (shift 32, mask 0xFFFF); extract h into r8 (shift 48, no mask needed -- h occupies the top 16 bits so the shift zero-extends automatically). Multiply via 2-op imul reg,reg (which paideia-as accepts; 2-op imul reg,imm is the pitfall shape and is NOT used here). Return rax. Pure leaf; no callee-save touched, no push/pop.",
+      block: {
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+
+        mov r8,  rdi;
+        shr r8,  48;
+
+        imul rax, r8;
+        ret;
+      }
+    }
 
 }

@@ -1,24 +1,297 @@
-// src/color.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/color.pdx -- postui.M1-002 (paideia-os/postui#2)
 //
-// Color module: placeholder for the 24-bit truecolor triplet landing
-// at M1-002.
+// Color: 24-bit truecolor triplet + helpers.
 //
-// docs/design.md §2.1 freezes postui on 24-bit truecolor only -- no
-// 16-color or 256-palette tier is stored or emitted. This module
-// scaffolds the CHANNEL_* and BYTE-WIDTH constants that downstream
-// modules (Cell, Style) reference; the (r, g, b) tuple type itself
-// lands at M1-002 alongside the struct-carrying Style aggregate.
+// =============================================================================
+// PACKED WIRE
+// =============================================================================
+//
+// A Color is packed into ONE u64 (COLOR_BYTES = 3 payload bytes; the
+// remaining 5 bytes of the u64 are always zero on the wire):
+//
+//   bits [ 0.. 8)  r   red channel   (0..255)
+//   bits [ 8..16)  g   green channel (0..255)
+//   bits [16..24)  b   blue channel  (0..255)
+//   bits [24..64)  0   reserved zero -- Cell (M1-003) reads exactly 3
+//                       bytes into its fg/bg slot, so the high bits are
+//                       never touched at write time.
+//
+// This is the same channel order the Cell wire uses (docs/design.md
+// §2.1: `fg [3]u8   24-bit truecolor (r, g, b)`); a color returned by
+// color_from_rgb can be OR'd into a Style at bit 0 (fg) or bit 24 (bg)
+// with a single shift + OR.
+//
+// docs/design.md §2.1 freezes postui on 24-bit truecolor as the ONLY
+// wire representation -- no 16-color or 256-palette tier is stored or
+// emitted. The color_to_index helper below computes a 256-color xterm
+// palette index for callers rendering to a legacy SGR consumer, but
+// that index is NEVER stored in a Cell; it is a projection used at
+// SGR-emit time by future kernel-side ANSI encoders or by ring-3
+// down-conversion utilities. Every field a Style carries is a 3-byte
+// truecolor tuple, per §2.1.
+//
+// =============================================================================
+// 256-COLOR APPROXIMATION
+// =============================================================================
+//
+// The xterm 256-color palette is
+//
+//   [0..15]    16 fixed ANSI base colors (system-defined; not covered here)
+//   [16..231]  6x6x6 truecolor cube: idx = 16 + 36*r_i + 6*g_i + b_i
+//              with each channel index in {0,1,2,3,4,5}
+//   [232..255] 24 grayscale steps
+//
+// color_to_index maps every input to the 6x6x6 cube -- the greyscale
+// steps are ignored because the closest cube cell is usually within
+// one JND of the grayscale approximation, and adding a "prefer
+// grayscale when |r-g| < eps and |g-b| < eps" branch costs more code
+// than v1 needs. Each channel is quantized as `c / 51` (yielding
+// {0,1,2,3,4,5} for `c` in {0..50, 51..101, ..., 255}), which is the
+// nearest fixed-step approximation to the xterm palette's actual
+// non-uniform step values {0, 95, 135, 175, 215, 255}. A future
+// higher-fidelity mapping can replace this quantizer without changing
+// the API surface.
+//
+// =============================================================================
+// LINEAR INTERPOLATION
+// =============================================================================
+//
+// color_lerp(a, b, t) blends two 24-bit colors with `t` in [0..256]:
+//
+//   out_c = ((256 - t) * a_c + t * b_c) / 256              per channel
+//         = ((256 - t) * a_c + t * b_c) >> 8
+//
+// t == 0   returns a; t == 256 returns b. Values of t > 256 are clamped
+// to 256 (so a caller that passes e.g. 300 saturates at b rather than
+// producing wrap-around channel values). The 256-step blend is chosen
+// over a 0..255 range so `256 - t` fits a single-instruction subtract
+// from an imm32 without a `sub 1` correction and so the divide is a
+// pure `shr 8`.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Color`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` (there are
+//     none in this module -- the sole conditional is `cmp rdx, 256`
+//     for the color_lerp clamp).
+//   - All immediates fit imm32 (0xFF, 51, 256, 16, 36, 6, 8, etc.).
+//   - `div r8` for unsigned quantization (rax quotient, rdx remainder;
+//     mirrors mkfs.pdxfs/src/format_record.pdx's own `div rcx` usage).
+//   - `imul reg, reg` only (2-op imul reg,imm is the paideia-as pitfall).
+//   - Effect row `!{} @{}` throughout (pure register logic).
+//   - Labels prefixed `cl_` / `ci_` per docs/design.md fingerprint
+//     discipline.
 
 module Color = structure {
 
-  // Number of channel bytes per color value. Locked at 3 (r, g, b);
-  // an alpha channel is out of scope for a terminal cell.
-  pub let COLOR_BYTES : u64 = 3
+  // ==========================================================================
+  // Sizing / bound constants (locked at M1-001 scaffold; kept here so
+  // there is one authoritative source in the same module as the helpers).
+  // ==========================================================================
 
-  // Channel-value bounds. Every color component is a u8 (0..255).
-  // Recorded as u64 constants so a downstream range check can
-  // compare against them without a narrowing cast.
+  pub let COLOR_BYTES       : u64 = 3
   pub let COLOR_CHANNEL_MIN : u64 = 0
   pub let COLOR_CHANNEL_MAX : u64 = 255
+
+  // ==========================================================================
+  // color_from_rgb(r, g, b) -> u64 (packed Color)
+  //
+  // Packs three u8 channels into a single u64 in Cell wire order
+  // (r | g<<8 | b<<16). Every input is masked to 8 bits so an
+  // out-of-bound channel truncates rather than corrupting the next.
+  // ==========================================================================
+
+  pub let color_from_rgb : (u64, u64, u64) -> u64 !{} @{} =
+    fn (r: u64) (g: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): color_from_rgb packs three u8 channels into a u64 Color. Mask each arg to 0xFF (255, imm32-safe); shift g to bit 8, b to bit 16; OR into rax. Pure leaf, no memory, no push/pop, no callee-save touched. Register plan: rdi=r, rsi=g, rdx=b (all caller-save, freely modified); rax = accumulator/return.",
+      block: {
+        and rdi, 0xFF;
+        and rsi, 0xFF;
+        and rdx, 0xFF;
+
+        shl rsi, 8;
+        shl rdx, 16;
+
+        mov rax, rdi;
+        or  rax, rsi;
+        or  rax, rdx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // color_to_index(r, g, b) -> u64
+  //
+  // Returns the xterm 256-color palette index approximating the given
+  // 24-bit truecolor via the 6x6x6 color cube: idx = 16 + 36*rq + 6*gq +
+  // bq where each channel index is `c / 51`. The greyscale ramp
+  // (232..255) is not used; the caller gets the closest cube cell only.
+  //
+  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  //   rbx = r_idx      r12 = g_idx      r13 = saved b arg
+  //   r14 = b_idx      r8  = 51 divisor and pack-scratch
+  //   rax = div dividend then accumulator/return
+  //   rdx = div remainder (clobbered every iteration)
+  // rdi/rsi/rdx = args (rdx is CLOBBERED by div so we save b to r13 first).
+  // ==========================================================================
+
+  pub let color_to_index : (u64, u64, u64) -> u64 !{} @{} =
+    fn (r: u64) (g: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): color_to_index quantizes an (r,g,b) triple to the xterm 6x6x6 palette index. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Save b into r13 BEFORE the first `div r8` (div clobbers rdx which holds the b arg). For each channel: mask to 0xFF into rax, clear rdx via xor, load divisor 51 into r8, `div r8` (rax=quotient, rdx=remainder; same shape mkfs.pdxfs/src/format_record.pdx uses). Store rq/gq/bq in rbx/r12/r14. Then compose 36*rq + 6*gq + bq via two 2-op imul reg,reg (36 -> r8 then imul rax,r8; 6 -> r9 then imul r8,r9 where r8 holds gq); finally add 16 (imm32-safe). All immediates (0xFF, 51, 36, 6, 16) fit imm32. No test mnemonic; no compares. Effects `!{} @{}` -- pure register logic. Labels prefixed ci_ per docs fingerprint discipline (none needed here -- straight-line body).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        // Save b BEFORE div clobbers rdx.
+        mov r13, rdx;
+        and r13, 0xFF;
+
+        // r_idx = r / 51
+        mov rax, rdi;
+        and rax, 0xFF;
+        xor rdx, rdx;
+        mov r8,  51;
+        div r8;                             // rax = r / 51, rdx = r % 51
+        mov rbx, rax;
+
+        // g_idx = g / 51
+        mov rax, rsi;
+        and rax, 0xFF;
+        xor rdx, rdx;
+        mov r8,  51;
+        div r8;
+        mov r12, rax;
+
+        // b_idx = b / 51 (using the saved copy in r13)
+        mov rax, r13;
+        xor rdx, rdx;
+        mov r8,  51;
+        div r8;
+        mov r14, rax;
+
+        // idx = 16 + 36*r_idx + 6*g_idx + b_idx
+        mov rax, rbx;
+        mov r8,  36;
+        imul rax, r8;                       // rax = 36 * r_idx
+
+        mov r8,  r12;
+        mov r9,  6;
+        imul r8, r9;                        // r8  = 6 * g_idx
+        add rax, r8;
+
+        add rax, r14;
+        add rax, 16;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // color_lerp(a, b, t) -> u64
+  //
+  // Linear interpolation between two 24-bit Colors. `t` is a 0..256
+  // blend factor: t == 0 returns a, t == 256 returns b. Values above
+  // 256 are clamped to 256 (saturate at b rather than wrap).
+  //
+  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  //   rbx = b.b         r12 = out.r      r13 = out.g
+  //   r14 = 256 - t     r8/r9/r10/r11 = extract scratches
+  //   rax = channel accumulator / final pack / return
+  // rdi = a, rsi = b, rdx = t (rdx is clamped but not clobbered by any
+  // div in this function).
+  // ==========================================================================
+
+  pub let color_lerp : (u64, u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) (t: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M1-002 (#2): color_lerp blends two 24-bit Colors by a 0..256 factor t. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Clamp t: if t > 256, mov rdx, 256 (imm 256 imm32-safe). Compute inv = 256 - t into r14 via `mov r14, 256; sub r14, rdx`. Extract a.r into rax (and 0xFF), a.g into r8 (shr 8, and 0xFF), a.b into r9 (shr 16, and 0xFF). Extract b.r into r10 (and 0xFF), b.g into r11 (shr 8, and 0xFF), b.b into rbx (shr 16, and 0xFF). Per channel: rax = (inv*a_c + t*b_c) via two 2-op imul reg,reg then add; `shr rax, 8` to divide by 256; `and rax, 0xFF` to clamp any high-bit slop. Store r/g into r12/r13; b lives in rax when we pack. Pack via shl 8/16 + OR into rax. Every imm (0xFF, 256, 8, 16, cl_t_ok label offset) fits imm32. Effects `!{} @{}` -- pure register logic. Labels prefixed cl_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        // Clamp t to [0..256].
+        cmp rdx, 256;
+        jbe cl_t_ok;
+        mov rdx, 256;
+      cl_t_ok:
+
+        // inv = 256 - t into r14
+        mov r14, 256;
+        sub r14, rdx;
+
+        // Extract a channels
+        mov rax, rdi;
+        and rax, 0xFF;                       // rax = a.r
+
+        mov r8,  rdi;
+        shr r8,  8;
+        and r8,  0xFF;                       // r8 = a.g
+
+        mov r9,  rdi;
+        shr r9,  16;
+        and r9,  0xFF;                       // r9 = a.b
+
+        // Extract b channels
+        mov r10, rsi;
+        and r10, 0xFF;                       // r10 = b.r
+
+        mov r11, rsi;
+        shr r11, 8;
+        and r11, 0xFF;                       // r11 = b.g
+
+        mov rbx, rsi;
+        shr rbx, 16;
+        and rbx, 0xFF;                       // rbx = b.b
+
+        // out.r = (inv*a.r + t*b.r) >> 8
+        imul rax, r14;                       // rax = inv * a.r
+        imul r10, rdx;                       // r10 = t   * b.r
+        add rax, r10;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov r12, rax;                        // r12 = out.r
+
+        // out.g = (inv*a.g + t*b.g) >> 8
+        imul r8,  r14;
+        imul r11, rdx;
+        add r8, r11;
+        shr r8, 8;
+        and r8, 0xFF;
+        mov r13, r8;                         // r13 = out.g
+
+        // out.b = (inv*a.b + t*b.b) >> 8
+        imul r9,  r14;
+        imul rbx, rdx;
+        add r9, rbx;
+        shr r9, 8;
+        and r9, 0xFF;                        // r9  = out.b
+
+        // Pack (out.r | out.g << 8 | out.b << 16) into rax
+        shl r13, 8;
+        shl r9,  16;
+
+        mov rax, r12;
+        or  rax, r13;
+        or  rax, r9;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
 
 }
