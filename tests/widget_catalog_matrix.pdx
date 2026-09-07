@@ -1,0 +1,1937 @@
+// tests/widget_catalog_matrix.pdx -- postui.M5-005 (paideia-os/postui#39)
+//
+// WidgetCatalogMatrix: fifth-wave boot smoke -- exhaustive matrix that
+// drives EVERY widget's draw entrypoint through TWO documented state
+// variants (30 draw invocations in total) against a shared 80-col x
+// 30-row Cell buffer laid out as 10-tile-cols x 3-tile-rows with row
+// 9 / row 19 / row 29 guard rows separating tile rows.
+//
+// =============================================================================
+// SCOPE (docs/design.md sec.5.1 M5-005, design/architecture.md sec.7)
+// =============================================================================
+//
+// M5-005 lands the fifth tests/*.pdx module in postui, extending the
+// postui#34 (M4-008) boot-catalog pattern to a full variant matrix
+// that catches state-dependent regressions the single-variant catalog
+// smoke can miss:
+//
+//   * block:      with border (PLAIN) / without border (NONE + title)
+//   * paragraph:  wrap=NONE / wrap=WORD
+//   * list:       state=NULL (unselected) / state->selected=0
+//   * table:      header_ptr=Line / header_ptr=0
+//   * tabs:       1 tab, sel=0 / 3 tabs, sel=1
+//   * scrollbar:  orientation=Vertical / orientation=Horizontal
+//   * gauge:      kind=Bar / kind=Line
+//   * sparkline:  value_count=1 / value_count=0
+//   * barchart:   bar_count=1 / bar_count=5
+//   * chart:      kind=Line (2 pts) / kind=Scatter (1 pt)
+//   * canvas:     canvas_line drawn / canvas_clear only
+//   * text_input: mode=SingleLine / mode=MultiLine
+//   * tree:       leaf-only node / expanded root + 1 child
+//   * calendar:   month=1 / month=7
+//   * clear:      style=0 (default) / style=1 (custom)
+//
+// The M4-008 catalog smoke ("does every draw entrypoint stamp at least
+// one cell without leaking past its Rect?") is a *regression corpus*
+// for the module dispatch surface; this M5-005 matrix is a *variant
+// corpus* for the state-dispatch inside each draw. A change that
+// silently regresses the border=NONE fast path in block_draw, or the
+// value_count=0 short-circuit in sparkline_draw, or the header_ptr=0
+// branch in table_draw, would render fine under the M4-008 corpus but
+// fail here.
+//
+// Each variant is verified against three properties (same shape as
+// M4-008; the M4 rationale for skipping pixel-perfect fixtures over
+// 30 golden files applies here at 2x the multiplier):
+//
+//   1. widget_draw returns 0 (no widget-specific error sentinel).
+//   2. AT LEAST ONE non-zero cell exists inside the variant's Rect
+//      tile (proves the variant wrote SOMETHING). Every widget in the
+//      catalog is verified upstream to stamp non-zero cells even in
+//      its "empty" state:
+//        - sparkline with value_count=0 still fills the entire Rect
+//          with space glyph (0x20) styled with style_track (see
+//          sparkline.pdx Phase 1 fill).
+//        - canvas with a cleared bitmap still stamps every cell with
+//          the empty-braille glyph U+2800 = 0x0080A0E2 (see canvas.pdx
+//          canvas_draw main loop).
+//        - block with border=NONE + title=1 char stamps the title
+//          glyph at (bx, by) (see block.pdx Phase 3 title path with
+//          title_x_offset = r15!=0 ? 1 : 0; r15==0 for border=NONE
+//          means title starts at bx).
+//        - clear with style=0 stamps every cell with 0x20 (the space
+//          glyph itself is non-zero; the style-only zero doesn't
+//          collapse the fill).
+//   3. Rect dimensions are respected. Verified via row 9, row 19, and
+//      row 29 guard rows (240 qwords total). Same construction as
+//      M4-008: every variant tile has y in {0, 10, 20} and h=9, so
+//      every tile's y-range is disjoint from every guard row.
+//
+// =============================================================================
+// FIXTURE (80 cols x 30 rows shared buffer, 30 tiles + 3 guard rows)
+// =============================================================================
+//
+// Buffer: 80 cols x 30 rows x 16 B = 38400 B = 4800 u64 slots. @align(16)
+//         so every (y*cols+x)*16 offset lands on a Cell boundary.
+//
+// Tile layout (10 tile cols x 3 tile rows = 30 slots; every tile is
+// 8 cols wide x 9 rows tall; row 9, row 19, row 29 are GUARD rows
+// separating tile rows, all-zero throughout the test):
+//
+//   x= 0 x= 8 x=16 x=24 x=32 x=40 x=48 x=56 x=64 x=72
+//   +---++---++---++---++---++---++---++---++---++---+
+//   |Blk||Blk||Par||Par||Lst||Lst||Tbl||Tbl||Tab||Tab|  y=0..9
+//   | + || - ||NoW||WrW||nul||sel||hdr||nhd||1t0||3t1|
+//   +---++---++---++---++---++---++---++---++---++---+
+//     ~~~~~~~~~~~~~~~~~~~~~ row 9 GUARD ~~~~~~~~~~~~~~~~~~~~~
+//   +---++---++---++---++---++---++---++---++---++---+
+//   |ScV||ScH||GgB||GgL||SpV||Sp0||Br1||Br5||ChL||ChS|  y=10..19
+//   +---++---++---++---++---++---++---++---++---++---+
+//     ~~~~~~~~~~~~~~~~~~~~~ row 19 GUARD ~~~~~~~~~~~~~~~~~~~~
+//   +---++---++---++---++---++---++---++---++---++---+
+//   |CvL||CvC||TiS||TiM||TrL||TrE||Cl1||Cl7||Clr||Clr|  y=20..29
+//   |ine||lr ||L  ||L  ||eaf||xp ||   ||   ||def||cst|
+//   +---++---++---++---++---++---++---++---++---++---+
+//     ~~~~~~~~~~~~~~~~~~~~~ row 29 GUARD ~~~~~~~~~~~~~~~~~~~~
+//
+// Variant-to-tile slot map (slot index === matrix draw ordinal):
+//
+//   slot  widget/variant                 rect (x, y, w, h)   byte offset
+//   ----  ------------------------------ ------------------  -----------
+//    0    block   / border PLAIN         ( 0,  0, 8, 9)                0
+//    1    block   / no border + title    ( 8,  0, 8, 9)              128
+//    2    para    / wrap NONE            (16,  0, 8, 9)              256
+//    3    para    / wrap WORD            (24,  0, 8, 9)              384
+//    4    list    / state NULL           (32,  0, 8, 9)              512
+//    5    list    / state.selected=0     (40,  0, 8, 9)              640
+//    6    table   / header_ptr!=0        (48,  0, 8, 9)              768
+//    7    table   / header_ptr==0        (56,  0, 8, 9)              896
+//    8    tabs    / 1 tab, sel=0         (64,  0, 8, 9)             1024
+//    9    tabs    / 3 tabs, sel=1        (72,  0, 8, 9)             1152
+//   10    scroll  / Vertical             ( 0, 10, 8, 9)            12800
+//   11    scroll  / Horizontal           ( 8, 10, 8, 9)            12928
+//   12    gauge   / Bar                  (16, 10, 8, 9)            13056
+//   13    gauge   / Line                 (24, 10, 8, 9)            13184
+//   14    spark   / 1 value              (32, 10, 8, 9)            13312
+//   15    spark   / 0 values             (40, 10, 8, 9)            13440
+//   16    bar     / 1 bar                (48, 10, 8, 9)            13568
+//   17    bar     / 5 bars               (56, 10, 8, 9)            13696
+//   18    chart   / Line (2 pts)         (64, 10, 8, 9)            13824
+//   19    chart   / Scatter (1 pt)       (72, 10, 8, 9)            13952
+//   20    canvas  / line drawn           ( 0, 20, 8, 9)            25600
+//   21    canvas  / cleared only         ( 8, 20, 8, 9)            25728
+//   22    tinput  / SingleLine           (16, 20, 8, 9)            25856
+//   23    tinput  / MultiLine            (24, 20, 8, 9)            25984
+//   24    tree    / leaf-only            (32, 20, 8, 9)            26112
+//   25    tree    / expanded             (40, 20, 8, 9)            26240
+//   26    cal     / month=1              (48, 20, 8, 9)            26368
+//   27    cal     / month=7              (56, 20, 8, 9)            26496
+//   28    clear   / style=0              (64, 20, 8, 9)            26624
+//   29    clear   / style=1              (72, 20, 8, 9)            26752
+//
+// Guard rows: row 9 (byte offset 11520), row 19 (24320), row 29 (37120).
+// 3 rows x 80 cols x 16 B = 3840 B = 480 qwords total to check
+// (160 qwords per row).
+//
+// Every tile-top-left byte offset (0..26752) and every guard-row byte
+// offset (11520..37120) is imm32-safe. Every packed-rect literal
+// (0x0009000800000000..0x0009000800140048) is > 0x7FFFFFFF -> movabs.
+//
+// Row stride (BWCM_ROW_STRIDE) = 80 cols x 16 B = 1280 B (imm32-safe).
+//
+// =============================================================================
+// PER-VARIANT MINIMAL SPEC (see design/architecture.md sec.5 wire tables)
+// =============================================================================
+//
+// Every variant is set up with the smallest spec that guarantees the
+// tile check passes AND that meaningfully exercises the variant-
+// specific dispatch inside the widget:
+//
+//   block   / PLAIN   : border_kind=1, title="B", 4-corner + edge glyphs
+//                       stamped in the tile.
+//   block   / NONE    : border_kind=0, title="X", title glyph at (bx,by).
+//   para    / NoWrap  : wrap=PARA_WRAP_NONE, alignment=Left, text="X".
+//   para    / WordWrap: wrap=PARA_WRAP_WORD, alignment=Left, text="X".
+//   list    / NULL    : state_ptr=0 -> decodes as selected=LIST_SELECTED_NONE.
+//   list    / SEL     : state -> ListState(selected=0, offset=0).
+//   table   / HDR     : header_ptr -> shared Line "X"; state.selected=0.
+//   table   / NOHDR   : header_ptr=0; state.selected=0.
+//   tabs    / 1T0     : 1 tab titled "X"; selected=0.
+//   tabs    / 3T1     : 3 tabs all titled "X"; selected=1 (mid-selected).
+//   scroll  / V       : orientation=0, content=10, viewport=5, position=2.
+//   scroll  / H       : orientation=1, same v/c/p, exercises axis swap.
+//   gauge   / Bar     : kind=0, value=50, max=100.
+//   gauge   / Line    : kind=1, value=50, max=100.
+//   spark   / N1      : 1 value=7, max_override=7 -> col 0 fills full height.
+//   spark   / N0      : value_count=0 -> hits the value_count==0 fast path;
+//                       the phase-1 space fill still stamps every cell.
+//   bar     / 1B      : bars=[7], count=1, width=1, max=7.
+//   bar     / 5B      : bars=[7,3,5,2,6], count=5, width=1, max=7.
+//   chart   / LINE    : kind=0 (Line), 2 points (fx(0),fx(0)) & (fx(0),fx(8)),
+//                       x_max=fx(8), y_max=fx(9) -> vertical line down col 0.
+//   chart   / SCAT    : kind=1 (Scatter), 1 point (fx(0),fx(9)), y_max=fx(9)
+//                       -- same shape as M4-008's chart slot.
+//   canvas  / LINE    : canvas_clear + canvas_line((0,0)->(fx(15),fx(17)));
+//                       braille dots trace a diagonal.
+//   canvas  / CLR     : canvas_clear only. canvas_draw still stamps every
+//                       cell with the empty-braille glyph U+2800 -- the
+//                       braille glyph itself is non-zero.
+//   tinput  / SL      : mode=0 (SingleLine), buffer="X", cursor at end.
+//   tinput  / ML      : mode=1 (MultiLine), buffer="X", cursor at end.
+//   tree    / LEAF    : root = TreeNode("X", 0 children, packed_flags=0).
+//   tree    / EXP     : root = TreeNode("X", 1 child, packed_flags=(1<<63)|1),
+//                       child = TreeNode("X", 0 children, packed_flags=0).
+//   cal     / M1      : year=2026, month=1 (January), selected=0.
+//   cal     / M7      : year=2026, month=7 (July),   selected=0.
+//   clear   / S0      : style=0. word0 = 0x20 (space glyph, non-zero).
+//   clear   / S1      : style=1. word0 = 0x20 | style bits, still non-zero.
+//
+// =============================================================================
+// TILE-NON-EMPTY CHECK (wcm_tile_or_scan helper)
+// =============================================================================
+//
+// Same fixed-geometry (8-col x 9-row) OR-reduction as M4-008
+// (bwcs_tile_or_scan). Row stride = 80 * 16 = 1280 (BWCM_ROW_STRIDE).
+// Returns the OR value in rax; a zero return means every cell in the
+// tile is still zero -- the variant silently no-op'd.
+//
+// =============================================================================
+// GUARD-ROW CHECK (post-matrix invariant)
+// =============================================================================
+//
+// Rows 9, 19, 29 sit BETWEEN the three tile rows. No variant's Rect
+// intersects any guard row (every variant has y in {0, 10, 20} and
+// h=9; guard rows are {9, 19, 29}). After every variant's draw, a
+// three-segment loop walks each guard row (80 cells x 2 qwords x 3
+// rows = 480 qwords) and checks every qword is still zero. Any non-
+// zero qword short-circuits to the shared tile-or-guard sentinel.
+//
+// =============================================================================
+// FAIL SENTINELS (band 0xFFFFEDF0..0xFFFFEDFF)
+// =============================================================================
+//
+// Anchored per design/architecture.md sec.7 (Fail-code family table).
+// The M4-008 slot owns 0xFFFFEDD0..0xFFFFEDDF; M5-005 takes the next
+// 16-slot band 0xFFFFEDF0..0xFFFFEDFF (M5 matrix slot). The band
+// packs one sentinel per widget class (not per variant) plus one
+// aggregate for tile-empty/guard:
+//
+//   * 15 widget-class draw-rc sentinels: any variant of that widget
+//     that fails the rc == 0 check triggers the widget-class sentinel.
+//     A debugger walks the source to attribute variant A vs B.
+//   * 1 aggregate tile-empty/guard-violated sentinel shared across
+//     every check-site.
+//
+//   0xFFFFEDF0  WCM_ERR_BLOCK_DRAW_RC       block_draw rc != 0 (either variant)
+//   0xFFFFEDF1  WCM_ERR_PARAGRAPH_DRAW_RC   paragraph_draw rc != 0
+//   0xFFFFEDF2  WCM_ERR_LIST_DRAW_RC        list_draw rc != 0
+//   0xFFFFEDF3  WCM_ERR_TABLE_DRAW_RC       table_draw rc != 0
+//   0xFFFFEDF4  WCM_ERR_TABS_DRAW_RC        tabs_draw rc != 0
+//   0xFFFFEDF5  WCM_ERR_SCROLLBAR_DRAW_RC   scrollbar_draw rc != 0
+//   0xFFFFEDF6  WCM_ERR_GAUGE_DRAW_RC       gauge_draw rc != 0
+//   0xFFFFEDF7  WCM_ERR_SPARKLINE_DRAW_RC   sparkline_draw rc != 0
+//   0xFFFFEDF8  WCM_ERR_BARCHART_DRAW_RC    barchart_draw rc != 0
+//   0xFFFFEDF9  WCM_ERR_CHART_DRAW_RC       chart_draw rc != 0
+//   0xFFFFEDFA  WCM_ERR_CANVAS_DRAW_RC      canvas_draw / clear / line rc
+//   0xFFFFEDFB  WCM_ERR_TEXT_INPUT_DRAW_RC  text_input_draw rc != 0
+//   0xFFFFEDFC  WCM_ERR_TREE_DRAW_RC        tree_draw rc != 0
+//   0xFFFFEDFD  WCM_ERR_CALENDAR_DRAW_RC    calendar_draw rc != 0
+//   0xFFFFEDFE  WCM_ERR_CLEAR_DRAW_RC       clear_draw rc != 0
+//   0xFFFFEDFF  WCM_ERR_TILE_OR_GUARD       tile all-zero OR guard non-zero
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`WidgetCatalogMatrix`) matches
+//     the file basename `widget_catalog_matrix.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` and every
+//     small-value compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF.
+//   - Every packed rect literal (0x0009000800000000..0x0009000800140048)
+//     is > 0x7FFFFFFF -> movabs. Every fail sentinel (0xFFFFEDFx) is
+//     likewise a movabs.
+//   - Fixed64 constants used in canvas_line / chart bounds
+//     (fx(8)=0x0000000800000000, fx(9)=0x0000000900000000,
+//     fx(15)=0x0000000F00000000, fx(17)=0x0000001100000000) are all
+//     > 0x7FFFFFFF -> movabs.
+//   - LIST_SELECTED_NONE is composed via `xor rsi, rsi; sub rsi, 1`
+//     (list.pdx idiom), not via a movabs of 0xFFFFFFFFFFFFFFFF.
+//   - Tree expanded-flag packed_flags = 0x8000000000000001 loaded via
+//     movabs (imm > 0x7FFFFFFF, legal for mov).
+//   - text_input buffer_len_and_cursor packed = 0x0000000100000001
+//     (imm32-safe).
+//   - No 2-op `imul reg, imm`; no imul in this module.
+//   - No `and reg, imm64`; no `and` used at all.
+//   - Single-line pub let for every string literal.
+//   - r11 discipline: r11 is scratch inside the OR-scan and guard loops
+//     as transit for the loaded qword, never preserved across a call.
+//   - SysV alignment: `push rbx` (8 B) rounds SysV entry rsp%16==8 to 0
+//     in wcm_tile_or_scan (leaf discipline anchor) and in the main
+//     body. Every nested call (span_init, line_init, text_init,
+//     list_state_init, table_state_init, layout_length, block_spec_init,
+//     paragraph_spec_init, text_input_spec_init, fx_from_i64,
+//     canvas_clear, canvas_line, and every <w>_draw) is SysV-conformant
+//     and preserves rbx.
+//   - Cross-module bare calls resolve via paideia-as's flat ELF symbol
+//     namespace, matching M4-008 (boot_widget_catalog_smoke.pdx).
+//   - Effect row `!{mem} @{}` on widget_catalog_matrix_smoke -- writes
+//     to every fixture slab and the shared buffer transitively.
+//   - Labels prefixed `wcm_` per docs fingerprint discipline.
+
+module WidgetCatalogMatrix = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDF0..0xFFFFEDFF per architecture.md sec.7)
+  // ==========================================================================
+  pub let WCM_ERR_BLOCK_DRAW_RC      : u64 = 0xFFFFEDF0
+  pub let WCM_ERR_PARAGRAPH_DRAW_RC  : u64 = 0xFFFFEDF1
+  pub let WCM_ERR_LIST_DRAW_RC       : u64 = 0xFFFFEDF2
+  pub let WCM_ERR_TABLE_DRAW_RC      : u64 = 0xFFFFEDF3
+  pub let WCM_ERR_TABS_DRAW_RC       : u64 = 0xFFFFEDF4
+  pub let WCM_ERR_SCROLLBAR_DRAW_RC  : u64 = 0xFFFFEDF5
+  pub let WCM_ERR_GAUGE_DRAW_RC      : u64 = 0xFFFFEDF6
+  pub let WCM_ERR_SPARKLINE_DRAW_RC  : u64 = 0xFFFFEDF7
+  pub let WCM_ERR_BARCHART_DRAW_RC   : u64 = 0xFFFFEDF8
+  pub let WCM_ERR_CHART_DRAW_RC      : u64 = 0xFFFFEDF9
+  pub let WCM_ERR_CANVAS_DRAW_RC     : u64 = 0xFFFFEDFA
+  pub let WCM_ERR_TEXT_INPUT_DRAW_RC : u64 = 0xFFFFEDFB
+  pub let WCM_ERR_TREE_DRAW_RC       : u64 = 0xFFFFEDFC
+  pub let WCM_ERR_CALENDAR_DRAW_RC   : u64 = 0xFFFFEDFD
+  pub let WCM_ERR_CLEAR_DRAW_RC      : u64 = 0xFFFFEDFE
+  pub let WCM_ERR_TILE_OR_GUARD      : u64 = 0xFFFFEDFF
+
+  // ==========================================================================
+  // Fixture-shape constants (exported for downstream harness reuse).
+  // ==========================================================================
+  pub let WCM_ROWS         : u64 = 30
+  pub let WCM_COLS         : u64 = 80
+  pub let WCM_TILE_W       : u64 = 8
+  pub let WCM_TILE_H       : u64 = 9
+  pub let WCM_ROW_STRIDE   : u64 = 1280    // 80 cols * 16 B/cell
+  pub let WCM_VARIANT_COUNT: u64 = 30
+
+  // ==========================================================================
+  // Static UTF-8 byte runs. Single-line pub let per paideia-as pitfall.
+  // ==========================================================================
+  pub let _wcm_str_b : [u8; 1] = "B"
+  pub let _wcm_str_x : [u8; 1] = "X"
+
+  // ==========================================================================
+  // Shared buffer: 80 cols x 30 rows x 16 B = 38400 B = 4800 u64 slots.
+  // @align(16) so every (y*cols+x)*16 offset lands on a Cell boundary.
+  // ==========================================================================
+  pub let mut _wcm_buffer : [u64; 4800] = uninit @align(16)
+
+  // ==========================================================================
+  // Shared auxiliary data (Span "X", Line, Text) reused by every text-
+  // consuming variant. Immutable to draw paths.
+  // ==========================================================================
+  pub let mut _wcm_span_x : [u64; 3] = uninit @align(8)
+  pub let mut _wcm_line_x : [u64; 3] = uninit @align(8)
+  pub let mut _wcm_text_x : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // Per-variant spec slabs. Two per widget (30 total). Each spec's size
+  // matches its widget's WIRE section in the source module.
+  // ==========================================================================
+
+  // Slot 0/1: BLOCK (48 B = 6 u64 each)
+  pub let mut _wcm_block_a_spec : [u64; 6] = uninit @align(16)
+  pub let mut _wcm_block_b_spec : [u64; 6] = uninit @align(16)
+
+  // Slot 2/3: PARAGRAPH (48 B = 6 u64 each)
+  pub let mut _wcm_para_a_spec : [u64; 6] = uninit @align(8)
+  pub let mut _wcm_para_b_spec : [u64; 6] = uninit @align(8)
+
+  // Slot 4/5: LIST (64 B = 8 u64 each) + ListState (24 B = 3 u64) for
+  // the selected variant only.
+  pub let mut _wcm_list_a_spec  : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_list_b_spec  : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_list_b_state : [u64; 3] = uninit @align(8)
+
+  // Slot 6/7: TABLE (80 B = 10 u64 each). Header-variant needs a Line
+  // slot (24 B = 3 u64) for the header. Both share a single TableRow,
+  // Constraint, and TableState set (state.selected=0 for both).
+  pub let mut _wcm_table_a_spec        : [u64; 10] = uninit @align(8)
+  pub let mut _wcm_table_b_spec        : [u64; 10] = uninit @align(8)
+  pub let mut _wcm_table_row           : [u64; 2]  = uninit @align(8)
+  pub let mut _wcm_table_constraints   : [u64; 1]  = uninit @align(8)
+  pub let mut _wcm_table_state_a       : [u64; 3]  = uninit @align(8)
+  pub let mut _wcm_table_state_b       : [u64; 3]  = uninit @align(8)
+  pub let mut _wcm_table_header_line   : [u64; 3]  = uninit @align(8)
+
+  // Slot 8/9: TABS (56 B = 7 u64 each). 3-tabs variant needs a 3-span
+  // array (72 B = 9 u64) so the tabs_draw loop walks three distinct
+  // slots even though every span points at the same "X" bytes.
+  pub let mut _wcm_tabs_a_spec  : [u64; 7] = uninit @align(8)
+  pub let mut _wcm_tabs_b_spec  : [u64; 7] = uninit @align(8)
+  pub let mut _wcm_tabs_b_spans : [u64; 9] = uninit @align(8)
+
+  // Slot 10/11: SCROLLBAR (56 B = 7 u64 each)
+  pub let mut _wcm_scroll_a_spec : [u64; 7] = uninit @align(8)
+  pub let mut _wcm_scroll_b_spec : [u64; 7] = uninit @align(8)
+
+  // Slot 12/13: GAUGE (48 B = 6 u64 each)
+  pub let mut _wcm_gauge_a_spec : [u64; 6] = uninit @align(8)
+  pub let mut _wcm_gauge_b_spec : [u64; 6] = uninit @align(8)
+
+  // Slot 14/15: SPARKLINE (40 B = 5 u64 each) + values (1 u64) for the
+  // non-empty variant only. Empty variant's values_ptr is 0.
+  pub let mut _wcm_spark_a_spec   : [u64; 5] = uninit @align(8)
+  pub let mut _wcm_spark_b_spec   : [u64; 5] = uninit @align(8)
+  pub let mut _wcm_spark_a_values : [u64; 1] = uninit @align(8)
+
+  // Slot 16/17: BARCHART (64 B = 8 u64 each) + bars (1 u64 for 1-bar,
+  // 5 u64 for 5-bar variant).
+  pub let mut _wcm_bar_a_spec : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_bar_b_spec : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_bar_a_bars : [u64; 1] = uninit @align(8)
+  pub let mut _wcm_bar_b_bars : [u64; 5] = uninit @align(8)
+
+  // Slot 18/19: CHART (72 B = 9 u64 each) + dataset (32 B = 4 u64) +
+  // points (2 u64 per point). Line variant has 2 points, Scatter has 1.
+  pub let mut _wcm_chart_a_spec    : [u64; 9] = uninit @align(8)
+  pub let mut _wcm_chart_b_spec    : [u64; 9] = uninit @align(8)
+  pub let mut _wcm_chart_a_dataset : [u64; 4] = uninit @align(8)
+  pub let mut _wcm_chart_b_dataset : [u64; 4] = uninit @align(8)
+  pub let mut _wcm_chart_a_points  : [u64; 4] = uninit @align(8)
+  pub let mut _wcm_chart_b_points  : [u64; 2] = uninit @align(8)
+
+  // Slot 20/21: CANVAS (64 B = 8 u64 each) + bitmap (bw*bh = 72 B = 9
+  // u64 each). Both variants call canvas_clear + canvas_draw; the LINE
+  // variant additionally calls canvas_line before canvas_draw.
+  pub let mut _wcm_canvas_a_spec   : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_canvas_b_spec   : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_canvas_a_bitmap : [u64; 9] = uninit @align(8)
+  pub let mut _wcm_canvas_b_bitmap : [u64; 9] = uninit @align(8)
+
+  // Slot 22/23: TEXT_INPUT (72 B = 9 u64 each) + buffer (2 u64) each.
+  pub let mut _wcm_ti_a_spec   : [u64; 9] = uninit @align(8)
+  pub let mut _wcm_ti_b_spec   : [u64; 9] = uninit @align(8)
+  pub let mut _wcm_ti_a_buffer : [u64; 2] = uninit @align(8)
+  pub let mut _wcm_ti_b_buffer : [u64; 2] = uninit @align(8)
+
+  // Slot 24/25: TREE (64 B = 8 u64 each) + TreeNode (32 B = 4 u64).
+  // Leaf variant has 1 root node with 0 children. Expanded variant has
+  // 1 root with children_ptr -> 1-element child array, expanded flag set.
+  pub let mut _wcm_tree_a_spec  : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_tree_b_spec  : [u64; 8] = uninit @align(8)
+  pub let mut _wcm_tree_a_root  : [u64; 4] = uninit @align(8)
+  pub let mut _wcm_tree_b_root  : [u64; 4] = uninit @align(8)
+  pub let mut _wcm_tree_b_child : [u64; 4] = uninit @align(8)
+
+  // Slot 26/27: CALENDAR (48 B = 6 u64 each)
+  pub let mut _wcm_cal_a_spec : [u64; 6] = uninit @align(8)
+  pub let mut _wcm_cal_b_spec : [u64; 6] = uninit @align(8)
+
+  // Slot 28/29: CLEAR (16 B = 2 u64 each)
+  pub let mut _wcm_clear_a_spec : [u64; 2] = uninit @align(8)
+  pub let mut _wcm_clear_b_spec : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // wcm_tile_or_scan(base_ptr) -> u64
+  //
+  // Fixed-geometry OR-reduction over an 8-col x 9-row Cell tile (144
+  // qwords). Row stride = 80 cols * 16 B = 1280 B (WCM_ROW_STRIDE).
+  // Returns the OR of every qword in the tile; a zero return means
+  // every cell in the tile is zero.
+  //
+  // Register plan: leaf, no nested calls. Push rbx (SysV callee-save;
+  // rbx tracks the per-row base). rax = OR accumulator; r8 = column
+  // qword load transit; r9 = row counter; r10 = per-row col cursor;
+  // rcx = inner cell counter.
+  //
+  // Labels prefixed wcm_ts_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let wcm_tile_or_scan : (u64) -> u64 !{mem} @{} =
+    fn (base_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M5-005 (postui#39): wcm_tile_or_scan reduces a fixed-geometry 8-col x 9-row Cell tile (144 qwords) via straight OR into rax. Register plan: leaf, push rbx (SysV callee-save; rbx tracks the per-row base). Outer y-loop counts 9 rows in r9, inner x-loop counts 8 cells in rcx and touches both qwords per cell via base+displacement addressing (mov r8, [r10+0]; or rax, r8; mov r8, [r10+8]; or rax, r8; add r10, 16). After each row, add rbx, 1280 (WCM_ROW_STRIDE = 80*16, imm32-safe) and re-seed r10 = rbx. Return rax. Every immediate (0, 8, 16, 1280, 8, 9) fits imm32; no test, no imul, no and reg,imm64. Effect !{mem} (144 qword loads).",
+      block: {
+        push rbx;
+        mov rbx, rdi;                       // row-base cursor
+        xor rax, rax;                       // OR accumulator
+        mov r9, 9;                          // row counter
+      wcm_ts_row_loop:
+        cmp r9, 0;
+        je  wcm_ts_done;
+        mov r10, rbx;                       // per-row col cursor
+        mov rcx, 8;                         // cells per row
+      wcm_ts_col_loop:
+        cmp rcx, 0;
+        je  wcm_ts_row_next;
+        mov r8, [r10 + 0];
+        or  rax, r8;
+        mov r8, [r10 + 8];
+        or  rax, r8;
+        add r10, 16;
+        sub rcx, 1;
+        jmp wcm_ts_col_loop;
+      wcm_ts_row_next:
+        add rbx, 1280;                      // WCM_ROW_STRIDE
+        sub r9, 1;
+        jmp wcm_ts_row_loop;
+      wcm_ts_done:
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // widget_catalog_matrix_smoke() -> u64
+  //
+  // Runs the 30-variant matrix end-to-end. Phase shape:
+  //
+  //   Phase 0:  zero the 4800-qword shared buffer.
+  //   Phase 0b: zero every shared aux slab (span, line, text) plus every
+  //             slab that partial-writes single bytes (text_input
+  //             buffers, canvas bitmaps).
+  //   Phase 1:  build shared aux data (Span "X", Line, Text).
+  //   Phase 2:  slot 0 -- block with border PLAIN.
+  //   Phase 3:  slot 1 -- block without border (title stamps).
+  //   Phase 4:  slot 2 -- paragraph wrap=NONE.
+  //   Phase 5:  slot 3 -- paragraph wrap=WORD.
+  //   Phase 6:  slot 4 -- list state=NULL.
+  //   Phase 7:  slot 5 -- list state.selected=0.
+  //   Phase 8:  slot 6 -- table with header.
+  //   Phase 9:  slot 7 -- table without header.
+  //   Phase 10: slot 8 -- tabs 1-tab.
+  //   Phase 11: slot 9 -- tabs 3-tab mid-selected.
+  //   Phase 12: slot 10 -- scrollbar Vertical.
+  //   Phase 13: slot 11 -- scrollbar Horizontal.
+  //   Phase 14: slot 12 -- gauge Bar.
+  //   Phase 15: slot 13 -- gauge Line.
+  //   Phase 16: slot 14 -- sparkline with 1 value.
+  //   Phase 17: slot 15 -- sparkline value_count=0.
+  //   Phase 18: slot 16 -- barchart 1 bar.
+  //   Phase 19: slot 17 -- barchart 5 bars.
+  //   Phase 20: slot 18 -- chart Line (2 points).
+  //   Phase 21: slot 19 -- chart Scatter (1 point).
+  //   Phase 22: slot 20 -- canvas with drawn line.
+  //   Phase 23: slot 21 -- canvas cleared only.
+  //   Phase 24: slot 22 -- text_input SingleLine.
+  //   Phase 25: slot 23 -- text_input MultiLine.
+  //   Phase 26: slot 24 -- tree leaf-only.
+  //   Phase 27: slot 25 -- tree expanded.
+  //   Phase 28: slot 26 -- calendar month=1.
+  //   Phase 29: slot 27 -- calendar month=7.
+  //   Phase 30: slot 28 -- clear style=0.
+  //   Phase 31: slot 29 -- clear style=1.
+  //   Phase 32: guard-row check (rows 9, 19, 29).
+  //
+  // Returns 0 on ALL passes. First failure short-circuits with the
+  // widget-class sentinel; the smoke harness attributes variant A vs B
+  // via the source location.
+  //
+  // Labels prefixed wcm_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let widget_catalog_matrix_smoke : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M5-005 (postui#39): widget_catalog_matrix_smoke drives all 30 (widget, variant) draw invocations against an 80x30 shared buffer laid out as 10x3 tiles (each 8x9 cells) with row-9/19/29 guard rows between tile rows. Same shape as M4-008 (boot_widget_catalog_smoke.pdx) scaled to a 2-variant-per-widget matrix. 1-push (rbx) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for every nested call. Phase 0 zeros the shared buffer (4800 qwords) then zeros every fixture aux slab that is either shared across variants (span/line/text) or partial-written with mov_b (text_input buffers, canvas bitmaps); per-variant spec slabs are direct-store-overwritten in their setup phases and need no pre-zero. Phase 1 seeds shared aux: span_init(&_wcm_span_x, &_wcm_str_x, 1, 0); line_init(&_wcm_line_x, &_wcm_span_x, 1, 0); text_init(&_wcm_text_x, &_wcm_line_x, 1). Phases 2..31 walk each variant: setup spec (via spec_init helper OR direct-store), call widget_draw, check rc == 0 with jne to per-widget-class fail arm, then call wcm_tile_or_scan at the variant's tile byte offset and check the OR-accumulator is non-zero (je wcm_fail_tile_or_guard). Every packed rect literal (0x00090008xxxxxxxx) and every fail sentinel (0xFFFFEDFx) is > 0x7FFFFFFF -> movabs (10-byte mov reg, imm64), legal for mov. All variant-specific state (border_kind, wrap_mode, header_ptr, selected, orientation, kind, value_count, bar_count, mode, packed_flags, month, style) is stored via direct-store or spec_init. tabs 3-tab variant walks 3 spans that all point at the shared _wcm_str_x byte via a 3-slot span array _wcm_tabs_b_spans; each Span is span_init-composed inline via direct-store (ptr, byte_len, style). chart Line variant plots 2 points (fx(0), fx(0)) and (fx(0), fx(8)) with x_max=fx(8), y_max=fx(9) so the Bresenham path stamps a vertical column-0 line. chart Scatter variant plots 1 point at (fx(0), fx(0)) with x_max=fx(8), y_max=fx(9) -- inherits M4-008's scatter shape. canvas LINE variant runs canvas_clear + canvas_line((fx(0), fx(0)) -> (fx(15), fx(17))) + canvas_draw; canvas CLR variant runs canvas_clear + canvas_draw only (canvas_draw stamps every cell with the empty-braille glyph U+2800 = 0x0080A0E2, non-zero). text_input SingleLine and MultiLine each pre-stamp 'X' via mov_b at buffer[0] then compose the spec via text_input_spec_init(rect, buffer_ptr, cap=16, buffer_len_and_cursor=0x0000000100000001 (imm32-safe), scroll_and_mode = 0 for SL, 1 for ML via mov). tree leaf variant direct-stores a single TreeNode(label='X', label_len=1, children_ptr=0, packed_flags=0); tree expanded variant direct-stores a root TreeNode(label='X', label_len=1, children_ptr=&_wcm_tree_b_child, packed_flags=0x8000000000000001 via movabs -- bit 63 = expanded, child_count = 1) and a child TreeNode(label='X', label_len=1, children_ptr=0, packed_flags=0). calendar variants differ only in month field (1 vs 7). clear variants differ only in style field (0 vs 1). Phase 32 guard-row check: three separate segments at byte offsets 11520 (row 9), 24320 (row 19), 37120 (row 29). Each segment: lea rbx, [_wcm_buffer]; add rbx, offset; mov rcx, 160 (80 cells x 2 qwords); loop mov rax, [rbx+0]; cmp rax, 0; jne wcm_fail_tile_or_guard; add rbx, 8; sub rcx, 1; jmp. Success: xor rax, rax; pop rbx; ret. Each fail arm: mov rax, 0xFFFFEDFx via movabs (imm > 0x7FFFFFFF; legal for mov); pop rbx; ret. Every immediate that reaches cmp (0, 1, 2, 3, 4, 5, 7, 8, 10, 16, 30, 40, 50, 80, 100, 160, 2026, 4800 -- plus every byte offset 128, 256, ..., 26752, 11520, 24320, 37120) fits imm32; every immediate in shift/add contexts fits imm32 similarly. Every large constant (packed rects, Fixed64 constants, buffer_len_and_cursor 0x0000000100000001, tree packed_flags 0x8000000000000001, fail sentinels 0xFFFFEDFx) is loaded via mov reg, imm64 (movabs, legal for mov). No test, no imul, no and, no cmp reg, imm > 0x7FFFFFFF, no cmp reg, [mem]. Every callee resolves via paideia-as's flat ELF symbol namespace. Effect !{mem} covers every fixture store and buffer readback. Labels prefixed wcm_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+
+        // ==================================================================
+        // Phase 0: zero the shared buffer (4800 qwords).
+        // ==================================================================
+        xor rax, rax;
+        lea rbx, [rip + _wcm_buffer];
+        mov rcx, 4800;
+      wcm_zbuf_loop:
+        cmp rcx, 0;
+        je  wcm_zbuf_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_zbuf_loop;
+      wcm_zbuf_done:
+
+        // ==================================================================
+        // Phase 0b: zero every aux slab that is either shared across
+        // variants (span/line/text) or partial-written with mov_b
+        // (text_input buffers, canvas bitmaps).
+        // ==================================================================
+        xor rax, rax;
+        lea rbx, [rip + _wcm_span_x];
+        mov rcx, 3;
+      wcm_zspan_loop:
+        cmp rcx, 0;
+        je  wcm_zspan_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_zspan_loop;
+      wcm_zspan_done:
+
+        lea rbx, [rip + _wcm_line_x];
+        mov rcx, 3;
+      wcm_zline_loop:
+        cmp rcx, 0;
+        je  wcm_zline_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_zline_loop;
+      wcm_zline_done:
+
+        lea rbx, [rip + _wcm_text_x];
+        mov rcx, 2;
+      wcm_ztext_loop:
+        cmp rcx, 0;
+        je  wcm_ztext_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_ztext_loop;
+      wcm_ztext_done:
+
+        lea rbx, [rip + _wcm_ti_a_buffer];
+        mov rcx, 2;
+      wcm_ztiabuf_loop:
+        cmp rcx, 0;
+        je  wcm_ztiabuf_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_ztiabuf_loop;
+      wcm_ztiabuf_done:
+
+        lea rbx, [rip + _wcm_ti_b_buffer];
+        mov rcx, 2;
+      wcm_ztibbuf_loop:
+        cmp rcx, 0;
+        je  wcm_ztibbuf_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_ztibbuf_loop;
+      wcm_ztibbuf_done:
+
+        lea rbx, [rip + _wcm_canvas_a_bitmap];
+        mov rcx, 9;
+      wcm_zcvsa_loop:
+        cmp rcx, 0;
+        je  wcm_zcvsa_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_zcvsa_loop;
+      wcm_zcvsa_done:
+
+        lea rbx, [rip + _wcm_canvas_b_bitmap];
+        mov rcx, 9;
+      wcm_zcvsb_loop:
+        cmp rcx, 0;
+        je  wcm_zcvsb_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_zcvsb_loop;
+      wcm_zcvsb_done:
+
+        // ==================================================================
+        // Phase 1: build shared aux (Span "X", Line, Text).
+        // ==================================================================
+        lea rdi, [rip + _wcm_span_x];
+        lea rsi, [rip + _wcm_str_x];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call span_init;
+
+        lea rdi, [rip + _wcm_line_x];
+        lea rsi, [rip + _wcm_span_x];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        lea rdi, [rip + _wcm_text_x];
+        lea rsi, [rip + _wcm_line_x];
+        mov rdx, 1;
+        call text_init;
+
+        // ==================================================================
+        // Phase 2: slot 0 -- BLOCK / border PLAIN at (0, 0, 8, 9).
+        // block_spec_init(dst, rect, kind_and_pad, title_ptr, title_len)
+        //   kind_and_pad = 1 (border PLAIN, all pads 0)
+        // ==================================================================
+        lea rdi, [rip + _wcm_block_a_spec];
+        mov rsi, 0x0009000800000000;
+        mov rdx, 1;
+        lea rcx, [rip + _wcm_str_b];
+        mov r8, 1;
+        call block_spec_init;
+
+        lea rdi, [rip + _wcm_block_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call block_draw;
+        cmp rax, 0;
+        jne wcm_fail_block_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 3: slot 1 -- BLOCK / no border at (8, 0, 8, 9).
+        // kind_and_pad = 0 (border NONE, all pads 0). Title "X" (len=1)
+        // stamps at (bx, by) since title_x_offset = r15!=0 ? 1 : 0 = 0
+        // when border_kind is 0 (block.pdx Phase 3).
+        // ==================================================================
+        lea rdi, [rip + _wcm_block_b_spec];
+        mov rsi, 0x0009000800000008;
+        xor rdx, rdx;                       // kind_and_pad = 0 (NONE)
+        lea rcx, [rip + _wcm_str_x];
+        mov r8, 1;
+        call block_spec_init;
+
+        lea rdi, [rip + _wcm_block_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call block_draw;
+        cmp rax, 0;
+        jne wcm_fail_block_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 128;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 4: slot 2 -- PARAGRAPH / wrap NONE at (16, 0, 8, 9).
+        // paragraph_spec_init(dst, rect, text_ptr, scroll, wrap_and_align, style)
+        //   wrap_and_align = 0 -> wrap=PARA_WRAP_NONE, align=PARA_ALIGN_LEFT
+        // ==================================================================
+        lea rdi, [rip + _wcm_para_a_spec];
+        mov rsi, 0x0009000800000010;
+        lea rdx, [rip + _wcm_text_x];
+        xor rcx, rcx;
+        xor r8, r8;                         // wrap_and_align = 0 (NONE + Left)
+        xor r9, r9;
+        call paragraph_spec_init;
+
+        lea rdi, [rip + _wcm_para_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call paragraph_draw;
+        cmp rax, 0;
+        jne wcm_fail_paragraph_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 256;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 5: slot 3 -- PARAGRAPH / wrap WORD at (24, 0, 8, 9).
+        //   wrap_and_align = 1 -> wrap=PARA_WRAP_WORD, align=PARA_ALIGN_LEFT
+        // ==================================================================
+        lea rdi, [rip + _wcm_para_b_spec];
+        mov rsi, 0x0009000800000018;
+        lea rdx, [rip + _wcm_text_x];
+        xor rcx, rcx;
+        mov r8, 1;                          // wrap=WORD (low 32), align=Left (high 32)
+        xor r9, r9;
+        call paragraph_spec_init;
+
+        lea rdi, [rip + _wcm_para_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call paragraph_draw;
+        cmp rax, 0;
+        jne wcm_fail_paragraph_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 384;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 6: slot 4 -- LIST / state=NULL at (32, 0, 8, 9).
+        // Direct-store ListSpec (64 B). state_ptr=0 -> decodes as
+        // LIST_SELECTED_NONE + offset=0.
+        // ==================================================================
+        lea rbx, [rip + _wcm_list_a_spec];
+        mov rax, 0x0009000800000020;
+        mov [rbx + 0], rax;
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // _reserved_a
+        lea rax, [rip + _wcm_line_x];
+        mov [rbx + 16], rax;                // items_ptr
+        mov rax, 1;
+        mov [rbx + 24], rax;                // item_count
+        xor rax, rax;
+        mov [rbx + 32], rax;                // state_ptr = 0
+        mov [rbx + 40], rax;                // highlight_style
+        mov [rbx + 48], rax;                // default_style
+        mov [rbx + 56], rax;                // _reserved_b
+
+        lea rdi, [rip + _wcm_list_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call list_draw;
+        cmp rax, 0;
+        jne wcm_fail_list_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 512;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 7: slot 5 -- LIST / state.selected=0 at (40, 0, 8, 9).
+        // Compose ListState via list_state_init(state_ptr, selected=0,
+        // offset=0), then direct-store ListSpec with state_ptr set.
+        // ==================================================================
+        lea rdi, [rip + _wcm_list_b_state];
+        xor rsi, rsi;                       // selected = 0
+        xor rdx, rdx;                       // offset = 0
+        call list_state_init;
+
+        lea rbx, [rip + _wcm_list_b_spec];
+        mov rax, 0x0009000800000028;
+        mov [rbx + 0], rax;
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // _reserved_a
+        lea rax, [rip + _wcm_line_x];
+        mov [rbx + 16], rax;                // items_ptr
+        mov rax, 1;
+        mov [rbx + 24], rax;                // item_count
+        lea rax, [rip + _wcm_list_b_state];
+        mov [rbx + 32], rax;                // state_ptr
+        xor rax, rax;
+        mov [rbx + 40], rax;                // highlight_style
+        mov [rbx + 48], rax;                // default_style
+        mov [rbx + 56], rax;                // _reserved_b
+
+        lea rdi, [rip + _wcm_list_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call list_draw;
+        cmp rax, 0;
+        jne wcm_fail_list_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 640;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 8: slot 6 -- TABLE / header_ptr!=0 at (48, 0, 8, 9).
+        // Shared TableRow + Constraint + TableState (state.selected=0).
+        // Header Line points at the shared span array.
+        // ==================================================================
+        // TableRow: cells_ptr, cell_count=1 (shared across both table variants).
+        lea rbx, [rip + _wcm_table_row];
+        lea rax, [rip + _wcm_span_x];
+        mov [rbx + 0], rax;                 // cells_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // cell_count
+
+        // Constraint: layout_length(4) (shared).
+        mov rdi, 4;
+        call layout_length;
+        lea rbx, [rip + _wcm_table_constraints];
+        mov [rbx + 0], rax;
+
+        // Table header Line: spans_ptr -> _wcm_span_x, span_count=1, alignment=0.
+        lea rdi, [rip + _wcm_table_header_line];
+        lea rsi, [rip + _wcm_span_x];
+        mov rdx, 1;
+        xor rcx, rcx;
+        call line_init;
+
+        // TableState for A variant: selected=0, offset=0.
+        lea rdi, [rip + _wcm_table_state_a];
+        xor rsi, rsi;
+        xor rdx, rdx;
+        call table_state_init;
+
+        // TableSpec direct-store (80 B, 10 slots).
+        lea rbx, [rip + _wcm_table_a_spec];
+        mov rax, 0x0009000800000030;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_table_row];
+        mov [rbx + 8], rax;                 // rows_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // row_count
+        lea rax, [rip + _wcm_table_constraints];
+        mov [rbx + 24], rax;                // constraints_ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // column_count
+        lea rax, [rip + _wcm_table_header_line];
+        mov [rbx + 40], rax;                // header_ptr (NON-NULL)
+        lea rax, [rip + _wcm_table_state_a];
+        mov [rbx + 48], rax;                // state_ptr
+        xor rax, rax;
+        mov [rbx + 56], rax;                // highlight_style
+        mov [rbx + 64], rax;                // default_style
+        mov [rbx + 72], rax;                // reserved
+
+        lea rdi, [rip + _wcm_table_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call table_draw;
+        cmp rax, 0;
+        jne wcm_fail_table_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 768;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 9: slot 7 -- TABLE / header_ptr==0 at (56, 0, 8, 9).
+        // TableState B: selected=0, offset=0. Shares row + constraints.
+        // ==================================================================
+        lea rdi, [rip + _wcm_table_state_b];
+        xor rsi, rsi;
+        xor rdx, rdx;
+        call table_state_init;
+
+        lea rbx, [rip + _wcm_table_b_spec];
+        mov rax, 0x0009000800000038;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_table_row];
+        mov [rbx + 8], rax;                 // rows_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // row_count
+        lea rax, [rip + _wcm_table_constraints];
+        mov [rbx + 24], rax;                // constraints_ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // column_count
+        xor rax, rax;
+        mov [rbx + 40], rax;                // header_ptr = 0 (NO HEADER)
+        lea rax, [rip + _wcm_table_state_b];
+        mov [rbx + 48], rax;                // state_ptr
+        xor rax, rax;
+        mov [rbx + 56], rax;                // highlight_style
+        mov [rbx + 64], rax;                // default_style
+        mov [rbx + 72], rax;                // reserved
+
+        lea rdi, [rip + _wcm_table_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call table_draw;
+        cmp rax, 0;
+        jne wcm_fail_table_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 896;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 10: slot 8 -- TABS / 1-tab sel=0 at (64, 0, 8, 9).
+        // Direct-store TabsSpec (56 B, 7 slots) with the shared _wcm_span_x
+        // as its single-tab titles array.
+        // ==================================================================
+        lea rbx, [rip + _wcm_tabs_a_spec];
+        mov rax, 0x0009000800000040;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_span_x];
+        mov [rbx + 8], rax;                 // titles_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // tab_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // selected = 0 (first)
+        mov [rbx + 32], rax;                // divider (0 = default)
+        mov [rbx + 40], rax;                // style_active
+        mov [rbx + 48], rax;                // style_inactive
+
+        lea rdi, [rip + _wcm_tabs_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call tabs_draw;
+        cmp rax, 0;
+        jne wcm_fail_tabs_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 1024;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 11: slot 9 -- TABS / 3-tab sel=1 at (72, 0, 8, 9).
+        // Build 3 Span slots (72 B), each pointing at _wcm_str_x, then
+        // direct-store TabsSpec with selected=1 (mid-selected).
+        // ==================================================================
+        // _wcm_tabs_b_spans[0..3] direct-store (each Span 24 B).
+        lea rbx, [rip + _wcm_tabs_b_spans];
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 0], rax;                 // spans[0].ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // spans[0].byte_len
+        xor rax, rax;
+        mov [rbx + 16], rax;                // spans[0].style
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 24], rax;                // spans[1].ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // spans[1].byte_len
+        xor rax, rax;
+        mov [rbx + 40], rax;                // spans[1].style
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 48], rax;                // spans[2].ptr
+        mov rax, 1;
+        mov [rbx + 56], rax;                // spans[2].byte_len
+        xor rax, rax;
+        mov [rbx + 64], rax;                // spans[2].style
+
+        lea rbx, [rip + _wcm_tabs_b_spec];
+        mov rax, 0x0009000800000048;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_tabs_b_spans];
+        mov [rbx + 8], rax;                 // titles_ptr
+        mov rax, 3;
+        mov [rbx + 16], rax;                // tab_count = 3
+        mov rax, 1;
+        mov [rbx + 24], rax;                // selected = 1 (mid)
+        xor rax, rax;
+        mov [rbx + 32], rax;                // divider
+        mov [rbx + 40], rax;                // style_active
+        mov [rbx + 48], rax;                // style_inactive
+
+        lea rdi, [rip + _wcm_tabs_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call tabs_draw;
+        cmp rax, 0;
+        jne wcm_fail_tabs_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 1152;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 12: slot 10 -- SCROLLBAR / Vertical at (0, 10, 8, 9).
+        // Direct-store ScrollbarSpec (56 B, 7 slots).
+        // ==================================================================
+        lea rbx, [rip + _wcm_scroll_a_spec];
+        mov rax, 0x00090008000A0000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // orientation = 0 (V)
+        mov rax, 2;
+        mov [rbx + 16], rax;                // position = 2
+        mov rax, 10;
+        mov [rbx + 24], rax;                // content_length = 10
+        mov rax, 5;
+        mov [rbx + 32], rax;                // viewport_length = 5
+        mov rax, 1;
+        mov [rbx + 40], rax;                // style_track = 1
+        mov rax, 2;
+        mov [rbx + 48], rax;                // style_thumb = 2
+
+        lea rdi, [rip + _wcm_scroll_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call scrollbar_draw;
+        cmp rax, 0;
+        jne wcm_fail_scrollbar_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 12800;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 13: slot 11 -- SCROLLBAR / Horizontal at (8, 10, 8, 9).
+        // ==================================================================
+        lea rbx, [rip + _wcm_scroll_b_spec];
+        mov rax, 0x00090008000A0008;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // orientation = 1 (H)
+        mov rax, 2;
+        mov [rbx + 16], rax;                // position = 2
+        mov rax, 10;
+        mov [rbx + 24], rax;                // content_length = 10
+        mov rax, 5;
+        mov [rbx + 32], rax;                // viewport_length = 5
+        mov rax, 1;
+        mov [rbx + 40], rax;                // style_track = 1
+        mov rax, 2;
+        mov [rbx + 48], rax;                // style_thumb = 2
+
+        lea rdi, [rip + _wcm_scroll_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call scrollbar_draw;
+        cmp rax, 0;
+        jne wcm_fail_scrollbar_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 12928;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 14: slot 12 -- GAUGE / Bar at (16, 10, 8, 9).
+        // Direct-store GaugeSpec (48 B, 6 slots).
+        // ==================================================================
+        lea rbx, [rip + _wcm_gauge_a_spec];
+        mov rax, 0x00090008000A0010;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 50;
+        mov [rbx + 8], rax;                 // value = 50
+        mov rax, 100;
+        mov [rbx + 16], rax;                // max = 100
+        xor rax, rax;
+        mov [rbx + 24], rax;                // kind = 0 (Bar)
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_filled
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_empty
+
+        lea rdi, [rip + _wcm_gauge_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call gauge_draw;
+        cmp rax, 0;
+        jne wcm_fail_gauge_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13056;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 15: slot 13 -- GAUGE / Line at (24, 10, 8, 9).
+        // ==================================================================
+        lea rbx, [rip + _wcm_gauge_b_spec];
+        mov rax, 0x00090008000A0018;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 50;
+        mov [rbx + 8], rax;                 // value = 50
+        mov rax, 100;
+        mov [rbx + 16], rax;                // max = 100
+        mov rax, 1;
+        mov [rbx + 24], rax;                // kind = 1 (Line)
+        mov [rbx + 32], rax;                // style_filled
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_empty
+
+        lea rdi, [rip + _wcm_gauge_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call gauge_draw;
+        cmp rax, 0;
+        jne wcm_fail_gauge_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13184;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 16: slot 14 -- SPARKLINE / 1 value at (32, 10, 8, 9).
+        // 1 value=7 with max_override=7 -> column 0 fills full height.
+        // ==================================================================
+        lea rbx, [rip + _wcm_spark_a_values];
+        mov rax, 7;
+        mov [rbx + 0], rax;                 // values[0] = 7
+
+        lea rbx, [rip + _wcm_spark_a_spec];
+        mov rax, 0x00090008000A0020;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_spark_a_values];
+        mov [rbx + 8], rax;                 // values_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // value_count = 1
+        mov rax, 7;
+        mov [rbx + 24], rax;                // max_override = 7
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style = 1
+
+        lea rdi, [rip + _wcm_spark_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call sparkline_draw;
+        cmp rax, 0;
+        jne wcm_fail_sparkline_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13312;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 17: slot 15 -- SPARKLINE / value_count=0 at (40, 10, 8, 9).
+        // value_count=0 hits the empty-input fast path; sparkline.pdx
+        // Phase 1 still fills the entire Rect with space glyph (0x20)
+        // styled with style_track, which yields non-zero cells.
+        // ==================================================================
+        lea rbx, [rip + _wcm_spark_b_spec];
+        mov rax, 0x00090008000A0028;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // values_ptr = 0
+        mov [rbx + 16], rax;                // value_count = 0
+        mov [rbx + 24], rax;                // max_override = 0
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style = 1 (keeps cells non-zero on fill)
+
+        lea rdi, [rip + _wcm_spark_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call sparkline_draw;
+        cmp rax, 0;
+        jne wcm_fail_sparkline_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13440;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 18: slot 16 -- BARCHART / 1 bar at (48, 10, 8, 9).
+        // ==================================================================
+        lea rbx, [rip + _wcm_bar_a_bars];
+        mov rax, 7;
+        mov [rbx + 0], rax;                 // bars[0] = 7
+
+        lea rbx, [rip + _wcm_bar_a_spec];
+        mov rax, 0x00090008000A0030;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_bar_a_bars];
+        mov [rbx + 8], rax;                 // bars_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // bar_count = 1
+        mov [rbx + 24], rax;                // bar_width = 1
+        xor rax, rax;
+        mov [rbx + 32], rax;                // gap = 0
+        mov rax, 7;
+        mov [rbx + 40], rax;                // max_override = 7
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style_bar = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // style_bg = 0
+
+        lea rdi, [rip + _wcm_bar_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call barchart_draw;
+        cmp rax, 0;
+        jne wcm_fail_barchart_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13568;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 19: slot 17 -- BARCHART / 5 bars at (56, 10, 8, 9).
+        // ==================================================================
+        lea rbx, [rip + _wcm_bar_b_bars];
+        mov rax, 7;
+        mov [rbx + 0], rax;                 // bars[0] = 7
+        mov rax, 3;
+        mov [rbx + 8], rax;                 // bars[1] = 3
+        mov rax, 5;
+        mov [rbx + 16], rax;                // bars[2] = 5
+        mov rax, 2;
+        mov [rbx + 24], rax;                // bars[3] = 2
+        mov rax, 6;
+        mov [rbx + 32], rax;                // bars[4] = 6
+
+        lea rbx, [rip + _wcm_bar_b_spec];
+        mov rax, 0x00090008000A0038;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_bar_b_bars];
+        mov [rbx + 8], rax;                 // bars_ptr
+        mov rax, 5;
+        mov [rbx + 16], rax;                // bar_count = 5
+        mov rax, 1;
+        mov [rbx + 24], rax;                // bar_width = 1
+        xor rax, rax;
+        mov [rbx + 32], rax;                // gap = 0
+        mov rax, 7;
+        mov [rbx + 40], rax;                // max_override = 7
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style_bar = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // style_bg = 0
+
+        lea rdi, [rip + _wcm_bar_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call barchart_draw;
+        cmp rax, 0;
+        jne wcm_fail_barchart_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13696;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 20: slot 18 -- CHART / Line (2 pts) at (64, 10, 8, 9).
+        // 2 points (fx(0), fx(0)) and (fx(0), fx(8)) with x_max=fx(8),
+        // y_max=fx(9). Both points map to column 0; Bresenham stamps a
+        // vertical line across the tile column.
+        // ==================================================================
+        mov rdi, 0;
+        call fx_from_i64;
+        lea rbx, [rip + _wcm_chart_a_points];
+        mov [rbx + 0], rax;                 // points[0].x_fx = fx(0)
+        mov [rbx + 8], rax;                 // points[0].y_fx = fx(0)
+        mov [rbx + 16], rax;                // points[1].x_fx = fx(0)
+        mov rdi, 8;
+        call fx_from_i64;
+        lea rbx, [rip + _wcm_chart_a_points];
+        mov [rbx + 24], rax;                // points[1].y_fx = fx(8)
+
+        // Dataset direct-store (32 B, 4 slots).
+        lea rbx, [rip + _wcm_chart_a_dataset];
+        lea rax, [rip + _wcm_chart_a_points];
+        mov [rbx + 0], rax;                 // points_ptr
+        mov rax, 2;
+        mov [rbx + 8], rax;                 // point_count = 2
+        xor rax, rax;
+        mov [rbx + 16], rax;                // kind = 0 (Line)
+        mov [rbx + 24], rax;                // marker = 0 (default)
+
+        // ChartSpec direct-store (72 B, 9 slots).
+        lea rbx, [rip + _wcm_chart_a_spec];
+        mov rax, 0x00090008000A0040;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_chart_a_dataset];
+        mov [rbx + 8], rax;                 // datasets_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // dataset_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // x_min = fx(0)
+        mov rax, 0x0000000800000000;
+        mov [rbx + 32], rax;                // x_max = fx(8) (movabs)
+        xor rax, rax;
+        mov [rbx + 40], rax;                // y_min = fx(0)
+        mov rax, 0x0000000900000000;
+        mov [rbx + 48], rax;                // y_max = fx(9) (movabs)
+        mov rax, 1;
+        mov [rbx + 56], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 64], rax;                // style_axis (reserved)
+
+        lea rdi, [rip + _wcm_chart_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call chart_draw;
+        cmp rax, 0;
+        jne wcm_fail_chart_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13824;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 21: slot 19 -- CHART / Scatter (1 pt) at (72, 10, 8, 9).
+        // 1 point (fx(0), fx(0)) with x_max=fx(8), y_max=fx(9) -- inherits
+        // M4-008's scatter shape; marker glyph stamps at bottom-left cell.
+        // ==================================================================
+        mov rdi, 0;
+        call fx_from_i64;
+        lea rbx, [rip + _wcm_chart_b_points];
+        mov [rbx + 0], rax;                 // points[0].x_fx = fx(0)
+        mov [rbx + 8], rax;                 // points[0].y_fx = fx(0)
+
+        // Dataset direct-store.
+        lea rbx, [rip + _wcm_chart_b_dataset];
+        lea rax, [rip + _wcm_chart_b_points];
+        mov [rbx + 0], rax;                 // points_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // point_count = 1
+        mov [rbx + 16], rax;                // kind = 1 (Scatter)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // marker = 0 (default)
+
+        lea rbx, [rip + _wcm_chart_b_spec];
+        mov rax, 0x00090008000A0048;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_chart_b_dataset];
+        mov [rbx + 8], rax;                 // datasets_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // dataset_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // x_min = fx(0)
+        mov rax, 0x0000000800000000;
+        mov [rbx + 32], rax;                // x_max = fx(8)
+        xor rax, rax;
+        mov [rbx + 40], rax;                // y_min = fx(0)
+        mov rax, 0x0000000900000000;
+        mov [rbx + 48], rax;                // y_max = fx(9)
+        mov rax, 1;
+        mov [rbx + 56], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 64], rax;                // style_axis
+
+        lea rdi, [rip + _wcm_chart_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call chart_draw;
+        cmp rax, 0;
+        jne wcm_fail_chart_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 13952;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 22: slot 20 -- CANVAS / line drawn at (0, 20, 8, 9).
+        // Direct-store CanvasSpec then canvas_clear + canvas_line(...) +
+        // canvas_draw. Same shape as M4-008 (line covers a diagonal
+        // stamping braille dots).
+        // ==================================================================
+        lea rbx, [rip + _wcm_canvas_a_spec];
+        mov rax, 0x0009000800140000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // x_min = fx(0)
+        mov rax, 0x0000001000000000;
+        mov [rbx + 16], rax;                // x_max = fx(16)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // y_min = fx(0)
+        mov rax, 0x0000001200000000;
+        mov [rbx + 32], rax;                // y_max = fx(18)
+        lea rax, [rip + _wcm_canvas_a_bitmap];
+        mov [rbx + 40], rax;                // bitmap_ptr
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // _reserved
+
+        lea rdi, [rip + _wcm_canvas_a_spec];
+        call canvas_clear;
+        cmp rax, 0;
+        jne wcm_fail_canvas_rc;
+
+        lea rdi, [rip + _wcm_canvas_a_spec];
+        xor rsi, rsi;                       // x0 = fx(0)
+        xor rdx, rdx;                       // y0 = fx(0)
+        mov rcx, 0x0000000F00000000;        // x1 = fx(15)
+        mov r8,  0x0000001100000000;        // y1 = fx(17)
+        call canvas_line;
+        cmp rax, 0;
+        jne wcm_fail_canvas_rc;
+
+        lea rdi, [rip + _wcm_canvas_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call canvas_draw;
+        cmp rax, 0;
+        jne wcm_fail_canvas_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 25600;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 23: slot 21 -- CANVAS / cleared only at (8, 20, 8, 9).
+        // canvas_clear + canvas_draw (no canvas_line). canvas_draw still
+        // stamps every cell with the empty-braille glyph U+2800 =
+        // 0x0080A0E2 (see canvas.pdx canvas_draw main loop) -- the
+        // braille base glyph is non-zero even when the bitmap is all-zero.
+        // ==================================================================
+        lea rbx, [rip + _wcm_canvas_b_spec];
+        mov rax, 0x0009000800140008;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // x_min
+        mov rax, 0x0000001000000000;
+        mov [rbx + 16], rax;                // x_max = fx(16)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // y_min
+        mov rax, 0x0000001200000000;
+        mov [rbx + 32], rax;                // y_max = fx(18)
+        lea rax, [rip + _wcm_canvas_b_bitmap];
+        mov [rbx + 40], rax;                // bitmap_ptr
+        mov rax, 1;
+        mov [rbx + 48], rax;                // style = 1
+        xor rax, rax;
+        mov [rbx + 56], rax;                // _reserved
+
+        lea rdi, [rip + _wcm_canvas_b_spec];
+        call canvas_clear;
+        cmp rax, 0;
+        jne wcm_fail_canvas_rc;
+
+        lea rdi, [rip + _wcm_canvas_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call canvas_draw;
+        cmp rax, 0;
+        jne wcm_fail_canvas_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 25728;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 24: slot 22 -- TEXT_INPUT / SingleLine at (16, 20, 8, 9).
+        // Stamp 'X' at buffer[0], compose spec via text_input_spec_init.
+        //   buffer_len_and_cursor = 1 (len) | 1<<32 (cursor)
+        //                         = 0x0000000100000001 (imm32-safe)
+        //   scroll_and_mode       = 0 (mode = SingleLine)
+        // ==================================================================
+        lea rbx, [rip + _wcm_ti_a_buffer];
+        mov rax, 0x58;                      // 'X' == 0x58
+        mov_b [rbx + 0], rax;
+
+        lea rdi, [rip + _wcm_ti_a_spec];
+        mov rsi, 0x0009000800140010;
+        lea rdx, [rip + _wcm_ti_a_buffer];
+        mov rcx, 16;
+        mov r8, 0x0000000100000001;
+        xor r9, r9;
+        call text_input_spec_init;
+
+        lea rdi, [rip + _wcm_ti_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call text_input_draw;
+        cmp rax, 0;
+        jne wcm_fail_text_input_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 25856;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 25: slot 23 -- TEXT_INPUT / MultiLine at (24, 20, 8, 9).
+        // scroll_and_mode = 1 (mode = MultiLine).
+        // ==================================================================
+        lea rbx, [rip + _wcm_ti_b_buffer];
+        mov rax, 0x58;                      // 'X'
+        mov_b [rbx + 0], rax;
+
+        lea rdi, [rip + _wcm_ti_b_spec];
+        mov rsi, 0x0009000800140018;
+        lea rdx, [rip + _wcm_ti_b_buffer];
+        mov rcx, 16;
+        mov r8, 0x0000000100000001;
+        mov r9, 1;                          // mode = MultiLine (low 32)
+        call text_input_spec_init;
+
+        lea rdi, [rip + _wcm_ti_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call text_input_draw;
+        cmp rax, 0;
+        jne wcm_fail_text_input_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 25984;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 26: slot 24 -- TREE / leaf-only at (32, 20, 8, 9).
+        // Root TreeNode with 0 children, packed_flags=0 (not expanded,
+        // count=0). tree_draw stamps the label at row 0.
+        // ==================================================================
+        lea rbx, [rip + _wcm_tree_a_root];
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 0], rax;                 // label_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // label_len = 1
+        xor rax, rax;
+        mov [rbx + 16], rax;                // children_ptr = 0
+        mov [rbx + 24], rax;                // packed_flags = 0 (leaf)
+
+        lea rbx, [rip + _wcm_tree_a_spec];
+        mov rax, 0x0009000800140020;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_tree_a_root];
+        mov [rbx + 8], rax;                 // root_ptr
+        xor rax, rax;
+        mov [rbx + 16], rax;                // selected_ptr
+        mov [rbx + 24], rax;                // state_ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected
+        mov [rbx + 48], rax;                // _reserved_a
+        mov [rbx + 56], rax;                // _reserved_b
+
+        lea rdi, [rip + _wcm_tree_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call tree_draw;
+        cmp rax, 0;
+        jne wcm_fail_tree_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26112;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 27: slot 25 -- TREE / expanded at (40, 20, 8, 9).
+        // Root TreeNode with 1 child, packed_flags = bit 63 (expanded) |
+        // 1 (child_count) = 0x8000000000000001 (movabs). tree_draw walks
+        // root + child (DFS).
+        // ==================================================================
+        // Child node.
+        lea rbx, [rip + _wcm_tree_b_child];
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 0], rax;                 // label_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // label_len = 1
+        xor rax, rax;
+        mov [rbx + 16], rax;                // children_ptr = 0
+        mov [rbx + 24], rax;                // packed_flags = 0
+
+        // Root node.
+        lea rbx, [rip + _wcm_tree_b_root];
+        lea rax, [rip + _wcm_str_x];
+        mov [rbx + 0], rax;                 // label_ptr
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // label_len = 1
+        lea rax, [rip + _wcm_tree_b_child];
+        mov [rbx + 16], rax;                // children_ptr
+        mov rax, 0x8000000000000001;        // bit 63 = expanded, count = 1
+        mov [rbx + 24], rax;                // packed_flags
+
+        lea rbx, [rip + _wcm_tree_b_spec];
+        mov rax, 0x0009000800140028;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _wcm_tree_b_root];
+        mov [rbx + 8], rax;                 // root_ptr
+        xor rax, rax;
+        mov [rbx + 16], rax;                // selected_ptr
+        mov [rbx + 24], rax;                // state_ptr
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_line
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected
+        mov [rbx + 48], rax;                // _reserved_a
+        mov [rbx + 56], rax;                // _reserved_b
+
+        lea rdi, [rip + _wcm_tree_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call tree_draw;
+        cmp rax, 0;
+        jne wcm_fail_tree_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26240;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 28: slot 26 -- CALENDAR / month=1 at (48, 20, 8, 9).
+        // year=2026, month=1 (January), selected_day=0. bw=8 >= 8 keeps
+        // the header row; bh=9 >= 3 keeps the grid.
+        // ==================================================================
+        lea rbx, [rip + _wcm_cal_a_spec];
+        mov rax, 0x0009000800140030;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 2026;
+        mov [rbx + 8], rax;                 // year
+        mov rax, 1;
+        mov [rbx + 16], rax;                // month = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // selected_day
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_normal = 1
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected
+
+        lea rdi, [rip + _wcm_cal_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call calendar_draw;
+        cmp rax, 0;
+        jne wcm_fail_calendar_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26368;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 29: slot 27 -- CALENDAR / month=7 at (56, 20, 8, 9).
+        // Exercises the mid-year branch of the days_in_month and
+        // weekday_of_first paths.
+        // ==================================================================
+        lea rbx, [rip + _wcm_cal_b_spec];
+        mov rax, 0x0009000800140038;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 2026;
+        mov [rbx + 8], rax;                 // year
+        mov rax, 7;
+        mov [rbx + 16], rax;                // month = 7 (July)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // selected_day
+        mov rax, 1;
+        mov [rbx + 32], rax;                // style_normal
+        xor rax, rax;
+        mov [rbx + 40], rax;                // style_selected
+
+        lea rdi, [rip + _wcm_cal_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call calendar_draw;
+        cmp rax, 0;
+        jne wcm_fail_calendar_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26496;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 30: slot 28 -- CLEAR / style=0 at (64, 20, 8, 9).
+        // clear_draw stamps every cell with (0x20, style=0). The space
+        // glyph alone (0x20) makes word0 non-zero even with zero style,
+        // so the tile check passes.
+        // ==================================================================
+        lea rbx, [rip + _wcm_clear_a_spec];
+        mov rax, 0x0009000800140040;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // style = 0 (default)
+
+        lea rdi, [rip + _wcm_clear_a_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call clear_draw;
+        cmp rax, 0;
+        jne wcm_fail_clear_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26624;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 31: slot 29 -- CLEAR / style=1 at (72, 20, 8, 9).
+        // ==================================================================
+        lea rbx, [rip + _wcm_clear_b_spec];
+        mov rax, 0x0009000800140048;
+        mov [rbx + 0], rax;                 // rect
+        mov rax, 1;
+        mov [rbx + 8], rax;                 // style = 1 (custom)
+
+        lea rdi, [rip + _wcm_clear_b_spec];
+        lea rsi, [rip + _wcm_buffer];
+        mov rdx, 30;
+        mov rcx, 80;
+        call clear_draw;
+        cmp rax, 0;
+        jne wcm_fail_clear_rc;
+
+        lea rdi, [rip + _wcm_buffer];
+        add rdi, 26752;
+        call wcm_tile_or_scan;
+        cmp rax, 0;
+        je  wcm_fail_tile_or_guard;
+
+        // ==================================================================
+        // Phase 32: guard-row check. Walk row 9, row 19, row 29 (160
+        // qwords per row = 80 cells x 2 qwords/cell) and assert every
+        // qword is still zero. A single non-zero qword short-circuits
+        // to the shared tile-or-guard sentinel.
+        // ==================================================================
+        // Row 9 (byte offset 11520 = (9 * 80) * 16).
+        lea rbx, [rip + _wcm_buffer];
+        add rbx, 11520;
+        mov rcx, 160;
+      wcm_g9_loop:
+        cmp rcx, 0;
+        je  wcm_g9_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne wcm_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_g9_loop;
+      wcm_g9_done:
+
+        // Row 19 (byte offset 24320 = (19 * 80) * 16).
+        lea rbx, [rip + _wcm_buffer];
+        add rbx, 24320;
+        mov rcx, 160;
+      wcm_g19_loop:
+        cmp rcx, 0;
+        je  wcm_g19_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne wcm_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_g19_loop;
+      wcm_g19_done:
+
+        // Row 29 (byte offset 37120 = (29 * 80) * 16).
+        lea rbx, [rip + _wcm_buffer];
+        add rbx, 37120;
+        mov rcx, 160;
+      wcm_g29_loop:
+        cmp rcx, 0;
+        je  wcm_g29_done;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne wcm_fail_tile_or_guard;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp wcm_g29_loop;
+      wcm_g29_done:
+
+        // ==================================================================
+        // All 30 variants + guard rows passed.
+        // ==================================================================
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      wcm_fail_block_rc:
+        mov rax, 0xFFFFEDF0;
+        pop rbx;
+        ret;
+
+      wcm_fail_paragraph_rc:
+        mov rax, 0xFFFFEDF1;
+        pop rbx;
+        ret;
+
+      wcm_fail_list_rc:
+        mov rax, 0xFFFFEDF2;
+        pop rbx;
+        ret;
+
+      wcm_fail_table_rc:
+        mov rax, 0xFFFFEDF3;
+        pop rbx;
+        ret;
+
+      wcm_fail_tabs_rc:
+        mov rax, 0xFFFFEDF4;
+        pop rbx;
+        ret;
+
+      wcm_fail_scrollbar_rc:
+        mov rax, 0xFFFFEDF5;
+        pop rbx;
+        ret;
+
+      wcm_fail_gauge_rc:
+        mov rax, 0xFFFFEDF6;
+        pop rbx;
+        ret;
+
+      wcm_fail_sparkline_rc:
+        mov rax, 0xFFFFEDF7;
+        pop rbx;
+        ret;
+
+      wcm_fail_barchart_rc:
+        mov rax, 0xFFFFEDF8;
+        pop rbx;
+        ret;
+
+      wcm_fail_chart_rc:
+        mov rax, 0xFFFFEDF9;
+        pop rbx;
+        ret;
+
+      wcm_fail_canvas_rc:
+        mov rax, 0xFFFFEDFA;
+        pop rbx;
+        ret;
+
+      wcm_fail_text_input_rc:
+        mov rax, 0xFFFFEDFB;
+        pop rbx;
+        ret;
+
+      wcm_fail_tree_rc:
+        mov rax, 0xFFFFEDFC;
+        pop rbx;
+        ret;
+
+      wcm_fail_calendar_rc:
+        mov rax, 0xFFFFEDFD;
+        pop rbx;
+        ret;
+
+      wcm_fail_clear_rc:
+        mov rax, 0xFFFFEDFE;
+        pop rbx;
+        ret;
+
+      wcm_fail_tile_or_guard:
+        mov rax, 0xFFFFEDFF;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
