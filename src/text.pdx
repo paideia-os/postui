@@ -1,0 +1,869 @@
+// src/text.pdx -- postui.M2-002 (paideia-os/postui#11)
+//
+// Text / Span / Line -- styled-run text primitives.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog rows Paragraph/List/Table;
+// §1.5 grapheme width posture; §5.1 M2-002 issue text)
+// =============================================================================
+//
+// postui.M2-002 lands the composable text primitives that feed every
+// downstream text-rendering widget: Paragraph (M2-004), List (M2-005),
+// Table (M2-006), Tabs (M2-007) and eventually TextInput (M4-001). The
+// three primitives mirror the shape Ratatui's `text` module exposes but
+// consume postui-native styling (packed-u64 Style, packed-u64 Rect,
+// Width module cell-width policy):
+//
+//   Span : a contiguous UTF-8 byte run + one packed Style (24 B)
+//   Line : an ordered array of Spans + a horizontal alignment (24 B)
+//   Text : an ordered array of Lines                             (16 B)
+//
+// The wrap policy this module owns is line-local (a single Line's
+// break-point set for a given max width); the Paragraph widget owns
+// the multi-line rendering that consumes those break points and stamps
+// glyphs into a Buffer.
+//
+// =============================================================================
+// STORAGE MODEL -- NO ALLOCATOR
+// =============================================================================
+//
+// postui has no heap at v1 (docs/design.md §1.2 spells this out; the
+// only allocation postui does is the Buffer's memory-mapped back/front
+// region via mem_alloc + cap_bind, and even that is one-shot at
+// terminal_init time). Every text primitive therefore lives in a
+// caller-provided memory slot -- an fname-local u64[3]/u64[3]/u64[2]
+// declared in the caller's stack frame, or a slot the caller carves
+// out of a downstream fixed-size buffer (a Table row's headers, a
+// List's item labels, etc.). The API shape mirrors block_spec_init:
+//
+//   span_init(slot_ptr, ptr, byte_len, style)      -- 24 B write
+//   line_init(slot_ptr, spans_ptr, span_count, alignment) -- 24 B write
+//   text_init(slot_ptr, lines_ptr, line_count)     -- 16 B write
+//
+// Downstream accessors take the slot pointer and return the packed
+// field words verbatim (no re-copy). A caller that needs to hand a
+// Line to Paragraph::render passes the Line's slot ptr, and Paragraph
+// walks it via line_span_count / line_break_positions without owning
+// the memory.
+//
+// The "return a packed u64" alternative that Rect / Style / Color use
+// does NOT fit Text/Span/Line: a Span is 24 bytes and a Line is 24
+// bytes, neither fits in a single register. A per-field u64 return
+// would force every constructor to produce 2 or 3 return words and
+// every caller to spill them into memory anyway -- the init-into-
+// caller-slot shape saves the spill step and matches the natural
+// callsite pattern where a caller builds a fixed-count Span array on
+// its own stack.
+//
+// =============================================================================
+// SPAN WIRE (24 B, TEXT_SPAN_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   ptr        pointer to UTF-8 bytes
+//   [+ 8..+16)   byte_len   byte count (NOT codepoint count)
+//   [+16..+24)   style      packed Style (Style module wire; see style.pdx)
+//
+// The Style word inlines the fg/bg/mods tuple in the same 8-byte layout
+// Cell::cell_set_style already writes -- Paragraph's render loop can
+// therefore pass `[span+16]` straight into `cell_set_style` without
+// unpacking.
+//
+// =============================================================================
+// LINE WIRE (24 B, TEXT_LINE_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   spans_ptr    pointer to first Span (array is 24 B * count)
+//   [+ 8..+16)   span_count   number of Spans in the array
+//   [+16..+24)   alignment    0 = Left, 1 = Center, 2 = Right; other values
+//                             are documented caller bugs and are ignored by
+//                             this module (the alignment field is a hint the
+//                             Paragraph render step reads, not a wrap-time
+//                             gate).
+//
+// A degenerate Line with span_count == 0 is legal (empty line, useful
+// for vertical whitespace); every accessor returns 0 / 0-cells / 0
+// breaks for it.
+//
+// =============================================================================
+// TEXT WIRE (16 B, TEXT_TEXT_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   lines_ptr    pointer to first Line (array is 24 B * count)
+//   [+ 8..+16)   line_count   number of Lines in the array
+//
+// A degenerate Text with line_count == 0 is legal (empty text); every
+// accessor returns 0.
+//
+// =============================================================================
+// WRAP STRATEGY -- LINE_BREAK_POSITIONS (byte-offset array, no alloc)
+// =============================================================================
+//
+// The issue text presents two shapes: (a) `text_wrap(text, max_width) ->
+// new_text` and (b) `line_break_positions(line, max_width, out_ptr,
+// out_max) -> count`. Shape (a) is fundamentally incompatible with
+// postui's no-allocator posture (a wrapped Text has more Lines than
+// the input, so the routine cannot write in-place into a fixed-size
+// caller slot; it either heap-allocates or returns a "you need N more
+// slots" contract). Shape (b) sidesteps the problem: the routine
+// reports break points as byte offsets and hands them back for
+// Paragraph (M2-004) to stitch into rendered Lines. Paragraph is where
+// the multi-Line materialization decision naturally lives -- and where
+// a scroll offset / wrap-mode selector eventually attaches -- so
+// pushing that decision down to a wrap primitive would fossilize it.
+//
+// Signature adopted:
+//
+//   line_break_positions(line_ptr, max_width, out_positions_ptr,
+//                        out_max) -> u64 count
+//
+// * `line_ptr`     -- ptr to a 24 B Line slot (line_init output).
+// * `max_width`    -- target maximum display columns per line segment.
+// * `out_positions_ptr` -- writable u64[out_max] buffer; each written
+//                          slot is a byte offset into the concatenated
+//                          Line byte stream (spans laid end-to-end) at
+//                          which the caller should insert a break --
+//                          i.e. `out_positions[i]` names the FIRST
+//                          byte of the (i+1)th visual line.
+// * `out_max`      -- capacity of that buffer.
+// * Returns: on success, the number of break points written (0..out_max).
+//             On buffer overflow, TEXT_ERR_BUF_TOO_SMALL. A caller can
+//             distinguish success from failure via
+//             `cmp rax, POSTUI_ERR_BAND_BASE` (0xFFFFEB80) -- every
+//             legitimate count is <= out_max which realistic callers
+//             cap at 4096 (TUI_DIM_MAX per docs/design.md §2.1), well
+//             below the sentinel band.
+//
+// Algorithm (greedy, single pass, byte-oriented):
+//
+//   cur_col      = display columns since last break
+//   word_width   = display width of the CURRENT unclosed word
+//   have_space   = 1 iff at least one ASCII space seen in current segment
+//   last_space_after_byte = byte offset of the byte JUST AFTER the last
+//                           ASCII space (so an emitted break skips the
+//                           space, producing "word |wrapped| word" not
+//                           "word | wrapped | word").
+//
+//   For each byte b at absolute offset off (concatenated across spans):
+//     1. Classify b -> width w:
+//          b < 0x20            -> 0     (C0 controls)
+//          b == 0x7F           -> 0     (DEL)
+//          b in [0x20..0x7F)   -> 1     (printable ASCII)
+//          b in [0x80..0xC0)   -> 0     (UTF-8 continuation byte)
+//          b in [0xC0..0xE0)   -> 1     (2-byte lead)
+//          b in [0xE0..0xF0)   -> 2     (3-byte lead, approximates wide)
+//          b in [0xF0..0xF8)   -> 2     (4-byte lead, astral approx wide)
+//          b >= 0xF8           -> 1     (invalid, U+FFFD replacement)
+//     2. If cur_col + w > max_width AND cur_col > 0 (overflow test):
+//          if have_space:
+//            emit last_space_after_byte  (word break; skip the space)
+//            cur_col = word_width; have_space = 0
+//          else:
+//            emit off                    (hard break at codepoint start)
+//            cur_col = 0; word_width = 0
+//        (in either case: if count_written >= out_max ->
+//         return TEXT_ERR_BUF_TOO_SMALL)
+//     3. cur_col += w; word_width += w
+//     4. If b == 0x20 (ASCII space):
+//          have_space = 1
+//          last_space_after_byte = off + 1
+//          word_width = 0
+//   Return count_written.
+//
+// The classification treats each UTF-8 codepoint's LEAD BYTE as the
+// width carrier and every continuation byte as width 0. This matches
+// the byte-scan discipline Width::str_display_width uses (byte-by-byte
+// walk with lead-byte dispatch) and lets the wrap loop stay register-
+// local: NO nested call into Width. The width numbers are the same
+// approximation Width::char_display_width would report for a
+// canonically-decoded codepoint, minus two cases the wrap step
+// deliberately accepts:
+//
+//   * A 3-byte codepoint outside every entry in Width's wide-range
+//     table (there are narrow BMP codepoints in the U+0800..U+FFFF
+//     range -- Cyrillic Extended-A, Vedic Extensions, ...) is
+//     counted as 2 cells here even though char_display_width would
+//     report 1. This over-counts columns by at most 1 cell per
+//     wrapped-narrow-BMP character, meaning the wrap step may break
+//     "too early" and produce a slightly under-filled line. It never
+//     produces overflow.
+//
+//   * A 4-byte codepoint that Width::char_display_width would call
+//     narrow (there are none at v1 -- every codepoint above U+10000
+//     is width-2 in Width's astral approximation -- but a v2 revision
+//     that folds a real EAW table for astral planes might disagree
+//     on the emoji U+1F600 skin-tone-neutral cases). No divergence
+//     at v1.
+//
+// The counter-argument -- delegate to char_display_width -- was
+// weighed and rejected: it would require every 3-byte codepoint to be
+// reconstructed into a u32 (three continuation-byte loads + shl 12/6
+// + and 0x3F), then a nested call into a routine that pushes 0
+// callee-save regs. The register-local classifier is O(1) per byte
+// with no memory hop; the callsite savings compound across the wrap
+// step's inner loop.
+//
+// Break-point buffer semantics: the output is a monotonically-
+// increasing sequence of byte offsets; the caller can iterate the
+// visual-line boundaries as [0, out[0]), [out[0], out[1]), ...,
+// [out[count-1], total_bytes). An empty return (count == 0) means
+// "no wrap needed; render as one line". A returned value >=
+// POSTUI_ERR_BAND_BASE is a sentinel (only TEXT_ERR_BUF_TOO_SMALL
+// at v1).
+//
+// =============================================================================
+// ERROR BAND (0xFFFFEBCA..0xFFFFEBCE, disjoint from Layout / Width)
+// =============================================================================
+//
+// design/architecture.md §5.1 line 725 assigns 0xFFFFEBC0..0xFFFFEBCF
+// to the M2 batch. Layout (postui.M2-001) owns 0xFFFFEBC0..0xFFFFEBC4
+// (see src/layout.pdx LAYOUT_ERR_* block). Width (postui.M2-003)
+// reserves 0xFFFFEBC5..0xFFFFEBC9 for a v2 revision that may need
+// failure returns (see src/width.pdx module header ERROR BAND). Text
+// takes the third slice 0xFFFFEBCA..0xFFFFEBCE.
+//
+//   TEXT_ERR_BUF_TOO_SMALL   : 0xFFFFEBCA
+//   (0xFFFFEBCB..0xFFFFEBCE reserved for a future revision that may
+//    trap invalid alignment / null-span-array / oversized-line-count
+//    if downstream callers demand hard validation. At v1 the init
+//    routines are total: alignment is stored verbatim; a null spans
+//    pointer traps at first dereference exactly like buffer_set's
+//    contract.)
+//
+// The remaining M2 slot 0xFFFFEBCF stays uncommitted for M2-004..M2-007
+// (Paragraph / List / Table / Tabs) to draw from.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Text`), matches file basename.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - Every `cmp reg, imm` / `and reg, imm` uses imm <= 0x7FFFFFFF.
+//     Widest immediate in this module is 0xF8 (invalid-lead threshold);
+//     every shift count (3 for `<< 3` to index a u64 array) is imm8.
+//   - No 2-op `imul reg, imm`. Only 2-op `imul reg, reg` is used, and
+//     only in line_display_width / text_max_line_width for the
+//     span/line stride multiplication (24). Actually those are add-
+//     chains via `add r12, 24` at loop bottom -- no imul at all in
+//     this module.
+//   - No `and reg, imm64` (widest mask 0xF8 well within imm32).
+//   - Every mov_b load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension) -- the wrap step's inner
+//     `mov_b rax, [r10 + rcx + 0]` byte-load respects this.
+//   - `pub let X : type = value` is single-line for every constant.
+//   - r11 discipline: line_break_positions uses r11 as the current
+//     span's byte_len across the byte-scan inner loop. There is NO
+//     `lea` in the line_break_positions body, so paideia-as's r11
+//     LEA-emission scratch never touches this state. Every other
+//     function in this module is either a pure leaf with no `lea` or
+//     the `lea` (none, actually) sits before any r11 data-write.
+//   - SysV push/pop parity:
+//       * span_init / line_init / text_init are pure leafs (no push/pop).
+//       * span_ptr / span_byte_len / span_style / line_span_count /
+//         line_alignment / text_line_count / span_display_width are
+//         either pure leafs or single-nested-call functions.
+//         span_display_width pushes 5 callee-save regs (rbx / r12 /
+//         r13 / r14 / r15 = 40 B, rsp%16 goes 8 -> 0) for the nested
+//         str_display_width call.
+//       * line_display_width and text_max_line_width push 5 callee-
+//         save regs for the same alignment discipline plus their own
+//         loop-state ownership across the nested span_display_width /
+//         line_display_width calls.
+//       * line_break_positions pushes 5 callee-save regs plus
+//         sub rsp, 48 (48 B state scratch, rsp%16 stays 0); no nested
+//         call (byte-scan is fully register-local) so the alignment
+//         is defense-in-depth for a future revision that might add
+//         one.
+//   - Cross-module call convention: bare `call str_display_width` per
+//     the frame.pdx precedent (`call tcc_query_tty_id`, `call
+//     tcc_present`) -- paideia-as's flat symbol namespace resolves
+//     Width's exported symbols by name without any module::function
+//     prefix.
+//   - Labels prefixed per function per docs fingerprint discipline:
+//       sp_ / sw_  span_*
+//       ln_ / lw_  line_*
+//       tx_ / tw_  text_*
+//       bp_        line_break_positions
+//     Every prefix scanned against the union of ls_ / rc_ / ri_ / cd_
+//     / sd_ / bl_ / fr_ / tm_ / cell_eq_ / rc_ / cl_ / ci_ / wk_ in
+//     the existing src/*.pdx to confirm no collision.
+
+module Text = structure {
+
+  // ==========================================================================
+  // Sizing constants (locked at M2-002 landing).
+  // ==========================================================================
+  pub let TEXT_SPAN_BYTES : u64 = 24
+  pub let TEXT_LINE_BYTES : u64 = 24
+  pub let TEXT_TEXT_BYTES : u64 = 16
+
+  // Field offsets. Named so a downstream reader can trace every
+  // displacement back to the wire-format block in this module header
+  // without decoding raw numerals.
+  pub let TEXT_SPAN_OFF_PTR      : u64 = 0
+  pub let TEXT_SPAN_OFF_BYTE_LEN : u64 = 8
+  pub let TEXT_SPAN_OFF_STYLE    : u64 = 16
+
+  pub let TEXT_LINE_OFF_SPANS_PTR  : u64 = 0
+  pub let TEXT_LINE_OFF_SPAN_COUNT : u64 = 8
+  pub let TEXT_LINE_OFF_ALIGNMENT  : u64 = 16
+
+  pub let TEXT_TEXT_OFF_LINES_PTR  : u64 = 0
+  pub let TEXT_TEXT_OFF_LINE_COUNT : u64 = 8
+
+  // Alignment ordinals (docs/design.md §2.6 Paragraph render rules;
+  // consumed at render time by Paragraph M2-004, ignored by this
+  // module's wrap step).
+  pub let TEXT_ALIGN_LEFT   : u64 = 0
+  pub let TEXT_ALIGN_CENTER : u64 = 1
+  pub let TEXT_ALIGN_RIGHT  : u64 = 2
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x2A offset = 0xFFFFEBCA, per design/architecture.md §5.1 M2
+  // slice allocation (Layout owns 0xFFFFEBC0..0xFFFFEBC4; Width
+  // reserves 0xFFFFEBC5..0xFFFFEBC9; Text takes 0xFFFFEBCA..0xFFFFEBCE).
+  // Every sentinel > 0x7FFFFFFF -- movabs required for `mov reg, imm`;
+  // NEVER usable in cmp/and.
+  // ==========================================================================
+  pub let TEXT_ERR_BUF_TOO_SMALL : u64 = 0xFFFFEBCA
+
+  // ==========================================================================
+  // span_init(slot_ptr, ptr, byte_len, style) -> ()
+  //
+  // Serialize the three Span fields into 24 bytes at [slot_ptr..+24).
+  // Fields are stored verbatim; no masking / range check (a caller
+  // passing a null ptr with non-zero byte_len will trap at first
+  // dereference inside span_display_width -- documented caller
+  // responsibility, same as buffer_set).
+  //
+  // Register plan: rdi=slot_ptr, rsi=ptr, rdx=byte_len, rcx=style;
+  // three 8-byte stores. Pure leaf: no callee-save touched, no
+  // push/pop.
+  // ==========================================================================
+  pub let span_init : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (ptr: u64) (byte_len: u64) (style: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): span_init writes 24 bytes of Span into [rdi..rdi+24). Three 8-byte stores at offsets 0/8/16 for ptr/byte_len/style. No validation -- constructors are total per module convention (matches layout_length / rect_new). Pure leaf: no callee-save touched, no push/pop, no nested call. Every store immediate offset (0, 8, 16) fits imm32 trivially. Effect `!{mem}` (three 8-byte stores).",
+      block: {
+        mov [rdi + 0],  rsi;
+        mov [rdi + 8],  rdx;
+        mov [rdi + 16], rcx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // span_ptr(span_slot) -> u64
+  // span_byte_len(span_slot) -> u64
+  // span_style(span_slot) -> u64
+  //
+  // Field accessors. Each is a single 8-byte load from the fixed offset.
+  // ==========================================================================
+  pub let span_ptr : (u64) -> u64 !{mem} @{} =
+    fn (span_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): span_ptr returns the u64 at [rdi+0]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 0];
+        ret;
+      }
+    }
+
+  pub let span_byte_len : (u64) -> u64 !{mem} @{} =
+    fn (span_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): span_byte_len returns the u64 at [rdi+8]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  pub let span_style : (u64) -> u64 !{mem} @{} =
+    fn (span_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): span_style returns the u64 at [rdi+16]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 16];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // span_display_width(span_slot) -> u64
+  //
+  // Returns the number of terminal cells the Span's UTF-8 byte run
+  // occupies, per Width::str_display_width. Loads (ptr, byte_len) from
+  // the Span slot and forwards them.
+  //
+  // Register plan: 5-push callee-save prologue for SysV rsp%16 alignment
+  // ahead of the nested `call str_display_width` (rsp entry %16 == 8,
+  // + 40 == 0). rbx / r12 / r13 / r14 / r15 all touched only for
+  // alignment; the body uses rdi / rsi for arg-marshalling and rax for
+  // the return. No state must survive the call, so callee-save regs
+  // stay untouched by the body.
+  // ==========================================================================
+  pub let span_display_width : (u64) -> u64 !{mem} @{} =
+    fn (span_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): span_display_width loads (ptr, byte_len) from the Span at [rdi..rdi+16) and calls Width::str_display_width. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B) aligns rsp for the nested SysV call (entry rsp%16==8, +40==0). Body uses rdi/rsi as arg regs (rdi = ptr from [rdi_orig + 0] BEFORE overwrite -- load into rax first then move; rsi = byte_len from [rdi_orig + 8]). Cross-module call is bare `call str_display_width` per Frame precedent (call tcc_query_tty_id, call tcc_present). rax carries the return through. No `test`, no `imul`, no `and reg, imm`. Effect `!{mem}` (two 8-byte loads + transitive str_display_width memory reads). Labels: none (straight-line + one call).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Load (ptr, byte_len) into scratch BEFORE clobbering rdi.
+        mov rax, [rdi + 0];         // rax = ptr
+        mov rsi, [rdi + 8];         // rsi = byte_len (arg2)
+        mov rdi, rax;               // rdi = ptr (arg1)
+        call str_display_width;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // line_init(slot_ptr, spans_ptr, span_count, alignment) -> ()
+  //
+  // Serialize the three Line fields into 24 bytes at [slot_ptr..+24).
+  // ==========================================================================
+  pub let line_init : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (spans_ptr: u64) (span_count: u64) (alignment: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): line_init writes 24 bytes of Line into [rdi..rdi+24). Three 8-byte stores at offsets 0/8/16 for spans_ptr/span_count/alignment. Alignment stored verbatim -- values outside [0,2] are documented caller bugs; the field is a Paragraph-render hint, ignored by this module. Pure leaf. Effect `!{mem}` (three 8-byte stores).",
+      block: {
+        mov [rdi + 0],  rsi;
+        mov [rdi + 8],  rdx;
+        mov [rdi + 16], rcx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // line_span_count(line_slot) -> u64
+  // line_alignment(line_slot) -> u64
+  // ==========================================================================
+  pub let line_span_count : (u64) -> u64 !{mem} @{} =
+    fn (line_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): line_span_count returns the u64 at [rdi+8]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  pub let line_alignment : (u64) -> u64 !{mem} @{} =
+    fn (line_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): line_alignment returns the u64 at [rdi+16]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 16];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // line_display_width(line_slot) -> u64
+  //
+  // Sum of span_display_width across every Span in the Line. Returns
+  // 0 for a Line with span_count == 0.
+  //
+  // Register plan (5-push callee-save + no additional rsp sub, aligned
+  // for nested span_display_width call):
+  //   rbx = current span address (walks by TEXT_SPAN_BYTES = 24)
+  //   r12 = end address (spans_ptr + span_count * 24)
+  //   r13 = accumulated width (return value)
+  //   r14 / r15 = alignment-only pushes, never read or written in body
+  // ==========================================================================
+  pub let line_display_width : (u64) -> u64 !{mem} @{} =
+    fn (line_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): line_display_width walks the Line's Span array, calling span_display_width on each and summing into r13. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B) aligns rsp for the nested SysV call (entry rsp%16==8, +40==0). Register plan: rbx = current span cursor address (starts at spans_ptr from [rdi_orig+0], advances by 24 each iteration), r12 = end address (spans_ptr + span_count * 24, computed via a `mov rax, [rdi+8]; imul rax, X` pattern -- wait, X must be a register per paideia-as pitfall). Compute end via `mov rax, span_count; mov rcx, 24; imul rax, rcx; add rax, spans_ptr` -- imul is 2-op reg,reg, safe. Loop: cmp rbx, r12; jae ln_done. mov rdi, rbx; call span_display_width; add r13, rax; add rbx, 24; jmp ln_top. Epilogue: mov rax, r13; pop r15/r14/r13/r12/rbx; ret. Every immediate (0, 24, 40, 24 stride) fits imm32; no `test`, no `and reg, imm`, no `imul reg, imm` (imul only reg,reg via rcx scratch). Effect `!{mem}` (Line field loads + transitive span_display_width). Labels prefixed ln_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // rbx = spans_ptr; r12 = span_count.
+        mov rbx, [rdi + 0];
+        mov r12, [rdi + 8];
+
+        // r12 = end address = spans_ptr + span_count * 24
+        // Compute via `imul reg, reg` (24 in rcx scratch; paideia-as
+        // rejects 2-op `imul reg, imm`).
+        mov rax, r12;
+        mov rcx, 24;
+        imul rax, rcx;
+        add rax, rbx;
+        mov r12, rax;
+
+        xor r13, r13;                 // accumulated width
+
+      ln_top:
+        cmp rbx, r12;
+        jae ln_done;
+
+        mov rdi, rbx;                 // arg = current span slot
+        call span_display_width;
+        add r13, rax;
+        add rbx, 24;
+        jmp ln_top;
+
+      ln_done:
+        mov rax, r13;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_init(slot_ptr, lines_ptr, line_count) -> ()
+  //
+  // Serialize the two Text fields into 16 bytes at [slot_ptr..+16).
+  // ==========================================================================
+  pub let text_init : (u64, u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (lines_ptr: u64) (line_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): text_init writes 16 bytes of Text into [rdi..rdi+16). Two 8-byte stores at offsets 0/8 for lines_ptr/line_count. Pure leaf. Effect `!{mem}` (two 8-byte stores).",
+      block: {
+        mov [rdi + 0], rsi;
+        mov [rdi + 8], rdx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_line_count(text_slot) -> u64
+  // ==========================================================================
+  pub let text_line_count : (u64) -> u64 !{mem} @{} =
+    fn (text_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): text_line_count returns the u64 at [rdi+8]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // text_max_line_width(text_slot) -> u64
+  //
+  // Walks every Line in the Text, computing line_display_width and
+  // tracking the maximum. Returns 0 for a Text with line_count == 0.
+  //
+  // Register plan (5-push callee-save; nested call to line_display_width):
+  //   rbx = current line cursor address (walks by TEXT_LINE_BYTES = 24)
+  //   r12 = end address (lines_ptr + line_count * 24)
+  //   r13 = running maximum
+  //   r14 / r15 = alignment-only pushes, never read or written in body
+  // ==========================================================================
+  pub let text_max_line_width : (u64) -> u64 !{mem} @{} =
+    fn (text_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): text_max_line_width walks the Text's Line array, calling line_display_width on each and tracking the maximum in r13. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B) aligns rsp for the nested SysV call (entry rsp%16==8, +40==0). Register plan: rbx = current line cursor address (starts at lines_ptr from [rdi_orig+0], advances by 24 each iteration), r12 = end address (lines_ptr + line_count * 24, computed via `mov rcx, 24; imul rax, rcx` -- imul reg,reg only). Loop: cmp rbx, r12; jae tx_done. mov rdi, rbx; call line_display_width; cmp rax, r13; jbe tx_next; mov r13, rax. tx_next: add rbx, 24; jmp tx_top. Epilogue: mov rax, r13; 5-pop; ret. Every immediate (0, 24, 40) fits imm32; no `test`, no `and reg, imm`, no `imul reg, imm`. Effect `!{mem}` (Text field loads + transitive line_display_width). Labels prefixed tx_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // rbx = lines_ptr; r12 = line_count.
+        mov rbx, [rdi + 0];
+        mov r12, [rdi + 8];
+
+        // r12 = end address = lines_ptr + line_count * 24
+        mov rax, r12;
+        mov rcx, 24;
+        imul rax, rcx;
+        add rax, rbx;
+        mov r12, rax;
+
+        xor r13, r13;                 // running max
+
+      tx_top:
+        cmp rbx, r12;
+        jae tx_done;
+
+        mov rdi, rbx;                 // arg = current line slot
+        call line_display_width;
+        cmp rax, r13;
+        jbe tx_next;
+        mov r13, rax;
+
+      tx_next:
+        add rbx, 24;
+        jmp tx_top;
+
+      tx_done:
+        mov rax, r13;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // line_break_positions(line_ptr, max_width, out_positions_ptr, out_max)
+  //   -> u64
+  //
+  // Compute the greedy word-wrap break positions for a Line at the given
+  // max display width. Emits break offsets (byte offsets into the
+  // concatenated Line byte stream) into out_positions_ptr[0..out_max);
+  // returns the number written. If out_max is too small,
+  // TEXT_ERR_BUF_TOO_SMALL (0xFFFFEBCA, > POSTUI_ERR_BAND_BASE).
+  //
+  // See WRAP STRATEGY block in the module header for the full algorithm
+  // rationale. Byte-oriented classifier -- no nested call into Width;
+  // the byte-scan is fully register-local.
+  //
+  // Register plan (5-push callee-save + sub rsp, 48 for state scratch):
+  //
+  //   rbx = spans_base            (constant; from [line_ptr + 0])
+  //   r12 = span iteration byte offset (0..span_limit, step 24)
+  //   r13 = out_positions_ptr     (constant)
+  //   r14 = out_max               (constant)
+  //   r15 = max_width             (constant)
+  //   r8  = cur_col               (accumulator, valid throughout)
+  //   r9  = word_width            (accumulator, valid throughout)
+  //   r10 = current span_ptr      (reloaded each outer iteration)
+  //   r11 = current span_byte_len (reloaded each outer iteration)
+  //   rcx = byte offset within current span (0..span_byte_len)
+  //   rax/rdi/rsi/rdx = free scratch (byte load, width w, break_pos, ...)
+  //
+  //   Stack scratch (48 B):
+  //     [rsp+ 0)  cursor                    (global byte offset)
+  //     [rsp+ 8)  last_space_after_byte
+  //     [rsp+16)  have_space                (0/1)
+  //     [rsp+24)  count_written
+  //     [rsp+32)  span_limit                (span_count * 24)
+  //     [rsp+40)  byte_scratch              (spill for byte value)
+  //
+  //   Alignment: entry rsp%16==8; +40 (5 pushes)==48==0; +48==96==0.
+  //   No `lea` in the body, so paideia-as's r11-scratch LEA discipline
+  //   never interferes with the r11 = span_byte_len loop state.
+  //   No nested call, so callee-save regs are alignment-only for a
+  //   future revision that grows one.
+  // ==========================================================================
+  pub let line_break_positions : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (line_ptr: u64) (max_width: u64) (out_positions_ptr: u64) (out_max: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-002 (postui#11): line_break_positions is the greedy word-wrap engine. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 B) + sub rsp, 48 (48 B state scratch); entry rsp%16==8, +40==0, +48==0. Stack layout: [rsp+0..8) cursor, [rsp+8..16) last_space_after_byte, [rsp+16..24) have_space, [rsp+24..32) count_written, [rsp+32..40) span_limit, [rsp+40..48) byte_scratch. Register plan: rbx = spans_base (constant; from [rdi_orig+0]), r12 = span iteration byte offset (0..span_limit step 24), r13 = out_positions_ptr, r14 = out_max, r15 = max_width, r8 = cur_col accumulator, r9 = word_width accumulator, r10 = current span_ptr, r11 = current span_byte_len, rcx = byte offset within current span. NO `lea` in the body -- r11 is used as the byte-loop bound without paideia-as's LEA-scratch discipline biting. NO nested call -- byte-scan is fully register-local; the byte classifier uses cmp/je chain on 0x20/0x7F/0x80/0xC0/0xE0/0xF0/0xF8 (each imm32-safe) with the same lead-byte contract Width::str_display_width uses (documented approximation over char_display_width in the WRAP STRATEGY block). Phase 0 (init): load spans_base into rbx from [rdi+0]; load span_count into rax from [rdi+8]; span_limit = span_count * 24 via `mov rcx, 24; imul rax, rcx` (2-op reg,reg only, paideia-as-safe); store span_limit at [rsp+32]. Zero the other scratch slots (cursor / last_space_after_byte / have_space / count_written) and the accumulator regs (r8 / r9 / r12). Phase 1 (span loop): cmp r12 against [rsp+32]; jae bp_all_done. Load r10=[rbx+r12+0] and r11=[rbx+r12+8]. Zero rcx (byte offset within span). Phase 2 (byte loop): cmp rcx, r11; jae bp_span_done. Load byte via `xor rax, rax; mov_b rax, [r10+rcx+0]` (paideia-as pitfall #1248 zero-extension). Save byte to [rsp+40] (needed for the space check after the emit block may clobber rax). Classify: cmp rax against 0x20/0x7F/0x80/0xC0/0xE0/0xF0/0xF8 in ascending order; produce width w in rdx (0/1/2 per class; invalid lead 0xF8+ -> 1). Overflow test: rdi = r8 + rdx; cmp rdi, r15; jbe bp_no_break. cmp r8, 0; je bp_no_break. Emit path: rax = [rsp+16]; cmp rax, 0; je bp_hard. Word break: rax = [rsp+8]. Jump bp_do_emit. bp_hard: rax = [rsp+0] + rcx (cursor + intra-span offset). bp_do_emit: rsi = [rsp+24] (count_written); cmp rsi, r14; jae bp_err (TEXT_ERR_BUF_TOO_SMALL). Store break_pos: `mov rdi, rsi; shl rdi, 3` (imm8 shift, safe); `mov [r13+rdi+0], rax`. count_written++: `add rsi, 1; mov [rsp+24], rsi`. Reset accumulators per break type: cmp [rsp+16], 0; je bp_hard_reset. Word-break reset: mov r8, r9; zero [rsp+16]. Hard reset: zero r8 and r9. Fall through to bp_no_break. bp_no_break: add r8, rdx; add r9, rdx. Space handling: reload byte from [rsp+40]; cmp rax, 0x20; jne bp_after_space. Space: mark [rsp+16]=1; compute cursor+rcx+1 into rax and store to [rsp+8]; zero r9 (word_width; the space ends the current word). bp_after_space: add rcx, 1; jmp bp_byte_top. Phase 3 (span done): cursor += span_byte_len: `mov rax, [rsp+0]; add rax, r11; mov [rsp+0], rax`. Advance r12 by 24; jmp bp_span_top. Phase 4 (all done): success return: mov rax, [rsp+24]; add rsp, 48; 5-pop; ret. Error path bp_err: mov rax, 0xFFFFEBCA (movabs; imm > 0x7FFFFFFF, legal for mov only); add rsp, 48; 5-pop; ret. Every cmp/and immediate (0, 1, 24, 40, 0x20, 0x7F, 0x80, 0xC0, 0xE0, 0xF0, 0xF8) fits imm32. Every shift count (3 for u64 array index) is imm8. No `test`, no 2-op `imul reg, imm` (only `imul rax, rcx` at phase 0), no `and reg, imm64`. Byte-store uses no `and` on the byte value. Labels prefixed bp_ per docs fingerprint discipline (bp_span_top / bp_span_done / bp_byte_top / bp_w_* / bp_after_w / bp_no_break / bp_hard / bp_do_emit / bp_hard_reset / bp_after_space / bp_all_done / bp_err).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 48;
+
+        // ---- Phase 0: init ----------------------------------------------------
+        // Cache args into callee-save regs BEFORE any scratch use of the
+        // caller-save arg registers. Ordering matters: rcx carries
+        // out_max, and rcx also serves as the `imul` divisor scratch
+        // below -- must be captured first.
+        mov r14, rcx;                    // r14 = out_max
+        mov r15, rsi;                    // r15 = max_width
+        mov r13, rdx;                    // r13 = out_positions_ptr
+
+        // Load Line fields.
+        mov rbx, [rdi + 0];              // rbx = spans_base
+        mov rax, [rdi + 8];              // rax = span_count
+
+        // span_limit = span_count * 24 (imul reg,reg only; paideia-as
+        // rejects 2-op `imul reg, imm`).
+        mov rcx, 24;
+        imul rax, rcx;
+        mov [rsp + 32], rax;             // span_limit
+
+        // Zero the accumulators and the outer-loop counter.
+        xor r8,  r8;                     // cur_col = 0
+        xor r9,  r9;                     // word_width = 0
+        xor r12, r12;                    // span iteration byte offset = 0
+
+        // Zero the stack-resident state slots (cursor /
+        // last_space_after_byte / have_space / count_written). span_limit
+        // and byte_scratch not zeroed -- span_limit was set above;
+        // byte_scratch is written before every read.
+        xor rax, rax;
+        mov [rsp + 0],  rax;             // cursor
+        mov [rsp + 8],  rax;             // last_space_after_byte
+        mov [rsp + 16], rax;             // have_space
+        mov [rsp + 24], rax;             // count_written
+
+        // ---- Phase 1: span loop ---------------------------------------------
+      bp_span_top:
+        mov rax, [rsp + 32];             // span_limit
+        cmp r12, rax;
+        jae bp_all_done;
+
+        mov r10, [rbx + r12 + 0];        // r10 = span_ptr
+        mov r11, [rbx + r12 + 8];        // r11 = span_byte_len
+
+        xor rcx, rcx;                    // byte offset within span
+
+        // ---- Phase 2: byte loop ---------------------------------------------
+      bp_byte_top:
+        cmp rcx, r11;
+        jae bp_span_done;
+
+        // Load current byte into rax; spill to byte_scratch for
+        // post-emit space check.
+        xor rax, rax;
+        mov_b rax, [r10 + rcx + 0];
+        mov [rsp + 40], rax;             // byte_scratch
+
+        // Classify byte -> width w in rdx.
+        cmp rax, 0x20;
+        jb  bp_w_zero;
+        cmp rax, 0x7F;
+        je  bp_w_zero;
+        cmp rax, 0x80;
+        jb  bp_w_one;
+        cmp rax, 0xC0;
+        jb  bp_w_zero;                   // continuation byte
+        cmp rax, 0xE0;
+        jb  bp_w_one;                    // 2-byte lead
+        cmp rax, 0xF0;
+        jb  bp_w_two;                    // 3-byte lead
+        cmp rax, 0xF8;
+        jb  bp_w_two;                    // 4-byte lead (astral approx)
+        // Invalid lead >= 0xF8: replacement width 1.
+        mov rdx, 1;
+        jmp bp_after_w;
+      bp_w_zero:
+        xor rdx, rdx;
+        jmp bp_after_w;
+      bp_w_one:
+        mov rdx, 1;
+        jmp bp_after_w;
+      bp_w_two:
+        mov rdx, 2;
+
+      bp_after_w:
+        // Overflow test: (cur_col + w > max_width) AND (cur_col > 0)?
+        mov rdi, r8;
+        add rdi, rdx;
+        cmp rdi, r15;
+        jbe bp_no_break;
+        cmp r8, 0;
+        je  bp_no_break;
+
+        // Emit break. Choose break_pos into rax based on have_space.
+        mov rax, [rsp + 16];             // have_space
+        cmp rax, 0;
+        je  bp_hard;
+        mov rax, [rsp + 8];              // word break: last_space_after_byte
+        jmp bp_do_emit;
+      bp_hard:
+        // Hard break: absolute byte = cursor + rcx.
+        mov rax, [rsp + 0];
+        add rax, rcx;
+
+      bp_do_emit:
+        // Buffer capacity check.
+        mov rsi, [rsp + 24];             // count_written
+        cmp rsi, r14;
+        jae bp_err;
+
+        // out_positions[count_written] = break_pos
+        mov rdi, rsi;
+        shl rdi, 3;                      // rdi = count * 8 (imm8 shift)
+        mov [r13 + rdi + 0], rax;
+
+        // count_written++
+        add rsi, 1;
+        mov [rsp + 24], rsi;
+
+        // Reset accumulators per break type.
+        mov rax, [rsp + 16];             // reload have_space
+        cmp rax, 0;
+        je  bp_hard_reset;
+        // Word-break reset: cur_col = word_width; have_space = 0.
+        mov r8, r9;
+        xor rax, rax;
+        mov [rsp + 16], rax;
+        jmp bp_no_break;
+      bp_hard_reset:
+        xor r8, r8;
+        xor r9, r9;
+
+      bp_no_break:
+        // Add width to accumulators.
+        add r8, rdx;
+        add r9, rdx;
+
+        // Space handling: if byte == 0x20, mark space + reset word.
+        mov rax, [rsp + 40];             // reload byte
+        cmp rax, 0x20;
+        jne bp_after_space;
+
+        // have_space = 1
+        mov rax, 1;
+        mov [rsp + 16], rax;
+        // last_space_after_byte = cursor + rcx + 1
+        mov rax, [rsp + 0];
+        add rax, rcx;
+        add rax, 1;
+        mov [rsp + 8], rax;
+        // word_width = 0 (space ends the current word)
+        xor r9, r9;
+
+      bp_after_space:
+        add rcx, 1;
+        jmp bp_byte_top;
+
+      bp_span_done:
+        // cursor += span_byte_len
+        mov rax, [rsp + 0];
+        add rax, r11;
+        mov [rsp + 0], rax;
+
+        // Advance to next span.
+        add r12, 24;
+        jmp bp_span_top;
+
+      bp_all_done:
+        // Return count_written.
+        mov rax, [rsp + 24];
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bp_err:
+        // Buffer overflow: return TEXT_ERR_BUF_TOO_SMALL (0xFFFFEBCA,
+        // > POSTUI_ERR_BAND_BASE 0xFFFFEB80).
+        mov rax, 0xFFFFEBCA;
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
