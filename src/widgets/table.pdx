@@ -685,10 +685,18 @@ module Table = structure {
         add rax, rdi;
         mov r11, rax;                        // r11 = span_ptr
 
-        // If style_used slot is 0, load span.style at [r11+16] into it
-        mov rax, [rsp + 280];
-        cmp rax, 0;
-        jne tb_body_style_kept;
+        // Selected rows keep highlight_style verbatim (set once at row
+        // start, regardless of its packed value -- including the
+        // legitimate style_new(0,0,0) = black-on-black case). Checking
+        // the live selection condition here (rather than testing
+        // [rsp+280] for a sentinel zero) avoids conflating a real,
+        // constructible Style value with an internal "unset" flag: a
+        // highlight_style of 0 must still override the row, and a
+        // span.style of 0 must still be reloaded on every non-selected
+        // column.
+        mov rax, [r15 + 0];                  // state.selected
+        cmp rax, rdx;                        // rdx = current row_i
+        je  tb_body_style_kept;              // selected -> keep highlight_style
         mov rax, [r11 + 16];                 // span.style
         mov [rsp + 280], rax;
       tb_body_style_kept:
@@ -772,15 +780,10 @@ module Table = structure {
         mov rdi, [rsp + 312];
 
       tb_body_col_next:
-        // On non-selected rows, clear style_used so the next column
-        // re-loads its own span.style.
-        mov rax, [r15 + 0];
-        cmp rax, rdx;
-        je  tb_body_no_clear;
-        xor rax, rax;
-        mov [rsp + 280], rax;
-      tb_body_no_clear:
-
+        // Style for the next column is now resolved unconditionally at
+        // the top of the column loop (selected -> keep highlight_style,
+        // else -> reload span.style), so no end-of-column reset of
+        // [rsp+280] is needed here any more.
         add rcx, 1;
         jmp tb_body_col_top;
       tb_body_col_done:

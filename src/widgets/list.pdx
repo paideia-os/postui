@@ -229,6 +229,25 @@ module List = structure {
   pub let LIST_STATE_OFF_RESERVED : u64 = 16
 
   // ==========================================================================
+  // LIST_SELECTED_NONE: sentinel for "no selection" in ListState's
+  // `selected` field (see LISTSTATE WIRE in the module header).
+  // 0xFFFFFFFFFFFFFFFF -- distinct from any legitimate item index
+  // (item_count is capped by memory long before approaching 2^64-1).
+  //
+  // Declared here as the literal value so a downstream caller can read
+  // `List::LIST_SELECTED_NONE` directly per the module header's promise
+  // ("Callers reading LIST_SELECTED_NONE from the exported constant get
+  // the same value") -- a `pub let` declaration is a compile-time value,
+  // not an instruction operand, so the imm32 (0x7FFFFFFF) ceiling that
+  // gates `mov reg,imm` / `cmp` / `and` usage sites does not apply to
+  // the declaration itself. Every runtime composition of this value
+  // (list_draw's li_dr_no_state arm, list_view_pack's li_lv_no_state
+  // arm) still goes through `xor reg, reg; sub reg, 1` rather than a
+  // movabs load of this constant, per PAIDEIA-AS CONFORMANCE below.
+  // ==========================================================================
+  pub let LIST_SELECTED_NONE : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
   // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
   // + 0x4C offset = 0xFFFFEBCC. Sits inside the M2 slice
   // 0xFFFFEBC0..0xFFFFEBCF (design/architecture.md §5.1); disjoint from

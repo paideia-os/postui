@@ -49,7 +49,7 @@
 //                                    (Text::TEXT_TEXT_BYTES = 16; see
 //                                    src/text.pdx).
 //   [+16..+24)   scroll_offset  u64 starting LOGICAL line index (a value
-//                                    >= line_count returns PGR_ERR_BAND;
+//                                    > line_count returns PGR_ERR_BAND;
 //                                    == line_count draws nothing and
 //                                    returns 0).
 //   [+24..+32)   wrap_mode      u64 0 = PARA_WRAP_NONE, 1 = PARA_WRAP_WORD,
