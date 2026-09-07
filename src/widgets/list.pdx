@@ -1,0 +1,779 @@
+// src/widgets/list.pdx -- postui.M2-005 (paideia-os/postui#14)
+//
+// List widget: selectable vertical item list with a caller-owned
+// ListState (selected index + scroll offset).
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog row "List"; §5.1 M2-005 slot)
+// =============================================================================
+//
+// M2-005 lands the second post-Block widget body (after Paragraph at
+// M2-004) and the first widget with caller-owned scroll/selection
+// state. The three deliverables of this landing are:
+//
+//   1. ListSpec (64 B) -- the immutable per-frame render descriptor
+//      (rect, item array, item count, state pointer, highlight + default
+//      style words). The state pointer is a pointer to a separately
+//      caller-owned ListState so the widget can mutate scroll/offset
+//      across frames without re-uploading the whole spec.
+//
+//   2. ListState (24 B) -- the mutable state slot: selected item index
+//      (LIST_SELECTED_NONE = 0xFFFFFFFFFFFFFFFF for "no selection") and
+//      topmost visible item index (scroll offset). One reserved u64 is
+//      held for a future revision that may add a per-widget mode word
+//      (e.g. wrap/no-wrap, prefix marker glyph pack) without breaking
+//      the 24-byte wire.
+//
+//   3. list_draw + list_view_pack: the widget_draw entry (WK_LIST arm
+//      hook lands at a later PR bumping widget_kind.pdx) and the
+//      semantic-pipe ListView@0.1 packer. Both follow block.pdx's
+//      shape verbatim so a downstream reader trained on block_draw /
+//      block_view_pack reads this file as a delta rather than a new
+//      idiom.
+//
+// =============================================================================
+// LISTSPEC WIRE (64 bytes, LIST_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect             u64 packed (x, y, w, h) per Rect module wire
+//   [+ 8..+16)   _reserved_a      zero on the wire; future flag byte /
+//                                  border-style ordinal / prefix glyph slot
+//                                  can extend here without breaking the
+//                                  16-byte "rect + rect-meta" span
+//   [+16..+24)   items_ptr        u64 ptr to array of Line structs (24 B each,
+//                                  Text::TEXT_LINE_BYTES layout)
+//   [+24..+32)   item_count       u64
+//   [+32..+40)   state_ptr        u64 ptr to ListState (24 B, layout below).
+//                                  A zero state_ptr is legal and decodes as
+//                                  (selected = LIST_SELECTED_NONE, offset = 0)
+//                                  for a caller that wants a stateless list.
+//   [+40..+48)   highlight_style  u64 packed Style (Style module wire)
+//                                  applied to the selected row.
+//   [+48..+56)   default_style    u64 packed Style applied to every other
+//                                  visible row.
+//   [+56..+64)   _reserved_b      zero on the wire; future
+//                                  ellipsis/marker style word can extend
+//                                  here without breaking 64-byte width.
+//
+// 64 bytes matches an x86_64 cache line, keeps rect + rect-meta in the
+// first 16 bytes (mirroring BlockSpec's 16-byte header shape after the
+// pad/reserved compaction), and gives every subsequent field a natural
+// 8-byte alignment.
+//
+// =============================================================================
+// LISTSTATE WIRE (24 bytes, LIST_STATE_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   selected     u64 index of selected item, or
+//                              LIST_SELECTED_NONE (0xFFFF..FF) for none
+//   [+ 8..+16)   offset       u64 topmost visible item index
+//   [+16..+24)   _reserved    zero on the wire; future mode-flags slot
+//
+// LIST_SELECTED_NONE is 0xFFFFFFFFFFFFFFFF -- distinct from any
+// legitimate item index (item_count is capped by memory long before
+// approaching 2^64-1). Composed at load time via `xor r, r; sub r, 1`
+// rather than a movabs of the imm64 literal, avoiding any encoder
+// disagreement about whether imm64 == 0xFFFF..FF is representable in
+// the mov reg,imm form. Callers reading LIST_SELECTED_NONE from the
+// exported constant get the same value.
+//
+// =============================================================================
+// LISTVIEW@0.1 WIRE (semantic-pipe record; docs/design.md §2.3 example)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic         u32 = 0x5756534C ("LSVW" LE)
+//   [+ 4..+ 8)   record_len    u32 fixed = LSVW_HEADER_BYTES = 40
+//   [+ 8..+16)   rect_pack     u64 verbatim from ListSpec+0 (same wire as
+//                                  a Rect: x/y/w/h each u16, low-to-high)
+//   [+16..+24)   item_count    u64 verbatim from ListSpec+24
+//   [+24..+32)   selected      u64 from state_ptr (or LIST_SELECTED_NONE
+//                                  when state_ptr == 0)
+//   [+32..+40)   offset        u64 from state_ptr (or 0 when state_ptr == 0)
+//
+// MAGIC = 0x5756534C ("LSVW" LE). Derivation: the ASCII bytes L S V W
+// are 0x4C 0x53 0x56 0x57; laid little-endian into a u32 that word
+// reads back as 0x5756534C (byte 0 = 0x4C, byte 1 = 0x53, byte 2 = 0x56,
+// byte 3 = 0x57). Matches Block's own BLKV = 0x564B4C42 pattern
+// (bytes B L K V little-endian). Both magic words fit imm32 as a
+// positive value, so the mov store uses the compact mov r32, imm32
+// path -- no movabs. The alternative candidate 0x57565344 in the
+// prompt would decode as bytes D S V W (0x44 0x53 0x56 0x57) --
+// spelling "DSVW", not "LSVW", so we adopt the corrected 0x5756534C.
+//
+// record_len is FIXED at 40 bytes at v1 (no variable-length trailer);
+// a M2-009 registry landing that wants labels-in-payload can extend
+// the record shape and bump the schema string to "ListView@0.2". No
+// zero-pad step is needed since 40 is already 8-byte aligned.
+//
+// =============================================================================
+// ERROR BAND (single slot, 0xFFFFEBCC)
+// =============================================================================
+//
+// The M2 batch anchors at 0xFFFFEBC0..0xFFFFEBCF (design/architecture.md
+// §5.1). Layout owns 0xFFFFEBC0..0xFFFFEBC4; Width reserves
+// 0xFFFFEBC5..0xFFFFEBC9; Text owns 0xFFFFEBCA (TEXT_ERR_BUF_TOO_SMALL);
+// Text has reserved 0xFFFFEBCB..0xFFFFEBCE for its own future revisions.
+// List picks 0xFFFFEBCC exactly (the sole slot the prompt allocates to
+// this landing) -- a spec-error return that a future revision may repurpose
+// as "bad state ptr / oversized item_count" when list_draw grows hard
+// validation. At v1 nothing in this module returns LST_ERR_BAND (both
+// list_draw and list_view_pack are total: null state_ptr and zero
+// item_count decode to a valid empty render). The sentinel is declared
+// so downstream `cmp rax, LST_ERR_BAND` cascades (staged via a scratch
+// reg because 0xFFFFEBCC exceeds imm32) can be wired without a future
+// header edit.
+//
+// =============================================================================
+// LIST_DRAW SEMANTICS (v1 simplification, documented)
+// =============================================================================
+//
+// For each visible row r in [0, rect.h):
+//   item_idx = offset + r
+//   If item_idx >= item_count: STOP (rows past the item tail are not
+//     touched -- the caller's fill / prior frame remains). Rationale:
+//     matches Ratatui's default of not painting empty rows; keeps the
+//     hot path minimal on partially-full lists. A caller that needs
+//     bg-fill past the tail composes a Clear underneath.
+//   chosen_style = (item_idx == selected) ? highlight_style : default_style
+//   Fill the row [rect.x, rect.x + rect.w) with (space, chosen_style).
+//   Overlay the line's UTF-8 bytes into the row's symbol slots, one
+//     byte per cell, stopping when col_pos >= rect.w. The row's chosen
+//     style stays applied to every overlaid cell (the span's own style
+//     word is NOT threaded through at v1 -- a Ratatui-parity revision
+//     that combines highlight bg with per-span fg lands with the widget
+//     styling pass at M4 alongside TextInput's inline-style overlay).
+//
+// line_display_width is called once per rendered row (per the M2-005
+// contract). Its return value is stored for a diagnostic assert and
+// otherwise consumed only by the truncation check "does line width
+// exceed row width" -- the byte overlay still truncates at bw
+// unconditionally, so a mis-approximation between line_display_width's
+// grapheme accounting and the byte-per-cell fallback here cannot corrupt
+// the frame; it only affects a documented over/under-fill by at most
+// one cell per multi-byte codepoint on the row.
+//
+// Bounds: NO clipping against (rows, cols) -- same posture block_draw
+// takes (docs at block.pdx). Frame::draw / WidgetKind dispatch have
+// already clamped rect against the canvas dims; adding a gate here
+// would double-charge every cell write.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`List`) -- matches file basename;
+//     paideia-as basename resolution ignores the src/widgets/ prefix.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every `cmp reg, imm` / `and reg, imm` uses imm <= 0x7FFFFFFF. The
+//     widest immediate is 0xFFFFFF (24-bit style/rect mask) which fits
+//     imm32 as a positive value.
+//   - Every sentinel > 0x7FFFFFFF (LST_ERR_BAND, LIST_SELECTED_NONE)
+//     is loaded via mov reg,imm (movabs) or composed via xor + sub 1.
+//     NEVER used in cmp/and.
+//   - 2-op `imul reg, reg` only. The 24-byte stride multiply for
+//     Line/Span array indexing runs through a `mov rcx, 24; imul rax,
+//     rcx` pair -- never `imul rax, 24`.
+//   - No `and reg, imm64`. The pad-byte zeroing on style words uses
+//     shl 8 / shr 8 (cell_set_style pattern) rather than an imm64
+//     complement mask.
+//   - `pub let X : type = value` is single-line for every constant.
+//   - Every mov_b load is preceded by `xor reg, reg` (paideia-as pitfall
+//     #1248 load-side zero-extension).
+//   - r11 discipline: list_draw uses r11 only in phases that emit no
+//     `lea`. Every RIP-relative address load in this module resolves
+//     via a bare `mov [ptr + off]` chain -- no `lea` at all.
+//   - SysV push/pop parity:
+//       * list_state_init, list_state_selected, list_state_offset,
+//         list_state_scroll_to, list_view_pack are pure leafs
+//         (no push/pop, no nested call). Alignment is trivial.
+//       * list_draw pushes 5 callee-save regs (rbx / r12 / r13 / r14 /
+//         r15 = 40 B) + sub rsp, 128 (128 B state scratch); entry
+//         rsp%16==8, +40 (5 pushes) ==48==0, +128 ==176==0. Aligned
+//         for the nested `call line_display_width` (bare cross-module
+//         call, no `sub rsp, 8` needed at the callsite since the
+//         function-frame allocation already lands on the 16-byte
+//         boundary).
+//   - Cross-module call convention: bare `call line_display_width` per
+//     the frame.pdx / text.pdx precedent (paideia-as's flat symbol
+//     namespace resolves Text::line_display_width by name without any
+//     module::function prefix).
+//   - Labels prefixed `li_` per docs/design.md fingerprint discipline
+//     (layout.pdx already uses `ls_`, so this module deliberately picks
+//     `li_` to stay disjoint):
+//       li_ss_    list_state_scroll_to
+//       li_lv_    list_view_pack
+//       li_dr_    list_draw (row loop / fill loop / byte loop / etc.)
+
+module List = structure {
+
+  // ==========================================================================
+  // Sizing constants (locked at M2-005 landing).
+  // ==========================================================================
+  pub let LIST_SPEC_BYTES  : u64 = 64
+  pub let LIST_STATE_BYTES : u64 = 24
+
+  // Field offsets. Named so a downstream reader can trace every
+  // displacement back to the LISTSPEC WIRE block in this module header
+  // without decoding raw numerals.
+  pub let LIST_OFF_RECT             : u64 = 0
+  pub let LIST_OFF_RESERVED_A       : u64 = 8
+  pub let LIST_OFF_ITEMS_PTR        : u64 = 16
+  pub let LIST_OFF_ITEM_COUNT       : u64 = 24
+  pub let LIST_OFF_STATE_PTR        : u64 = 32
+  pub let LIST_OFF_HIGHLIGHT_STYLE  : u64 = 40
+  pub let LIST_OFF_DEFAULT_STYLE    : u64 = 48
+  pub let LIST_OFF_RESERVED_B       : u64 = 56
+
+  pub let LIST_STATE_OFF_SELECTED : u64 = 0
+  pub let LIST_STATE_OFF_OFFSET   : u64 = 8
+  pub let LIST_STATE_OFF_RESERVED : u64 = 16
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x4C offset = 0xFFFFEBCC. Sits inside the M2 slice
+  // 0xFFFFEBC0..0xFFFFEBCF (design/architecture.md §5.1); disjoint from
+  // Layout (0xFFFFEBC0..C4), Width reserved (0xFFFFEBC5..C9), and Text
+  // (0xFFFFEBCA plus reserved 0xFFFFEBCB..CE).
+  //
+  // Sentinel > 0x7FFFFFFF -- mov reg,imm emits movabs; NEVER used in
+  // cmp/and. At v1 no v1 body returns this (list_draw and
+  // list_view_pack are total under every documented input); the
+  // declaration lets a future revision that grows hard validation
+  // wire the return without a header edit.
+  // ==========================================================================
+  pub let LST_ERR_BAND : u64 = 0xFFFFEBCC
+
+  // ==========================================================================
+  // ListView@0.1 semantic-pipe wire (docs/design.md §2.3 example).
+  //
+  // MAGIC 0x5756534C = "LSVW" little-endian (byte 0=0x4C 'L', byte 1=
+  // 0x53 'S', byte 2=0x56 'V', byte 3=0x57 'W'). Same pattern Block's
+  // BLKV = 0x564B4C42 uses. Fits imm32 as a positive value; the
+  // packer uses the compact mov r32,imm32 store path.
+  // ==========================================================================
+  pub let LSVW_MAGIC          : u64 = 0x5756534C
+  pub let LSVW_HEADER_BYTES   : u64 = 40
+  pub let LSVW_OFF_MAGIC      : u64 = 0
+  pub let LSVW_OFF_RECORD_LEN : u64 = 4
+  pub let LSVW_OFF_RECT       : u64 = 8
+  pub let LSVW_OFF_ITEM_COUNT : u64 = 16
+  pub let LSVW_OFF_SELECTED   : u64 = 24
+  pub let LSVW_OFF_OFFSET     : u64 = 32
+
+  // Schema name ("ListView@0.1", NUL-terminated -- the string a
+  // M2-009 BLAKE3-based schema-hash constant would be computed against,
+  // kept here as the authoritative source so the M2-009 hash landing
+  // has exactly one string to hash and there is no risk of a
+  // byte-for-byte drift between the packer and the hash computation).
+  pub let LSVW_SCHEMA_NAME     : [u8; 13] = "ListView@0.1\0"
+  pub let LSVW_SCHEMA_NAME_LEN : u64 = 12
+
+  // ==========================================================================
+  // list_state_init(slot_ptr, selected, offset) -> ()
+  //
+  // Pack a ListState into 24 bytes at [slot_ptr..slot_ptr+24). Fields
+  // are stored verbatim; the reserved slot is explicitly zeroed.
+  //
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (three 8-byte stores).
+  // ==========================================================================
+  pub let list_state_init : (u64, u64, u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) (selected: u64) (offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_state_init writes 24 bytes of ListState into [rdi..rdi+24). Three 8-byte stores at offsets 0/8/16: selected (rsi), offset (rdx), reserved (xor rax explicit zero). Zeroing the reserved slot preserves the wire's zero-on-write invariant even when the caller reuses stale memory. Pure leaf: no callee-save touched, no push/pop, no nested call. Every immediate offset (0, 8, 16) fits imm32 trivially. Effect `!{mem}` (three 8-byte stores).",
+      block: {
+        mov [rdi + 0],  rsi;
+        mov [rdi + 8],  rdx;
+        xor rax, rax;
+        mov [rdi + 16], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // list_state_selected(slot_ptr) -> u64
+  // list_state_offset(slot_ptr) -> u64
+  //
+  // Field accessors. Each is a single 8-byte load from the fixed offset.
+  // ==========================================================================
+  pub let list_state_selected : (u64) -> u64 !{mem} @{} =
+    fn (slot_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_state_selected returns the u64 at [rdi+0]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 0];
+        ret;
+      }
+    }
+
+  pub let list_state_offset : (u64) -> u64 !{mem} @{} =
+    fn (slot_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_state_offset returns the u64 at [rdi+8]. Single 8-byte load. Pure leaf.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // list_state_scroll_to(state_ptr, index, viewport_height) -> ()
+  //
+  // Adjust the state's offset so `index` falls within the visible
+  // range [offset, offset + viewport_height).
+  //
+  //   if index < offset:              offset = index                (scroll up)
+  //   else if index >= offset + vh:   offset = index - vh + 1       (scroll down)
+  //   else:                           no change
+  //
+  // Degenerate viewport_height == 0: the second branch fires whenever
+  // index >= offset (since offset + 0 == offset), producing new_offset
+  // = index + 1. That value is defensible as "one past the caller's
+  // requested cursor" -- a caller with vh == 0 has already given up
+  // rendering anything, so the offset value cannot affect visible
+  // output; documented behavior only.
+  //
+  // Register plan: rdi=state_ptr, rsi=index, rdx=viewport_height.
+  // rax = offset scratch + new offset; rcx = offset + vh scratch.
+  // Pure leaf: no callee-save touched, no push/pop, no nested call.
+  // Effect `!{mem}` (one 8-byte load + at most one 8-byte store).
+  // Labels prefixed li_ss_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let list_state_scroll_to : (u64, u64, u64) -> () !{mem} @{} =
+    fn (state_ptr: u64) (index: u64) (viewport_height: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_state_scroll_to nudges the state's offset (at [rdi+8]) to keep `index` inside [offset, offset+viewport_height). Load current offset into rax. If index (rsi) < rax: store index into [rdi+8]; ret (scroll up). Otherwise compute rcx = rax + rdx (offset + vh) and if rsi < rcx: ret (already visible; no change). Otherwise compute new offset = rsi - rdx + 1 into rax; store; ret (scroll down). Every cmp compares two registers or a register vs 0; no cmp reg,imm > 0x7FFFFFFF. `sub` / `add` with imm 1 fits imm8. No `test`, no `imul`, no `and reg,imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (one 8-byte load + at most one 8-byte store). Labels prefixed li_ss_ per docs fingerprint discipline.",
+      block: {
+        // rax = current offset
+        mov rax, [rdi + 8];
+
+        // Scroll up: index < offset ?
+        cmp rsi, rax;
+        jae li_ss_check_hi;
+        mov [rdi + 8], rsi;
+        ret;
+
+      li_ss_check_hi:
+        // rcx = offset + viewport_height
+        mov rcx, rax;
+        add rcx, rdx;
+
+        // Already visible: index < offset + vh ?
+        cmp rsi, rcx;
+        jb  li_ss_done;
+
+        // Scroll down: new_offset = index - vh + 1
+        mov rax, rsi;
+        sub rax, rdx;
+        add rax, 1;
+        mov [rdi + 8], rax;
+
+      li_ss_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // list_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature -- a later WidgetKind edit routes
+  // WK_LIST to this function via the same shape block_draw uses. `rows`
+  // is not read by this body (row indexing is via the ListSpec's rect,
+  // not the canvas dims), kept for signature uniformity so a compare-
+  // chain dispatch does not have to reshape args per widget.
+  //
+  // See LIST_DRAW SEMANTICS in the module header for the render algorithm.
+  //
+  // Return: always 0 (OK) at v1. list_draw is total under every
+  // documented input: null state_ptr, zero item_count, zero rect.w,
+  // zero rect.h, offset past item_count -- all draw NOTHING and return
+  // 0. A future revision may return an LST_ERR_BAND sentinel for e.g.
+  // hard validation of state_ptr alignment; the u64 return is reserved
+  // now so that later widening does not change the widget_draw ABI.
+  //
+  // Callee-save plan (5 pushes = 40 B, rsp aligns from entry 8 to 0):
+  //   rbx = buf_ptr
+  //   r12 = cols
+  //   r13 = spec_ptr
+  //   r14 = items_ptr
+  //   r15 = alignment-only push (never read or written in the body;
+  //          gives a future revision room for a fifth persistent
+  //          register without touching the frame shape)
+  //
+  // Stack scratch (sub rsp, 128 keeps rsp%16 == 0):
+  //   [rsp+  0)  selected               (from state or LIST_SELECTED_NONE)
+  //   [rsp+  8)  offset                 (from state or 0)
+  //   [rsp+ 16)  item_count             (from spec+24)
+  //   [rsp+ 24)  highlight_style        (from spec+40)
+  //   [rsp+ 32)  default_style          (from spec+48)
+  //   [rsp+ 40)  bx                     (rect.x, 16-bit widened to u64)
+  //   [rsp+ 48)  by                     (rect.y)
+  //   [rsp+ 56)  bw                     (rect.w)
+  //   [rsp+ 64)  bh                     (rect.h)
+  //   [rsp+ 72)  row_r                  (visible row idx, 0..bh)
+  //   [rsp+ 80)  col_pos                (column within row, 0..bw)
+  //   [rsp+ 88)  current_style          (chosen for the current row)
+  //   [rsp+ 96)  spans_base             (Line's spans_ptr)
+  //   [rsp+104)  span_count             (Line's span_count)
+  //   [rsp+112)  span_idx               (0..span_count)
+  //   [rsp+120)  pad                    (unused; keeps allocation multiple
+  //                                       of 16)
+  //
+  // Labels prefixed li_dr_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let list_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_draw renders the visible slice of a ListSpec into the canvas back-region. Push rbx/r12/r13/r14/r15 (5 pushes, 40 bytes, rsp aligned per SysV -- matches block_draw discipline), sub rsp, 128 for state scratch (rsp%16 stays 0). Cache buf_ptr in rbx, cols in r12, spec_ptr in r13, items_ptr in r14 (loaded once from [r13+16]). Prologue loads: item_count from [r13+24] into [rsp+16]; highlight_style from [r13+40] into [rsp+24]; default_style from [r13+48] into [rsp+32]. Rect decode: load [r13+0], extract bx/by/bw/bh via mov+and 0xFFFF and mov+shr+and 0xFFFF pattern; store each into [rsp+40..72] (u64-widened; every mask 0xFFFF fits imm32). Zero-dim bail: if bw==0 or bh==0, jump to epilogue with rax=0 without doing any writes -- the buffer is preserved as-is. State decode: load state_ptr from [r13+32]; if 0, compose selected via xor+sub 1 = LIST_SELECTED_NONE and offset = 0, else load [state+0] and [state+8]; store both to [rsp+0], [rsp+8]. Row loop (phase R): xor row_r=[rsp+72]; while row_r < bh: item_idx = offset + row_r; if item_idx >= item_count: break (item tail; leave remaining rows untouched per the LIST_DRAW SEMANTICS block); chosen_style = (item_idx == selected) ? highlight_style : default_style -- computed via cmp/je + two mov-from-stack; store into [rsp+88]; line_ptr = items_ptr + item_idx * 24 (24 in rcx scratch, imul rax, rcx -- 2-op reg,reg, paideia-as-safe); call line_display_width(line_ptr) for the row-fit check (the return in rax is not consumed at v1; the byte overlay truncates at bw independently -- the call executes for its documented side-effect of validating the spans array shape); reload line_ptr (not stored across the call since callee-save r14=items_ptr and stack items_ptr recompute is cheap). Fill phase (F): col_pos = 0; while col_pos < bw: compute dst = buf + ((by+row_r)*cols + (bx+col_pos))*16 into rax via mov+add+imul (2-op reg,reg)+add+add+shl 4+add; write cell as (word0 = 0x20 | (style<<32), word1 = (style>>32) & 0xFFFFFF) using the Cell wire mapping worked out in the module header (Style bits [0..32) land at Cell word0 bits [32..64); Style bits [32..56) land at Cell word1 bits [0..24); the pad byte at Style bit [56..64) is not shifted in, so word1's top 40 bits stay zero -- Cell reserved bytes 11..15 stay zero). col_pos++. Overlay phase (O): reload line_ptr from items_ptr + item_idx*24; load spans_base from [line+0] into [rsp+96]; load span_count from [line+8] into [rsp+104]; xor span_idx = [rsp+112] = 0; col_pos = 0 (reloaded to [rsp+80]); outer while span_idx < span_count AND col_pos < bw: span_slot = spans_base + span_idx * 24 (imul reg,reg via rcx=24); load sp = [span_slot+0], sl = [span_slot+8]; inner byte_i loop 0..sl: if col_pos >= bw: break outer; xor rax,rax; mov_b rax, [sp+byte_i]; compute dst; write byte into cell symbol slot only via `mov_d [dst+0], byte_reg` (leaves fg/bg/mods bytes 4..11 from the fill phase intact -- same shortcut block_draw's title path uses). col_pos++. Span-end: span_idx++. Row-end: row_r++. Epilogue: xor rax, rax (return 0=OK); add rsp, 128; pop r15/r14/r13/r12/rbx (reverse order); ret. Every immediate (0, 1, 16, 24, 40, 48, 96, 104, 112, 128, 0xFFFF, 0xFFFFFF, shift counts 4/16/32/48) fits imm32; every shift count fits imm8. 2-op imul is only ever `imul reg, reg` (24-stride via rcx=24; row*cols via r12; item_idx*24 via rcx=24). No `test`; every mov_b load is preceded by `xor reg, reg`. Cross-module call to line_display_width is bare `call line_display_width` per frame.pdx/text.pdx precedent. Effect `!{mem}` (fill cell stores + overlay byte stores + transitive line_display_width memory reads). Labels prefixed li_dr_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 128;
+
+        // ---- Prologue: cache invariants ------------------------------------
+        mov rbx, rsi;                    // rbx = buf_ptr
+        mov r12, rcx;                    // r12 = cols
+        mov r13, rdi;                    // r13 = spec_ptr
+        mov r14, [r13 + 16];             // r14 = items_ptr
+
+        // Cache item_count / styles on the stack.
+        mov rax, [r13 + 24];
+        mov [rsp + 16], rax;             // item_count
+        mov rax, [r13 + 40];
+        mov [rsp + 24], rax;             // highlight_style
+        mov rax, [r13 + 48];
+        mov [rsp + 32], rax;             // default_style
+
+        // ---- Extract rect fields --------------------------------------------
+        mov r8, [r13 + 0];               // r8 = packed rect
+
+        mov rax, r8;
+        and rax, 0xFFFF;
+        mov [rsp + 40], rax;             // bx
+
+        mov rax, r8;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 48], rax;             // by
+
+        mov rax, r8;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 56], rax;             // bw
+
+        mov rax, r8;
+        shr rax, 48;
+        mov [rsp + 64], rax;             // bh
+
+        // Zero-dim bail: bw == 0 || bh == 0 -> success, no writes.
+        mov rax, [rsp + 56];
+        cmp rax, 0;
+        je  li_dr_ret;
+        mov rax, [rsp + 64];
+        cmp rax, 0;
+        je  li_dr_ret;
+
+        // ---- Load ListState -------------------------------------------------
+        mov rdi, [r13 + 32];             // rdi = state_ptr (transient)
+        cmp rdi, 0;
+        je  li_dr_no_state;
+
+        mov rax, [rdi + 0];
+        mov [rsp + 0], rax;              // selected
+        mov rax, [rdi + 8];
+        mov [rsp + 8], rax;              // offset
+        jmp li_dr_state_ok;
+
+      li_dr_no_state:
+        // selected = LIST_SELECTED_NONE = 0xFFFFFFFFFFFFFFFF (compose
+        // via xor+sub 1 rather than imm64 literal load).
+        xor rax, rax;
+        sub rax, 1;
+        mov [rsp + 0], rax;
+        xor rax, rax;
+        mov [rsp + 8], rax;              // offset = 0
+
+      li_dr_state_ok:
+        // ---- Row loop (phase R) --------------------------------------------
+        xor rax, rax;
+        mov [rsp + 72], rax;             // row_r = 0
+
+      li_dr_row_top:
+        mov rax, [rsp + 72];             // row_r
+        mov rcx, [rsp + 64];             // bh
+        cmp rax, rcx;
+        jae li_dr_ret;
+
+        // item_idx = offset + row_r
+        mov rdx, [rsp + 8];              // offset
+        add rdx, rax;                    // rdx = item_idx
+
+        // If item_idx >= item_count: stop.
+        mov rcx, [rsp + 16];             // item_count
+        cmp rdx, rcx;
+        jae li_dr_ret;
+
+        // ---- Choose row style ----------------------------------------------
+        mov rax, [rsp + 0];              // selected
+        cmp rdx, rax;
+        jne li_dr_pick_default;
+        mov rax, [rsp + 24];             // highlight_style
+        jmp li_dr_pick_done;
+      li_dr_pick_default:
+        mov rax, [rsp + 32];             // default_style
+      li_dr_pick_done:
+        mov [rsp + 88], rax;             // current_style
+
+        // ---- line_ptr = items_ptr + item_idx * 24 --------------------------
+        // (2-op imul reg,reg only)
+        mov rax, rdx;                    // item_idx
+        mov rcx, 24;
+        imul rax, rcx;
+        add rax, r14;
+        // rax = line_ptr
+
+        // Row-fit check: call line_display_width(line_ptr). The return
+        // value in rax is consumed only informationally at v1; the
+        // byte overlay in phase O truncates at bw independently. The
+        // call still executes for its documented row-fit contract.
+        mov rdi, rax;
+        call line_display_width;
+
+        // ---- Fill phase (phase F): fill row with (space, chosen_style) -----
+        xor rax, rax;
+        mov [rsp + 80], rax;             // col_pos = 0
+
+      li_dr_fill_top:
+        mov rax, [rsp + 80];             // col_pos
+        mov rcx, [rsp + 56];             // bw
+        cmp rax, rcx;
+        jae li_dr_overlay_start;
+
+        // dst = buf + ((by + row_r) * cols + (bx + col_pos)) * 16
+        mov rax, [rsp + 48];             // by
+        mov rcx, [rsp + 72];             // row_r
+        add rax, rcx;
+        imul rax, r12;                   // * cols (imul reg,reg)
+        mov rcx, [rsp + 40];             // bx
+        add rax, rcx;
+        mov rcx, [rsp + 80];             // col_pos
+        add rax, rcx;
+        shl rax, 4;                      // * 16
+        add rax, rbx;                    // + buf_ptr
+        // rax = dst
+
+        // Write cell = (space, chosen_style).
+        // word0 = 0x20 | (style << 32) [style has bits [0..32) placed
+        //  at [32..64), spanning fg + bg.r]
+        mov rcx, [rsp + 88];             // current_style
+        shl rcx, 32;
+        or  rcx, 0x20;                   // sym = space
+        mov [rax + 0], rcx;
+
+        // word1 = (style >> 32) & 0xFFFFFF [places bg.g at [0..8),
+        //  bg.b at [8..16), mods at [16..24); reserved bytes stay 0]
+        mov rcx, [rsp + 88];
+        shr rcx, 32;
+        and rcx, 0xFFFFFF;
+        mov [rax + 8], rcx;
+
+        mov rax, [rsp + 80];
+        add rax, 1;
+        mov [rsp + 80], rax;             // col_pos++
+        jmp li_dr_fill_top;
+
+        // ---- Overlay phase (phase O): stamp span bytes into symbol slots ---
+      li_dr_overlay_start:
+        // Recompute line_ptr = items_ptr + item_idx * 24. item_idx
+        // was in rdx before the fill loop; that register is now
+        // clobbered. Re-derive from (offset + row_r).
+        mov rax, [rsp + 8];              // offset
+        mov rcx, [rsp + 72];             // row_r
+        add rax, rcx;
+        mov rcx, 24;
+        imul rax, rcx;
+        add rax, r14;                    // rax = line_ptr
+
+        // Load spans_base / span_count into stack.
+        mov rcx, [rax + 0];              // spans_base
+        mov [rsp + 96], rcx;
+        mov rcx, [rax + 8];              // span_count
+        mov [rsp + 104], rcx;
+
+        // span_idx = 0; col_pos = 0.
+        xor rax, rax;
+        mov [rsp + 112], rax;            // span_idx
+        mov [rsp + 80], rax;             // col_pos = 0 (reset for overlay)
+
+      li_dr_span_top:
+        // Truncation gate: stop if col_pos >= bw.
+        mov rax, [rsp + 80];
+        mov rcx, [rsp + 56];             // bw
+        cmp rax, rcx;
+        jae li_dr_row_next;
+
+        // Span-array bound: stop if span_idx >= span_count.
+        mov rax, [rsp + 112];            // span_idx
+        mov rcx, [rsp + 104];            // span_count
+        cmp rax, rcx;
+        jae li_dr_row_next;
+
+        // span_slot = spans_base + span_idx * 24
+        mov rax, [rsp + 112];
+        mov rcx, 24;
+        imul rax, rcx;
+        mov rcx, [rsp + 96];             // spans_base
+        add rax, rcx;
+        // rax = span_slot
+
+        // Load sp (r10 = span byte ptr) and sl (r11 = span byte len).
+        mov r10, [rax + 0];
+        mov r11, [rax + 8];
+
+        // Inner byte loop: byte_i (rcx) from 0 to sl.
+        xor rcx, rcx;
+
+      li_dr_byte_top:
+        // sl bound.
+        cmp rcx, r11;
+        jae li_dr_span_next;
+
+        // Truncation gate inside the byte loop (col_pos may have
+        // reached bw mid-span).
+        mov rax, [rsp + 80];
+        mov rdx, [rsp + 56];             // bw
+        cmp rax, rdx;
+        jae li_dr_row_next;
+
+        // Load byte -> rdx.
+        xor rdx, rdx;
+        mov_b rdx, [r10 + rcx + 0];
+
+        // dst = buf + ((by + row_r) * cols + (bx + col_pos)) * 16
+        // Use r8 as scratch here (rcx = byte_idx, r10/r11 = span state,
+        // rdx = loaded byte, all live across the address compute).
+        mov rax, [rsp + 48];             // by
+        mov r8,  [rsp + 72];             // row_r
+        add rax, r8;
+        imul rax, r12;                   // * cols (imul reg,reg)
+        mov r8,  [rsp + 40];             // bx
+        add rax, r8;
+        mov r8,  [rsp + 80];             // col_pos
+        add rax, r8;
+        shl rax, 4;                      // * 16
+        add rax, rbx;                    // + buf_ptr
+
+        // Overlay: stamp byte into the cell's 4-byte symbol slot;
+        // upper 3 bytes cleared so a stale multi-byte glyph left by
+        // an earlier frame does not bleed through. Fg/bg/mods bytes
+        // 4..11 stay from the fill phase's chosen_style.
+        mov_d [rax + 0], rdx;
+
+        // col_pos++, byte_i++.
+        mov rax, [rsp + 80];
+        add rax, 1;
+        mov [rsp + 80], rax;
+        add rcx, 1;
+        jmp li_dr_byte_top;
+
+      li_dr_span_next:
+        mov rax, [rsp + 112];
+        add rax, 1;
+        mov [rsp + 112], rax;
+        jmp li_dr_span_top;
+
+      li_dr_row_next:
+        mov rax, [rsp + 72];
+        add rax, 1;
+        mov [rsp + 72], rax;
+        jmp li_dr_row_top;
+
+      li_dr_ret:
+        xor rax, rax;
+        add rsp, 128;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // list_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a ListView@0.1 semantic-pipe record into [dst..dst+40). The
+  // record shape is fixed (no variable-length trailer) at v1, so
+  // record_len is always LSVW_HEADER_BYTES = 40 and no zero-pad step
+  // is needed (40 is already 8-byte aligned).
+  //
+  // The actual `semantic_pipe::send_record` call is deferred to
+  // postui.M2-009 (see block_view_pack's module header for the same
+  // deferral rationale). This packer is the wire-format authority so
+  // M2-009's registry glue only has to know:
+  //   - the schema name string LSVW_SCHEMA_NAME (for BLAKE3 hashing)
+  //   - list_view_pack (for the byte payload)
+  // and does not have to re-derive the offset table.
+  //
+  // Register plan: rdi=spec_ptr (read-only), rsi=dst (write-only until
+  // return), rax=scratch/return, rcx=state_ptr scratch, rdx=selected
+  // scratch, r8=offset scratch. Pure leaf: no callee-save touched, no
+  // push/pop, no nested call. Effect `!{mem}` (reads through rdi,
+  // writes through rsi).
+  // Labels prefixed li_lv_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let list_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-005 (postui#14): list_view_pack lays a ListView@0.1 record at [rsi..rsi+40). Header phase writes the fixed scalar fields in one straight-line sequence: `mov rax, 0x5756534C` then `mov_d [rsi+0], rax` stamps the LSVW magic (0x5756534C = 1_465_142_604 fits imm32 so paideia-as emits the compact 5-byte mov r32, imm32 form, not the 10-byte movabs). record_len is fixed at 40 -- `mov rax, 40; mov_d [rsi+4], rax` (imm32-safe). The 8-byte packed Rect at [rdi+0] copies verbatim to [rsi+8] in one qword store -- ListSpec's rect and ListView's rect_pack share the identical Rect wire (x u16 | y u16 | w u16 | h u16 low-to-high). item_count at [rdi+24] copies verbatim to [rsi+16]. State fields: load state_ptr from [rdi+32]; if 0, compose LIST_SELECTED_NONE (xor rdx, rdx; sub rdx, 1) as selected and offset = 0, else load selected from [state+0] and offset from [state+8] verbatim. Store selected at [rsi+24], offset at [rsi+32]. Return 40 in rax. Every immediate (0, 4, 8, 16, 24, 32, 40, 0x5756534C) fits imm32. No `test`, no `imul`, no `and reg,imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (reads through rdi, writes through rsi). Labels prefixed li_lv_ per docs fingerprint discipline.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x5756534C;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] --------------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (8 bytes) at [rsi + 8] ---------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- item_count (u64) at [rsi + 16] --------------------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 16], rax;
+
+        // ---- Load state fields (or compose defaults) ----------------------
+        mov rcx, [rdi + 32];             // state_ptr
+        cmp rcx, 0;
+        je  li_lv_no_state;
+
+        mov rdx, [rcx + 0];              // selected
+        mov r8,  [rcx + 8];              // offset
+        jmp li_lv_state_ok;
+
+      li_lv_no_state:
+        // selected = LIST_SELECTED_NONE = 0xFFFFFFFFFFFFFFFF
+        xor rdx, rdx;
+        sub rdx, 1;
+        // offset = 0
+        xor r8, r8;
+
+      li_lv_state_ok:
+        // ---- selected (u64) at [rsi + 24] ---------------------------------
+        mov [rsi + 24], rdx;
+
+        // ---- offset (u64) at [rsi + 32] -----------------------------------
+        mov [rsi + 32], r8;
+
+        // ---- record_len return -------------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
