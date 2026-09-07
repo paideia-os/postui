@@ -1,0 +1,768 @@
+// src/widgets/sparkline.pdx -- postui.M3-003 (paideia-os/postui#22)
+//
+// Sparkline widget: integer-normalized bar-history column strip.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M3-003)
+// =============================================================================
+//
+// Sparkline is the 7th ordinal (WK_SPARKLINE = 6) in the closed widget
+// catalog and the third M3 widget-body landing after Fixed64 (M3-001)
+// and Gauge (M3-002). Same widget_draw-shape entry as every other
+// renderer (spec_ptr, buf_ptr, rows, cols) -> u64. Draws a strip of
+// vertical bars, one bar per column across the Rect's width, each
+// bar's height proportional to values[i] / max where max is either
+// caller-supplied (max_override != 0) or computed as max(values[]).
+//
+// This file ships:
+//   - The SparklineSpec state record (40-byte struct laid out in
+//     memory; see WIRE block below).
+//   - The eight partial-bar glyph u32 slots as one 32-byte .rodata
+//     table (spk_glyph_partial). Slot 0 is a space and unused during
+//     bar draw -- the partial-top load site indexes by rem = height % 8
+//     in [1..7]. Slot layout kept as full 8-entry pow-of-2 stride so
+//     the load site can emit `mov_d reg, [table + rem*4]` without a
+//     branch on the rem==0 case (the caller-side gate `cmp rem, 0; je`
+//     short-circuits the whole partial stamp).
+//   - sparkline_draw: the widget_draw-shape entry that fills the Rect
+//     with space then overlays one full-block column of the appropriate
+//     height per data point.
+//   - sparkline_view_pack: pack a SparklineView@0.1 semantic-pipe
+//     record into caller-provided memory (M2-009/M5 wires the actual
+//     semantic_pipe::send_record call).
+//
+// =============================================================================
+// SIGNATURE DEVIATION FROM ISSUE TEXT
+// =============================================================================
+//
+// The postui#22 issue text says "Rect (16B)" as the first SparklineSpec
+// slot. postui's Rect wire is a packed u64 (RECT_BYTES = 8, see
+// src/rect.pdx L55) -- storing a Rect uses 8 bytes, not 16. Adding 8
+// bytes of padding after the rect slot to hit the issue's "~48B"
+// estimate would create a caller-visible field-offset drift with no
+// offsetting benefit; every subsequent u64 slot would slip by 8 and
+// break any pre-existing SPARKLINE_OFF_* pointer arithmetic downstream
+// widgets or tests keyed against. This landing takes the tight 40-byte
+// layout (8 + 4*u64 = 40) and documents the deviation here, mirroring
+// scrollbar_view's 56-vs-issue-48 correction (src/widgets/scrollbar.pdx
+// L57..67).
+//
+// =============================================================================
+// SPARKLINESPEC WIRE (40 bytes, SPARKLINE_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect             u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  values_ptr       u64 pointer to a caller-owned array of
+//                                    u64 data points (values_ptr may be 0
+//                                    only if value_count is also 0; the
+//                                    draw path treats that pair as an
+//                                    empty spark and stamps the space
+//                                    background but no bars).
+//   [+16..+24) value_count      u64 number of points in values[] (draw
+//                                    reads up to min(value_count, Rect.w)
+//                                    to cap render cost at Rect.w
+//                                    columns; the rightmost data points
+//                                    of a longer series are dropped, not
+//                                    the leftmost -- callers wanting a
+//                                    ring-buffer newest-N view must
+//                                    reslice their pointer before the
+//                                    call).
+//   [+24..+32) max_override     u64 normalization ceiling. 0 selects
+//                                    auto-max = max(values[]); any
+//                                    non-zero value uses this constant
+//                                    directly, letting a caller pin a
+//                                    stable Y-axis across successive
+//                                    frames (matches Ratatui's
+//                                    Sparkline::max builder).
+//   [+32..+40) style            u64 packed Style (fg | bg<<24 | mods<<48)
+//
+// 40 bytes rather than the issue-text's aspirational "~48B" because
+// Rect is a packed u64 in this codebase (see SIGNATURE DEVIATION). The
+// tight 40 keeps every field at its natural 8-byte boundary and avoids
+// a "reserved" hole a downstream reader might mistake for a live slot.
+// 40 is not a power of two -- neither is BLOCK_SPEC_BYTES (48) nor
+// TABS_SPEC_BYTES (48); no widget-side hot path crosses a cache line
+// on a struct read (draw reads every field ONCE at prologue and stashes
+// derived values into stack scratch).
+//
+// =============================================================================
+// GLYPH TABLE (spk_glyph_partial: 8 x u32, 32 bytes)
+// =============================================================================
+//
+// Eight 4-byte slots holding the u32-packed 3-byte UTF-8 sequence for
+// the eight one-eighth-quantized fill glyphs plus one unused slot 0.
+// Layout is indexed by `rem = height % 8` (fill remainder in 1/8ths of
+// a cell). Slot 0 holds the ASCII space (0x20) as a defensive
+// fallback -- the draw path never loads slot 0 (a rem == 0 case skips
+// the whole partial stamp), but a debugger that misses the gate would
+// see a printable byte rather than a stale value.
+//
+// Byte sequence per slot (little-endian dword; byte 3 = 0 pad):
+//
+//   idx 0 : ' '  (U+0020) 0x20 0x00 0x00     -> 0x00000020  (unused)
+//   idx 1 : LOWER ONE EIGHTH BLOCK   U+2581  bytes 0xE2 0x96 0x81  -> 0x008196E2
+//   idx 2 : LOWER ONE QUARTER BLOCK  U+2582  bytes 0xE2 0x96 0x82  -> 0x008296E2
+//   idx 3 : LOWER THREE EIGHTHS BLOCK U+2583 bytes 0xE2 0x96 0x83  -> 0x008396E2
+//   idx 4 : LOWER HALF BLOCK          U+2584 bytes 0xE2 0x96 0x84  -> 0x008496E2
+//   idx 5 : LOWER FIVE EIGHTHS BLOCK  U+2585 bytes 0xE2 0x96 0x85  -> 0x008596E2
+//   idx 6 : LOWER THREE QUARTERS BLOCK U+2586 bytes 0xE2 0x96 0x86 -> 0x008696E2
+//   idx 7 : LOWER SEVEN EIGHTHS BLOCK  U+2587 bytes 0xE2 0x96 0x87 -> 0x008796E2
+//
+// The full-block glyph FULL BLOCK U+2588 (bytes 0xE2 0x96 0x88 ->
+// 0x008896E2) is NOT in this table -- it is a compile-time constant
+// (SPARKLINE_GLYPH_FULL) OR'd into style_high in the draw prologue and
+// loaded straight from stack scratch inside the full-cell hot loop,
+// which lets that loop's body compress to two 8-byte stores per cell
+// with no per-iteration glyph-load / OR fold.
+//
+// Every slot value fits imm32 (< 0x80000000) so a `mov reg, imm` on any
+// constant SPARKLINE_GLYPH_* emits the compact 5-byte `mov r32, imm32`
+// form. Table reads use `xor reg, reg; mov_d reg, [base + rem*4]`
+// (paideia-as pitfall #1248: mov_d does NOT zero-extend on x86_64 --
+// pre-zero the destination register defensively; see width.pdx L285).
+//
+// =============================================================================
+// BAR-HEIGHT GEOMETRY
+// =============================================================================
+//
+// Per data point v at column c:
+//
+//   height_1_8 = (v * bh * 8) / max     -- height in 1/8-cell units
+//   height_1_8 = min(height_1_8, bh * 8) -- clamp so a value >= max does
+//                                            not overflow the rect (only
+//                                            matters when max_override
+//                                            is set below max(values[]))
+//   full = height_1_8 / 8               -- whole cells of full-block █
+//   rem  = height_1_8 & 7               -- remainder in [0..7]
+//
+// Render order per column (bottom-up):
+//   rows [y_bottom, y_bottom - full + 1] : stamp █ (full block)
+//   row  y_bottom - full                 : if rem > 0, stamp glyph[rem]
+//   rows above the partial-top           : left as space (from phase-1 fill)
+//
+// where y_bottom = by + bh - 1 (bottom-most row of the Rect).
+//
+// Div-by-zero guards:
+//   - max == 0 after auto-scan (i.e. all values are zero OR value_count
+//                              is 0)  -> max_val is clamped to 1 before
+//                                          the div; the numerator is
+//                                          also 0 in that case so every
+//                                          height_1_8 evaluates to 0
+//                                          (no bar stamps, only the
+//                                          space background).
+//   - max_override is loaded directly into r15; if the caller passes 0
+//     the auto-scan path takes over.
+//
+// Every product is a u64 * u64 -> u64 (2-op imul reg, reg,
+// paideia-as-safe). Every division is `xor rdx, rdx; div reg` to keep
+// the dividend in rax with a clean high half.
+//
+// =============================================================================
+// SPARKLINEVIEW@0.1 WIRE (semantic-pipe record, 32 bytes fixed)
+// =============================================================================
+//
+//   [+0..+4)   magic            u32 = 0x57565053 ("SPVW" LE:
+//                                    'S' 0x53, 'P' 0x50, 'V' 0x56, 'W' 0x57)
+//   [+4..+8)   record_len       u32 = 32 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack        u64 verbatim from SparklineSpec+0
+//   [+16..+24) value_count      u64 verbatim from SparklineSpec+16
+//   [+24..+32) max_override     u64 verbatim from SparklineSpec+24
+//
+// values_ptr is deliberately excluded -- it is a process-local pointer
+// with no semantically meaningful value for a downstream consumer
+// (a semantic-pipe reader looking at the sparkline's *shape*, not the
+// caller's memory). style is also excluded -- visual attribute only,
+// matching BlockView@0.1's exclusion of fill_cell and ScrollbarView's
+// exclusion of style_track / style_thumb.
+//
+// record_len is fixed at 32 bytes and already 8-aligned, so no padding
+// loop is needed -- every field write is a single load/store pair.
+// Full u64 slots for value_count and max_override (no u32 truncation
+// like ScrollbarView takes for position/content_length/viewport_length)
+// because both fields are semantically load-bearing for a downstream
+// analyzer: a sparkline over > 4G data points is unusual but not
+// architecturally out of scope, and a max_override up to 2^64-1 must
+// round-trip verbatim so a consumer can detect the caller's chosen
+// ceiling. If a future SparklineView@0.2 needs to add a values_hash or
+// a min slot, it grows the record; existing readers keying against
+// magic + record_len self-describe the extension safely.
+//
+// A future postui.M2-009 revision that adds SEMANTIC_SCHEMA_SPVW to
+// src/semantic_registry.pdx (currently ships BLKV/PGVW/LSVW/TBVW/TABV/
+// SBVW only, up through M2) will use 0x57565053 as the schema hash --
+// same v1 posture every other <TAG>_MAGIC took. Not part of this
+// landing (issue #22 scope names src/widgets/sparkline.pdx as the sole
+// source touched); the schema registration is a follow-up M3-close-out
+// alongside the other M3 widgets.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Sparkline`), matches file
+//     basename (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_d dword-load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension; see width.pdx L285).
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 7,
+//     0, 1, 2, 3, 4, 8, 32, shift counts <= 56. The error sentinel
+//     0xFFFFEBD3 and the packed style/glyph words > 0x7FFFFFFF are
+//     loaded via `mov reg, imm` (movabs, 10-byte imm64 form; legal for
+//     mov, NOT legal for cmp/and). Every glyph literal (0x00000020,
+//     0x008196E2 .. 0x008896E2, 0x57565053) fits imm32 signed positive
+//     so paideia-as emits the compact 5-byte `mov r32, imm32` form.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is
+//     2-op `imul reg, reg`. All *8 column-index scaling folds to
+//     `shl reg, 3`; all *16 cell-address scaling folds to `shl reg, 4`.
+//     Division uses standard `xor rdx, rdx; div reg`.
+//   - Labels prefixed `spk_` per docs/design.md fingerprint discipline
+//     (spk_max_ for the auto-max scan, spk_vis_ for visible-cols
+//     clamp, spk_fill_ for phase-1 fill loops, spk_bar_ for the
+//     phase-2 bar column/full/partial loops, spk_ret_ for the shared
+//     epilogue, spk_bv_ for sparkline_view_pack).
+//   - sparkline_draw pushes 5 SysV callee-save regs (rbx, r12, r13,
+//     r14, r15) = 40 bytes plus `sub rsp, 80` for cell-word + geometry
+//     + table-addr scratch; entry rsp%16==8, +40==48 (aligned),
+//     +80==128 (aligned).
+//     Body makes NO nested calls (all cell writes, address math, and
+//     divisions are inline). Alignment is a discipline anchor mirroring
+//     block_draw / scrollbar_draw, hardening against a future revision
+//     that might add one.
+//   - sparkline_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save
+//     registers, matching scrollbar_view_pack's shape.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments; sparkline_draw additionally reads
+//     the values[] array through r13). No cap / sysreg effect.
+
+module Sparkline = structure {
+
+  // ==========================================================================
+  // SparklineSpec layout (40 bytes)
+  // ==========================================================================
+  pub let SPARKLINE_SPEC_BYTES        : u64 = 40
+
+  pub let SPARKLINE_OFF_RECT          : u64 = 0
+  pub let SPARKLINE_OFF_VALUES_PTR    : u64 = 8
+  pub let SPARKLINE_OFF_VALUE_COUNT   : u64 = 16
+  pub let SPARKLINE_OFF_MAX_OVERRIDE  : u64 = 24
+  pub let SPARKLINE_OFF_STYLE         : u64 = 32
+
+  // ==========================================================================
+  // Glyph u32 constants (3 UTF-8 bytes + 1 zero pad, little-endian).
+  // Each value < 0x80000000 -- paideia-as emits the compact 5-byte
+  // `mov r32, imm32` form when loaded via `mov reg, imm`.
+  //
+  // SPARKLINE_GLYPH_SPACE is the phase-1 fill glyph (' ', 0x20 with
+  // three zero pad bytes so a single 8-byte cell write clears the
+  // rest of the symbol slot). SPARKLINE_GLYPH_FULL is the phase-2
+  // full-block █; the partial glyphs live in spk_glyph_partial (below).
+  // ==========================================================================
+  pub let SPARKLINE_GLYPH_SPACE : u64 = 0x00000020
+  pub let SPARKLINE_GLYPH_FULL  : u64 = 0x008896E2
+
+  // ==========================================================================
+  // SparklineView@0.1 semantic-pipe wire (docs/design.md §2.3)
+  //
+  // MAGIC 0x57565053 = "SPVW" little-endian (byte 0=0x53 'S', byte 1=
+  // 0x50 'P', byte 2=0x56 'V', byte 3=0x57 'W'). Fits imm32 signed
+  // positive so the loader emits `mov r32, imm32` (5 bytes), not the
+  // 10-byte movabs form -- matches scrollbar_view_pack's SBVW load
+  // (src/widgets/scrollbar.pdx L687).
+  // ==========================================================================
+  pub let SPVW_MAGIC             : u64 = 0x57565053
+  pub let SPVW_RECORD_LEN        : u64 = 32
+  pub let SPVW_OFF_MAGIC         : u64 = 0
+  pub let SPVW_OFF_RECORD_LEN    : u64 = 4
+  pub let SPVW_OFF_RECT          : u64 = 8
+  pub let SPVW_OFF_VALUE_COUNT   : u64 = 16
+  pub let SPVW_OFF_MAX_OVERRIDE  : u64 = 24
+
+  // Schema name ("SparklineView@0.1", NUL-terminated -- the string a
+  // M2-009 BLAKE3-based schema-hash constant would be computed against,
+  // kept here as the authoritative source so any later hash landing has
+  // exactly one string to hash and no byte-for-byte drift risk).
+  pub let SPVW_SCHEMA_NAME     : [u8; 18] = "SparklineView@0.1\0"
+  pub let SPVW_SCHEMA_NAME_LEN : u64 = 17
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x53 offset = 0xFFFFEBD3, in the M3 sub-band 0xFFFFEBD0..0xFFFFEBDF
+  // (Layout+Text+M2-widgets fully occupy 0xFFFFEBC0..0xFFFFEBCF; the M3
+  // wave draws sentinels from 0xFFFFEBD0 upward). Every sentinel
+  // > 0x7FFFFFFF -- movabs required for `mov reg, imm`; NEVER usable in
+  // cmp/and.
+  //
+  // At v1 no sparkline_draw path returns this -- the body accepts any
+  // spec (a rect of 0x0 returns 0 with no cells written; a value_count
+  // of 0 short-circuits to a space-only fill; auto-max of an all-zero
+  // series falls back to a divisor of 1). The sentinel is reserved for
+  // a future revision that may want to trap e.g. a rect that overflows
+  // the canvas (widened to a u32 return today keeps the signature
+  // stable if that trap ever lands), matching Scrollbar's posture on
+  // SCROLLBAR_ERR_BAND (src/widgets/scrollbar.pdx L243).
+  // ==========================================================================
+  pub let SPK_ERR_BAND : u64 = 0xFFFFEBD3
+
+  // ==========================================================================
+  // Partial-bar glyph table (8 x u32, 32 bytes).
+  //
+  // Indexed by `rem = height % 8` in the draw hot path. Slot 0 is a
+  // defensive space fallback (the draw path never indexes it -- the
+  // partial stamp is gated by `cmp rem, 0; je`); slots 1..7 are the
+  // one-eighth quantized lower blocks ▁ ▂ ▃ ▄ ▅ ▆ ▇. See GLYPH TABLE
+  // block in the module header for the codepoint / byte mapping.
+  //
+  // 4-byte-per-slot stride lets the load site emit
+  //   xor reg, reg
+  //   mov  offset, rem
+  //   shl  offset, 2
+  //   mov_d reg, [table + offset]
+  // without a size-fixup for the last slot -- the trailing zero pad on
+  // every slot means bytes 1..4 of the destination cell's symbol slot
+  // land as zero even when the previous cell held a multi-byte glyph.
+  // ==========================================================================
+  pub let spk_glyph_partial : [u8; 32] = "\x20\x00\x00\x00\xE2\x96\x81\x00\xE2\x96\x82\x00\xE2\x96\x83\x00\xE2\x96\x84\x00\xE2\x96\x85\x00\xE2\x96\x86\x00\xE2\x96\x87\x00"
+
+  // ==========================================================================
+  // sparkline_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (matches WidgetKind::widget_draw dispatch
+  // per src/widget_kind.pdx L216). `rows` is unread (back region
+  // starts at buf_ptr+0). Returns 0 (OK) in every non-trivially-empty
+  // case; returns 0 for a zero-sized rect (bw==0 || bh==0) with no
+  // cells written.
+  //
+  // Draw sequence:
+  //   0. Cache invariants (rbx=buf_ptr, r12=cols, r14=packed rect).
+  //      Early-return 0 on empty rect (bw==0 or bh==0).
+  //   1. Precompute geometry into stack scratch:
+  //        [rsp+40] bh*8       [rsp+48] bx        [rsp+56] y_bottom
+  //   2. Load values_ptr (r13) and value_count; compute visible_cols =
+  //      min(value_count, bw) into [rsp+32].
+  //   3. Compute max_val into r15: if [rdi+24] (max_override) != 0 use
+  //      it verbatim; else scan values[0..value_count] for the max;
+  //      fall back to 1 if the scan finds all zeros or value_count == 0.
+  //   4. Load style; precompute style_high (word0 mixin: (style &
+  //      0xFFFFFF)<<32 | ((style>>24)&0xFF)<<56) into [rsp+0], word1
+  //      ((style>>32)&0xFFFF | ((style>>48)&0xFF)<<16) into [rsp+8],
+  //      space_word0 (' ' | style_high) into [rsp+16], full_block_word0
+  //      (0x008896E2 | style_high) into [rsp+24].
+  //   5. Phase 1 fill: outer y in [by..by+bh), inner x in [bx..bx+bw);
+  //      each cell stamped with (space_word0, word1) via two 8-byte
+  //      stores.
+  //   6. Phase 2 bars: for c in [0..visible_cols):
+  //        value = values[c]
+  //        if value == 0: continue (space fill already stands)
+  //        height = min(value * bh*8 / max, bh*8)
+  //        full = height >> 3, rem = height & 7
+  //        for row in [0..full):
+  //          y = y_bottom - row
+  //          stamp (full_block_word0, word1) at (bx+c, y)
+  //        if rem != 0:
+  //          y_partial = y_bottom - full
+  //          load glyph_u32 = spk_glyph_partial[rem]
+  //          word0 = glyph_u32 | style_high
+  //          stamp (word0, word1) at (bx+c, y_partial)
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the
+  // canvas's stamped rows/cols; adding a gate here would double-charge
+  // every cell write for no marginal safety (same posture Buffer::
+  // buffer_at, block_draw, and scrollbar_draw take -- see block.pdx
+  // L482, scrollbar.pdx L273).
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 80; entry rsp%16==8,
+  // +40==48 aligned, +80==128 aligned):
+  //   rbx = buf_ptr       r12 = cols            r13 = values_ptr
+  //   r14 = packed rect   r15 = max_val
+  //   Column loop:  r11 = c
+  //   Per-column:   rsi = full, rdi = rem, r9 = x = bx + c,
+  //                 r8 = y_bottom
+  //   Stack scratch (80 bytes):
+  //     [rsp+0]  style_high        (word0 mixin)
+  //     [rsp+8]  word1
+  //     [rsp+16] space_word0       (' ' | style_high; phase 1 fill)
+  //     [rsp+24] full_block_word0  (█ | style_high; phase 2 hot loop)
+  //     [rsp+32] visible_cols
+  //     [rsp+40] bh_times_8        (bh << 3; height numerator scale)
+  //     [rsp+48] bx
+  //     [rsp+56] y_bottom          (by + bh - 1)
+  //     [rsp+64] table_addr        (spk_glyph_partial; leaed once at
+  //                                  prologue since paideia-as's `lea
+  //                                  reg, [rip + label]` uses r11 as
+  //                                  internal scratch and our column
+  //                                  counter lives in r11)
+  //     [rsp+72] (unused pad; kept so sub rsp, 80 stays 16-byte aligned)
+  //
+  // Labels prefixed spk_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let sparkline_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-003 (postui#22): sparkline_draw is the widget_draw-shape entry for WK_SPARKLINE (6). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 80 (cell-word + geometry + table-addr scratch, keeps rsp%16==0). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / scrollbar_draw. Phase 0 (prologue): cache buf_ptr in rbx, cols in r12, packed rect in r14 (loaded once from [rdi+0]); snapshot spk_glyph_partial address into [rsp+64] via one `lea rax, [rip + spk_glyph_partial]` -- paideia-as's lea-emission uses r11 as internal scratch (width.pdx L246), and our column counter later lives in r11, so the lea MUST run before any r11 state is loaded (matches width.pdx / block.pdx lea-placement discipline); early-return 0 if bw==0 or bh==0 (bw = (r14>>32)&0xFFFF, bh = r14>>48). Save bh*8 to [rsp+40] (shl rcx, 3); save bx=(r14 & 0xFFFF) to [rsp+48]; compute y_bottom = by + bh - 1 = ((r14>>16)&0xFFFF) + bh - 1, save to [rsp+56]. Load values_ptr from [rdi+8] into r13; load value_count from [rdi+16] into r10; compute visible_cols = min(value_count, bw) via cmp/jbe/mov and save to [rsp+32]. Phase 0b (max compute): load max_override from [rdi+24] into r15; if non-zero, use verbatim. If zero, take auto-scan path: load value_count fresh (r11 -- r10 was reused by visible_cols compute); if 0, fall through to fallback. Else scan: xor rcx (scan idx), xor r15 (running max); loop `cmp rcx, r11; jae spk_max_check_zero; mov rax, rcx; shl rax, 3; mov rdx, [r13 + rax + 0]; cmp rdx, r15; jbe spk_max_no_upd; mov r15, rdx; spk_max_no_upd: add rcx, 1; jmp spk_max_scan`. After the loop `cmp r15, 0; jne spk_max_ready; mov r15, 1` -- the fallback guarantees the div-by-zero path is unreachable even when every scanned value is 0. Phase 0c (style precompute): load style from [rdi+32] into r11 (spec_ptr rdi is now dead). Compute style_high = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56) into rcx and store to [rsp+0] (keep in rcx for reuse). Compute word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16) into rax, store to [rsp+8]. Compute space_word0 = 0x20 | rcx into rax, store to [rsp+16]. Compute full_block_word0 = 0x008896E2 | rcx into rax, store to [rsp+24]. All shift counts (24, 32, 48, 56) fit imm8; all masks (0xFFFFFF, 0xFF, 0xFFFF, 7) fit imm32; both glyph literals (0x00000020, 0x008896E2) fit imm32 so paideia-as emits the compact 5-byte `mov r32, imm32` form. Phase 1 (fill entire rect with space): re-extract bx (r8) / by (r9) / bw (r10) / bh (r11) from r14; xe (rsi) = bx + bw, ye (rdi) = by + bh; outer y loop rdx from by to ye-1, inner x loop rcx from bx to xe-1; each iteration computes dst = buf_ptr + (y*cols + x)*16 into rax via `mov rax, rdx; imul rax, r12; add rax, rcx; shl rax, 4; add rax, rbx`; two 8-byte load/store pairs copy space_word0/word1 from [rsp+16]/[rsp+8] into [rax+0]/[rax+8] (transit through r10, safe to clobber after ye is committed to rdi). Phase 2 (bar draw): reload visible_cols from [rsp+32] into r10; if 0, jump to spk_ret_zero. Column counter r11 = 0; loop `spk_bar_col`: cmp r11, r10; jae spk_ret_zero. Load value: `mov rax, r11; shl rax, 3; mov rax, [r13 + rax + 0]` (u64 stride via explicit shl 3 since paideia-as codebase avoids SIB-scale addressing). Skip zero-valued columns straight to spk_bar_next. Compute height: `mov rdx, [rsp + 40]; imul rax, rdx (2-op reg,reg -- rax = value*bh_x8, wrap-safe for realistic sparkline data domains)`; `xor rdx, rdx; div r15` gives quotient in rax; clamp with `mov rdx, [rsp + 40]; cmp rax, rdx; jbe spk_bar_no_clamp; mov rax, rdx`. Decompose: rsi = rax >> 3 (full), rdi = rax & 7 (rem). Compute x = bx + c into r9 (`mov r9, [rsp+48]; add r9, r11`), y_bottom into r8 (`mov r8, [rsp+56]`). Full-cell hot loop: rcx = 0; `spk_bar_full`: cmp rcx, rsi; jae spk_bar_partial. y = y_bottom - rcx (`mov rdx, r8; sub rdx, rcx`); dst compute (same imul+shl4 shape as phase 1); stamp full_block_word0 from [rsp+24] + word1 from [rsp+8]. add rcx, 1; jmp spk_bar_full. Partial-cell block `spk_bar_partial`: gate `cmp rdi, 0; je spk_bar_next` (rem == 0 => no partial). Otherwise: y_partial = y_bottom - full into rdx; dst compute; load glyph_u32 via `mov rcx, [rsp + 64]; mov rdx, rdi; shl rdx, 2; xor rsi, rsi; mov_d rsi, [rcx + rdx + 0]` (table address was pre-snapshotted in prologue to keep r11 -- the column counter -- unclobbered by paideia-as's lea-emission scratch use; xor-then-mov_d for paideia-as #1248 load-side zero-extension; rsi and rdi are safe to clobber here -- full/rem are no longer needed after the partial stamp). Compose word0 via `mov rdx, [rsp + 0]; or rsi, rdx` (paideia-as codebase avoids `or reg, mem`; stage through a scratch reg). Store `mov [rax + 0], rsi; mov r10, [rsp + 8]; mov [rax + 8], r10` (r10 = visible_cols is clobbered here; reloaded at the top of spk_bar_col next iteration). spk_bar_next: add r11, 1; jmp spk_bar_col. Reload of visible_cols at each spk_bar_col iteration keeps the column-loop invariant self-healing after either the full-cell or partial-cell paths clobber r10. Epilogue spk_ret_zero: xor rax, rax; add rsp, 80; pop r15/r14/r13/r12/rbx (reverse); ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 7, 0, 1, 2, 3, 4, 8, 32, shift counts 2/3/4/16/24/32/48/56) fits imm32/imm8; glyph words and style masks fit imm32. 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. Effect `!{mem}` (fill + bar cell writes + spec/values/stack reads). Labels prefixed spk_ per docs fingerprint discipline: spk_vis_done for visible_cols clamp, spk_max_scan/no_upd/check_zero/default/ready for the auto-max scan chain, spk_fill_yloop/xloop/ynext/done for phase-1 fill, spk_bar_col/next/no_clamp/full/partial for phase-2 bar loops, spk_ret_zero for the shared success epilogue.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 80;
+
+        // ---- Prologue: cache invariants ----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r14, [rdi + 0];               // r14 = packed rect
+
+        // ---- Snapshot glyph-table address (lea placed BEFORE any r11
+        // ---- state is loaded; paideia-as's `lea reg, [rip + label]`
+        // ---- uses r11 as internal scratch and our column counter later
+        // ---- lives in r11 -- matches width.pdx L275 discipline). ---------
+        lea rax, [rip + spk_glyph_partial];
+        mov [rsp + 64], rax;
+
+        // ---- Early-return on zero-sized rect -----------------------------
+        // bw = (r14 >> 32) & 0xFFFF
+        mov rax, r14;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        cmp rax, 0;
+        je  spk_ret_zero;
+        // bh = r14 >> 48 (top 16 bits, no mask needed)
+        mov r9, r14;
+        shr r9, 48;
+        cmp r9, 0;
+        je  spk_ret_zero;
+
+        // ---- Save bh*8 to [rsp+40] ---------------------------------------
+        mov rcx, r9;
+        shl rcx, 3;
+        mov [rsp + 40], rcx;
+
+        // ---- Save bx to [rsp+48] -----------------------------------------
+        mov r10, r14;
+        and r10, 0xFFFF;
+        mov [rsp + 48], r10;
+
+        // ---- Save y_bottom = by + bh - 1 to [rsp+56] ---------------------
+        mov r8, r14;
+        shr r8, 16;
+        and r8, 0xFFFF;                   // r8 = by
+        add r8, r9;                       // r8 = by + bh
+        sub r8, 1;                        // r8 = by + bh - 1
+        mov [rsp + 56], r8;
+
+        // ---- Load values_ptr, value_count; compute visible_cols ----------
+        mov r13, [rdi + 8];               // values_ptr
+        mov r10, [rdi + 16];              // value_count
+        // rax still holds bw here
+        cmp r10, rax;
+        jbe spk_vis_done;
+        mov r10, rax;
+      spk_vis_done:
+        mov [rsp + 32], r10;              // visible_cols
+
+        // ---- Compute max_val (r15) ---------------------------------------
+        mov r15, [rdi + 24];              // max_override
+        cmp r15, 0;
+        jne spk_max_ready;
+
+        // Auto-max scan
+        mov r11, [rdi + 16];              // value_count fresh (r10 was reused)
+        cmp r11, 0;
+        je  spk_max_default;
+
+        xor rcx, rcx;                     // scan index
+        xor r15, r15;                     // running max
+      spk_max_scan:
+        cmp rcx, r11;
+        jae spk_max_check_zero;
+        mov rax, rcx;
+        shl rax, 3;
+        mov rdx, [r13 + rax + 0];         // values[scan]
+        cmp rdx, r15;
+        jbe spk_max_no_upd;
+        mov r15, rdx;
+      spk_max_no_upd:
+        add rcx, 1;
+        jmp spk_max_scan;
+
+      spk_max_check_zero:
+        cmp r15, 0;
+        jne spk_max_ready;
+
+      spk_max_default:
+        mov r15, 1;                       // fallback: avoid div-by-zero
+
+      spk_max_ready:
+
+        // ---- Precompute style_high, word1, space_word0, full_block_word0 -
+        mov r11, [rdi + 32];              // style (spec_ptr rdi now dead)
+
+        // style_high = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56)
+        mov rcx, r11;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r11;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rcx, rax;                     // rcx = style_high (kept live for reuse)
+        mov [rsp + 0], rcx;
+
+        // word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16)
+        mov rax, r11;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rdx, r11;
+        shr rdx, 48;
+        and rdx, 0xFF;
+        shl rdx, 16;
+        or  rax, rdx;
+        mov [rsp + 8], rax;               // word1
+
+        // space_word0 = 0x20 | style_high
+        mov rax, 0x20;
+        or  rax, rcx;
+        mov [rsp + 16], rax;
+
+        // full_block_word0 = 0x008896E2 | style_high
+        mov rax, 0x008896E2;
+        or  rax, rcx;
+        mov [rsp + 24], rax;
+
+        // =====================================================================
+        // Phase 1: fill entire rect with space cells
+        // =====================================================================
+
+        // Re-extract bx (r8), by (r9), bw (r10), bh (r11) from r14
+        mov r8, r14;
+        and r8, 0xFFFF;
+
+        mov r9, r14;
+        shr r9, 16;
+        and r9, 0xFFFF;
+
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFFFF;
+
+        mov r11, r14;
+        shr r11, 48;
+
+        // xe = bx + bw -> rsi
+        mov rsi, r8;
+        add rsi, r10;
+        // ye = by + bh -> rdi
+        mov rdi, r9;
+        add rdi, r11;
+
+        // y counter: rdx = by
+        mov rdx, r9;
+
+      spk_fill_yloop:
+        cmp rdx, rdi;
+        jae spk_fill_done;
+
+        // x counter: rcx = bx
+        mov rcx, r8;
+
+      spk_fill_xloop:
+        cmp rcx, rsi;
+        jae spk_fill_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp space_word0 + word1 (transit through r10; safe to clobber)
+        mov r10, [rsp + 16];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp spk_fill_xloop;
+
+      spk_fill_ynext:
+        add rdx, 1;
+        jmp spk_fill_yloop;
+
+      spk_fill_done:
+
+        // =====================================================================
+        // Phase 2: draw bars, one column per data point
+        // =====================================================================
+
+        // Column counter c in r11
+        xor r11, r11;
+
+      spk_bar_col:
+        mov r10, [rsp + 32];              // visible_cols (reload each iter)
+        cmp r11, r10;
+        jae spk_ret_zero;
+
+        // ---- Load value = values[c] --------------------------------------
+        mov rax, r11;
+        shl rax, 3;
+        mov rax, [r13 + rax + 0];
+
+        // Skip zero-valued columns (space fill already stands)
+        cmp rax, 0;
+        je  spk_bar_next;
+
+        // ---- height = min(value * bh_x8 / max_val, bh_x8) ----------------
+        mov rdx, [rsp + 40];              // bh_x8
+        imul rax, rdx;                    // rax = value * bh_x8 (2-op reg,reg)
+        xor rdx, rdx;
+        div r15;                          // rax = height (in 1/8 units)
+
+        mov rdx, [rsp + 40];              // bh_x8 (reload for clamp)
+        cmp rax, rdx;
+        jbe spk_bar_no_clamp;
+        mov rax, rdx;
+      spk_bar_no_clamp:
+
+        // ---- full = height >> 3 -> rsi; rem = height & 7 -> rdi ----------
+        mov rsi, rax;
+        shr rsi, 3;
+        and rax, 7;
+        mov rdi, rax;
+
+        // ---- x = bx + c -> r9; y_bottom -> r8 ----------------------------
+        mov r9, [rsp + 48];               // bx
+        add r9, r11;
+        mov r8, [rsp + 56];               // y_bottom
+
+        // ---- Full-cell loop: rcx counts rows 0..full ---------------------
+        xor rcx, rcx;
+      spk_bar_full:
+        cmp rcx, rsi;
+        jae spk_bar_partial;
+
+        // y = y_bottom - rcx
+        mov rdx, r8;
+        sub rdx, rcx;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, r9;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp full_block_word0 + word1
+        mov r10, [rsp + 24];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp spk_bar_full;
+
+      spk_bar_partial:
+        // Gate: rem == 0 -> no partial cell
+        cmp rdi, 0;
+        je  spk_bar_next;
+
+        // y_partial = y_bottom - full
+        mov rdx, r8;
+        sub rdx, rsi;
+
+        // dst = buf_ptr + (y_partial*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, r9;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Load partial glyph u32: spk_glyph_partial[rem*4].
+        // Table address was snapshotted into [rsp+64] via a single lea
+        // at prologue-time -- see the r11-clobber note there.
+        mov rcx, [rsp + 64];
+        mov rdx, rdi;
+        shl rdx, 2;
+        xor rsi, rsi;
+        mov_d rsi, [rcx + rdx + 0];
+
+        // word0 = glyph | style_high (stage style_high through rdx; paideia-
+        // as codebase avoids `or reg, mem`)
+        mov rdx, [rsp + 0];
+        or  rsi, rdx;
+
+        // Stamp partial cell + word1
+        mov [rax + 0], rsi;
+        mov r10, [rsp + 8];
+        mov [rax + 8], r10;
+
+      spk_bar_next:
+        add r11, 1;
+        jmp spk_bar_col;
+
+      spk_ret_zero:
+        xor rax, rax;
+        add rsp, 80;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // sparkline_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a SparklineView@0.1 semantic-pipe record into [dst..dst+32).
+  // record_len is fixed at 32 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to a later postui.M2-009 revision that adds SEMANTIC_SCHEMA_SPVW
+  // -- this packer is the wire-format authority so that landing's
+  // registry glue only has to know the schema-name string
+  // (for BLAKE3 hashing) and this packer (for the byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call.
+  // Effect `!{mem}` (reads through rdi, writes through rsi).
+  // Labels prefixed spk_bv_ per docs fingerprint discipline (none
+  // needed at v1 -- record is fixed-length, no branches).
+  // ==========================================================================
+  pub let sparkline_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-003 (postui#22): sparkline_view_pack lays a fixed-32-byte SparklineView@0.1 record at [rsi..rsi+32). Header phase writes five scalar fields in one straight-line sequence: `mov rax, 0x57565053` then `mov_d [rsi+0], rax` stamps the 'SPVW' magic (0x57565053 = 1_465_274_451 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches scrollbar_view_pack's SBVW magic idiom, src/widgets/scrollbar.pdx L687). record_len is a hard 32 (no variable-length payload), stored via `mov rax, 32; mov_d [rsi+4], rax`. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store -- SparklineSpec's rect slot and SparklineView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. value_count (u64) is loaded from [rdi+16] and stored qword at [rsi+16]; max_override (u64) is loaded from [rdi+24] and stored qword at [rsi+24]. Full u64 retention for both (no u32 truncation like ScrollbarView takes for its content_length / viewport_length -- documented in module header) because both slots are semantically load-bearing and a >4G sparkline sample count is architecturally in-scope. return rax = 32. Every immediate (0x57565053, 32, 0, 4, 8, 16, 24) fits imm32 (0x57565053 = 1_465_274_451 < 0x7FFFFFFF; the rest are small). No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 3 qword-loads / 3 qword-stores / 1 dword-magic-store / 1 dword-record_len-store.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57565053;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 32;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- value_count (u64) at [rsi + 16] -------------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 16], rax;
+
+        // ---- max_override (u64) at [rsi + 24] ------------------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 24], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 32;
+        ret;
+      }
+    }
+
+}
