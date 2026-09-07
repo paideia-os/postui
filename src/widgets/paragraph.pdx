@@ -1,0 +1,912 @@
+// src/widgets/paragraph.pdx -- postui.M2-004 (paideia-os/postui#13)
+//
+// Paragraph widget: styled multi-line text with word/char wrap + scroll.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog row Paragraph; §5.1 M2-004)
+// =============================================================================
+//
+// Paragraph is the first widget above Block that consumes the Text/Span/Line
+// primitives landed at postui.M2-002 (src/text.pdx). It walks a caller-
+// supplied Text through a rectangular render Rect, folding the styled bytes
+// of each Line into 16-byte Cell writes via the same buffer index math the
+// Block title path uses (buf_ptr + (y*cols + x)*16). Word-wrap is delegated
+// to Text::line_break_positions (byte-offset array, no allocator); Paragraph
+// slices each logical Line into visual segments at those offsets, drops
+// visual rows past the bottom of the Rect, and truncates each visual row at
+// the right edge. Scroll is a starting logical-line index; no visual-line
+// scroll (a wrap-aware scrollbar lands at M2-008 Scrollbar).
+//
+// This module lands:
+//   - The ParagraphSpec state record (48-byte struct laid out in memory,
+//     matching the BLOCK_SPEC_BYTES = 48 shape so widget-slot arenas that
+//     size on max(spec bytes across kinds) do not have to bump for the
+//     Paragraph landing).
+//   - paragraph_spec_init: pack a ParagraphSpec into caller-provided memory.
+//   - paragraph_draw: the widget_draw entry point matching the standard
+//     (spec_ptr, buf_ptr, rows, cols) -> u64 signature that
+//     postui.M1-007's WidgetKind dispatch keys against for WK_PARAGRAPH.
+//   - paragraph_view_pack: pack a ParagraphView@0.1 semantic-pipe record
+//     into caller-provided memory. Fixed-size 48-byte record (no variable-
+//     length payload like BlockView's title -- Paragraph's own text is
+//     already streamed through the frame's cell writes, and the view
+//     record is a control-plane snapshot: rect + wrap-policy + scroll +
+//     line_count, not a copy of the text bytes). The semantic_pipe::
+//     send_record call lands at postui.M2-009 alongside BlockView, per
+//     block.pdx's own header rationale.
+//
+// =============================================================================
+// PARAGRAPHSPEC WIRE (48 bytes, PARA_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect           u64 packed (x, y, w, h) per Rect wire
+//                                    (identical to BlockSpec+0 -- the two
+//                                    widgets share the 4x u16 field
+//                                    packing so a shared cell-index
+//                                    helper can be lifted later without
+//                                    re-shaping either record).
+//   [+ 8..+16)   text_ptr       u64 pointer to a 16-byte Text struct
+//                                    (Text::TEXT_TEXT_BYTES = 16; see
+//                                    src/text.pdx).
+//   [+16..+24)   scroll_offset  u64 starting LOGICAL line index (a value
+//                                    >= line_count returns PGR_ERR_BAND;
+//                                    == line_count draws nothing and
+//                                    returns 0).
+//   [+24..+32)   wrap_mode      u64 0 = PARA_WRAP_NONE, 1 = PARA_WRAP_WORD,
+//                                    2 = PARA_WRAP_CHAR. Any other value
+//                                    triggers PGR_ERR_BAND at draw time.
+//                                    v1 supports NONE and WORD fully;
+//                                    CHAR is currently accepted but
+//                                    rendered identically to NONE
+//                                    (documented approximation; a future
+//                                    revision folds per-cell overflow-
+//                                    to-next-row into the byte loop).
+//   [+32..+40)   alignment      u64 0 = Left, 1 = Center, 2 = Right.
+//                                    v1 renders Left only; the field is
+//                                    stored and returned in the view
+//                                    record so semantic-pipe consumers
+//                                    can key against it, but paragraph_
+//                                    draw does not consult it. A future
+//                                    revision will honor Center/Right by
+//                                    computing a per-visual-line left
+//                                    pad from (bw - visual_line_width).
+//   [+40..+48)   style          u64 packed default Style (Style module
+//                                    wire; identical layout to Span's
+//                                    style word). At v1 every cell write
+//                                    picks up THIS spec-level Style
+//                                    rather than the per-Span style --
+//                                    the Span's own style is honored
+//                                    semantically (spans still carry
+//                                    style, exported through the Text
+//                                    module) but v1's paragraph_draw
+//                                    stamps the spec.style word into
+//                                    every cell to keep the byte loop
+//                                    register-local (a per-span style
+//                                    switch adds a mov [rsp+span_style]
+//                                    load per byte, deferred to the
+//                                    same v2 revision that adds
+//                                    alignment).
+//
+// The 48-byte size matches BlockSpec exactly, keeping widget-slot arena
+// sizing math simple across kinds. Every field is 8-byte aligned so the
+// draw body reads each with a single qword load; no byte-slot packing
+// (unlike Block's border_kind + padding bytes) because Paragraph's fields
+// are all naturally 64-bit-shaped values, not one-byte enums.
+//
+// =============================================================================
+// PARAGRAPHVIEW@0.1 WIRE (48 bytes fixed, PGVW_RECORD_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic          u32 = 0x57564750 ("PGVW" LE)
+//   [+ 4..+ 8)   record_len     u32 = 48 (fixed; NO variable-length
+//                                    payload -- unlike BlockView's title,
+//                                    Paragraph's text bytes live behind
+//                                    text_ptr and are per-process, not
+//                                    copyable through the semantic pipe.
+//                                    The view is a control-plane
+//                                    snapshot: rect + wrap-policy +
+//                                    scroll + line_count).
+//   [+ 8..+12)   wrap_mode      u32 (u64 spec field truncated to u32;
+//                                    ordinals 0..2 unchanged).
+//   [+12..+16)   alignment      u32 (u64 spec field truncated; 0..2).
+//   [+16..+24)   rect_pack      u64 verbatim from ParagraphSpec+0 (same
+//                                    wire as a Rect; same 4x u16 layout
+//                                    BlockView uses at its own +12).
+//   [+24..+32)   scroll_offset  u64 verbatim from ParagraphSpec+16.
+//   [+32..+40)   style          u64 verbatim from ParagraphSpec+40.
+//   [+40..+48)   line_count     u64 dereferenced from text_ptr's Text
+//                                    struct (Text::text_line_count).
+//                                    If text_ptr == 0, line_count = 0.
+//
+// The magic ordering keeps BlockView's byte layout shape for the first 8
+// bytes exactly (magic|record_len), so a downstream reader that
+// discriminates on the u32 at offset 0 uses the same 4-byte load path
+// for both view types. record_len stays u32 to match BlockView's field
+// width and to leave the top 32 bits of the header word free for a
+// future flags slot if PGVW ever needs one.
+//
+// A fixed record_len also means paragraph_view_pack has no
+// round-up-to-8-boundary shift chain that block_view_pack needs -- one
+// less arithmetic step, one less place to drift from the schema.
+//
+// =============================================================================
+// ERROR BAND (0xFFFFEBCB, single slot)
+// =============================================================================
+//
+// design/architecture.md §5.1 assigns the M2 batch 0xFFFFEBC0..0xFFFFEBCF.
+// Layout owns 0xFFFFEBC0..0xFFFFEBC4 (see src/layout.pdx). Width reserves
+// 0xFFFFEBC5..0xFFFFEBC9. Text owns 0xFFFFEBCA..0xFFFFEBCE (see
+// src/text.pdx). Paragraph takes 0xFFFFEBCB as a SINGLE catch-all slot:
+//
+//   PGR_ERR_BAND (0xFFFFEBCB) -- returned by paragraph_draw when:
+//     * scroll_offset > text.line_count (out-of-range scroll)
+//     * wrap_mode ordinal is >= 3 (unknown wrap policy)
+//     * (future) any additional caller-input validation failure
+//
+// A single-slot sentinel matches Layout/Text's own posture: a Paragraph
+// caller that sees rax >= POSTUI_ERR_BAND_BASE (0xFFFFEB80) already
+// knows the frame did not render; the exact ordinal is a debug-print
+// discriminator, not a control-flow gate. A finer breakdown (out-of-
+// range scroll vs. bad wrap_mode) can be added later by widening this
+// slot to a small band without changing the widget_draw ABI (u64
+// return is already reserved for exactly this class of extension).
+//
+// 0xFFFFEBCB is > 0x7FFFFFFF so `mov reg, imm64` (movabs) is the only
+// legal path to stage it into a register; NEVER used in cmp/and.
+// Callers gate error detection via `cmp rax, POSTUI_ERR_BAND_BASE`
+// staged through another register (or, cheaper: `cmp rax, small_ok_max;
+// jbe ok` -- the wrap loop in paragraph_draw uses exactly this shortcut
+// against the 64-entry break-position cap when reading
+// line_break_positions' return).
+//
+// =============================================================================
+// DRAW ALGORITHM (paragraph_draw)
+// =============================================================================
+//
+// One outer loop over logical lines (from scroll_offset up to line_count),
+// each iteration containing an inner loop over VISUAL segments derived
+// from line_break_positions (WORD wrap) or a single trivial segment
+// (NONE / CHAR at v1). Every visual segment consumes one output row of
+// the render Rect. When cur_y hits ye or line_idx hits line_count, the
+// draw completes cleanly with rax = 0.
+//
+//   Phase 0 -- prologue + arg cache:
+//     * push rbx/r12/r13/r14/r15 (5-push, rsp %16 goes 8->0)
+//     * sub rsp, 672 (48 stack scratch slots + 512-byte break array; the
+//       total keeps rsp %16 == 0)
+//     * rbx = buf_ptr, r12 = cols, r13 = spec_ptr, r14 = packed rect,
+//       r15 = text_ptr
+//     * Extract bx / by / bw / bh + xe / ye into stack slots ONCE; every
+//       later use is a stack load rather than a re-shift of r14.
+//     * Cache scroll_offset, wrap_mode (with validation), style,
+//       line_count into stack slots.
+//     * Validate wrap_mode <= 2 and scroll_offset <= line_count; if
+//       either fails, return PGR_ERR_BAND. scroll_offset == line_count
+//       returns 0 (empty draw is not an error).
+//     * Trivially-empty cases (text_ptr == 0, bw == 0, bh == 0) return
+//       0.
+//
+//   Phase 1 -- outer line loop (pg_line_loop):
+//     For each logical line at index >= scroll_offset:
+//       * If cur_y >= ye or line_idx >= line_count: exit.
+//       * If wrap_mode == WORD: call line_break_positions(line_cursor,
+//         bw, rsp, 64) into the 64-slot break array at [rsp+0..512).
+//         (rsp is the output base -- the array is the first stack slot,
+//         so this needs no per-call address computation.) A returned
+//         count > 64 (the out_max) is treated as 0 breaks -- the wrap
+//         degrades to NoWrap for that line rather than aborting the
+//         whole frame. A cleaner alternative would be to return
+//         PGR_ERR_BAND, but a runaway wrap on ONE line does not
+//         invalidate the OTHERS, so the degrade posture is more useful
+//         at v1.
+//       * Compute total_bytes = sum of span.byte_len across the line's
+//         spans (short linear walk; the total lands in a stack slot for
+//         the segment loop to use as the "last visual segment ends
+//         here" bound).
+//
+//   Phase 2 -- inner segment loop (pg_seg_loop):
+//     For each visual segment i in [0, break_count]:
+//       * If cur_y >= ye: exit both loops.
+//       * seg_end = (i < break_count) ? break_positions[i] : total_bytes
+//       * Walk the line's Span array; for each span whose byte range
+//         [span_start_abs, span_end_abs) intersects [seg_start, seg_end):
+//         emit each byte at column (byte_abs - seg_start) of the current
+//         visual row. col >= bw truncates the segment at the right edge
+//         (right-edge truncation is unconditional even for CHAR wrap at
+//         v1; see wrap_mode == CHAR note above).
+//       * Advance: seg_start = seg_end; cur_y += 1; seg_idx += 1.
+//
+//   Phase 3 -- advance to next logical line: line_idx += 1, line_cursor
+//   += TEXT_LINE_BYTES (24). Jump back to pg_line_loop.
+//
+//   Phase 4 -- epilogue: xor rax, rax; add rsp, 672; pop 5 callee-save;
+//   ret. Error path: mov rax, 0xFFFFEBCB (movabs; not usable in cmp);
+//   same stack unwind.
+//
+// Cell write per byte (inline, 2 stores):
+//   * mov_d [dst + 0], byte_zx_reg  (4-byte symbol slot; low byte = the
+//                                      ASCII/UTF-8-byte, upper 3 bytes zero
+//                                      -- v1 ASCII approximation, same as
+//                                      Block's title path; a v2 revision
+//                                      folding grapheme-cluster boundary
+//                                      detection lifts this to Width's
+//                                      char_display_width API)
+//   * mov [dst + 4], style_zx_reg   (8-byte fg|bg|mods|reserved slot;
+//                                      style word from spec, defensively
+//                                      shifted `shl 8; shr 8` to zero the
+//                                      pad byte -- same discipline
+//                                      cell_set_style uses).
+//
+// Bytes 12..15 of the cell (reserved tail) are NOT touched per write;
+// they inherit whatever the surrounding writer already zeroed them to
+// (buffer_init at Frame::init clears the whole back region to zero).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Paragraph`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension).
+//   - All immediates in cmp/and fit imm32 (widest: 0xFFFF for u16 mask,
+//     0x57564750 = 1_465_272_144 for PGVW magic, both < 0x7FFFFFFF).
+//   - The one imm64 (PGR_ERR_BAND = 0xFFFFEBCB) goes through `mov reg,
+//     imm64` (movabs); NEVER through cmp/and (the wrap-loop success
+//     check uses `cmp rax, 64` -- imm8 -- against the 64-entry cap and
+//     folds the sentinel into a degrade-to-noop path rather than
+//     needing a direct sentinel compare).
+//   - No 2-op `imul reg, imm`. Every multiply is 2-op `imul reg, reg`
+//     with the constant staged into a scratch register first (e.g.
+//     `mov rcx, 24; imul rax, rcx` for the TEXT_LINE_BYTES stride and
+//     the TEXT_SPAN_BYTES stride).
+//   - Labels prefixed `pg_` per docs/design.md fingerprint discipline.
+//     Every prefix scanned against the union of ls_ / rc_ / ri_ / cd_
+//     / sd_ / bl_ / bl_bv_ / fr_ / tm_ / cell_eq_ / rc_ / cl_ / ci_ /
+//     wk_ / sd_ / sp_ / sw_ / ln_ / lw_ / tx_ / tw_ / bp_ in the
+//     existing src/*.pdx to confirm no collision.
+//   - Effect row `!{mem}` on every function -- reads through spec_ptr
+//     / text_ptr / line array / span array / byte array, writes through
+//     buf_ptr and out_ptr.
+//   - SysV push/pop parity:
+//       * paragraph_spec_init and paragraph_view_pack are pure leafs
+//         (no push/pop, no callee-save writes, no nested call). All
+//         state fits in caller-save regs.
+//       * paragraph_draw pushes 5 callee-save regs (rbx / r12 / r13 /
+//         r14 / r15) = 40 B (rsp entry %16 == 8, +40 = 48 %16 == 0)
+//         and sub rsp, 672 for the stack scratch area (672 %16 == 0,
+//         rsp stays aligned). One nested call site (line_break_
+//         positions) which the aligned rsp satisfies without a further
+//         `sub rsp, 8`.
+//   - Cross-module call convention: bare `call line_break_positions`
+//     per Frame precedent (`call tcc_query_tty_id` etc.); paideia-as's
+//     flat symbol namespace resolves it against src/text.pdx's exported
+//     symbol without a module::function prefix.
+//   - r11 discipline: paragraph_draw uses r11 as a per-iter scratch
+//     (byte address, then dst address). There is NO `lea` in this
+//     module, so paideia-as's r11 LEA-emission scratch never touches
+//     these registers mid-use.
+
+module Paragraph = structure {
+
+  // ==========================================================================
+  // ParagraphSpec layout (48 bytes)
+  // ==========================================================================
+  pub let PARA_SPEC_BYTES        : u64 = 48
+
+  pub let PARA_OFF_RECT          : u64 = 0
+  pub let PARA_OFF_TEXT_PTR      : u64 = 8
+  pub let PARA_OFF_SCROLL_OFFSET : u64 = 16
+  pub let PARA_OFF_WRAP_MODE     : u64 = 24
+  pub let PARA_OFF_ALIGNMENT     : u64 = 32
+  pub let PARA_OFF_STYLE         : u64 = 40
+
+  // ==========================================================================
+  // Wrap-mode ordinals. NONE and WORD are fully implemented at v1; CHAR
+  // is accepted (does not trip PGR_ERR_BAND) but currently renders
+  // identically to NONE (documented v1 approximation; see module header).
+  // ==========================================================================
+  pub let PARA_WRAP_NONE : u64 = 0
+  pub let PARA_WRAP_WORD : u64 = 1
+  pub let PARA_WRAP_CHAR : u64 = 2
+
+  // ==========================================================================
+  // Alignment ordinals (mirrors Text::TEXT_ALIGN_*; stored in the spec +
+  // exported through the view record; v1 draw renders Left only).
+  // ==========================================================================
+  pub let PARA_ALIGN_LEFT   : u64 = 0
+  pub let PARA_ALIGN_CENTER : u64 = 1
+  pub let PARA_ALIGN_RIGHT  : u64 = 2
+
+  // ==========================================================================
+  // Wrap scratch cap. paragraph_draw allocates a 64-slot u64 break-
+  // position array on its own stack (64 * 8 = 512 B) and passes it as
+  // line_break_positions' out buffer. A return > 64 (the out_max) is
+  // read as "line's word-wrap needed more breaks than the cap allows";
+  // paragraph_draw degrades to NoWrap for THAT line (still renders the
+  // first visual row's worth of bytes truncated at the right edge)
+  // rather than aborting the frame. 64 breaks per line comfortably
+  // covers a 4096-cell-wide TUI at a 64-column render Rect (each
+  // segment is at most rect_w cells wide, so 4096 / 64 == 64 segments
+  // per line max), matching the TUI_DIM_MAX ceiling docs/design.md
+  // §2.1 documents.
+  // ==========================================================================
+  pub let PARA_BREAKS_MAX : u64 = 64
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x4B offset = 0xFFFFEBCB, per design/architecture.md §5.1 M2
+  // slice allocation (Layout 0xFFFFEBC0..0xFFFFEBC4; Width reserved
+  // 0xFFFFEBC5..0xFFFFEBC9; Text 0xFFFFEBCA..0xFFFFEBCE with 0xFFFFEBCB
+  // ceded here). Value > 0x7FFFFFFF -- movabs required for `mov reg,
+  // imm`; NEVER usable in cmp/and.
+  // ==========================================================================
+  pub let PGR_ERR_BAND : u64 = 0xFFFFEBCB
+
+  // ==========================================================================
+  // ParagraphView@0.1 semantic-pipe wire (docs/design.md §2.3)
+  //
+  // PGVW_MAGIC = 0x57564750 -- little-endian bytes 0x50 0x47 0x56 0x57
+  // spell "PGVW" (Paragraph View). Fits imm32 (< 0x7FFFFFFF) so the
+  // packer's magic store uses the compact 5-byte `mov r32, imm32`
+  // form, not a 10-byte movabs.
+  // ==========================================================================
+  pub let PGVW_MAGIC           : u64 = 1465272144
+  pub let PGVW_RECORD_BYTES    : u64 = 48
+  pub let PGVW_OFF_MAGIC       : u64 = 0
+  pub let PGVW_OFF_RECORD_LEN  : u64 = 4
+  pub let PGVW_OFF_WRAP_MODE   : u64 = 8
+  pub let PGVW_OFF_ALIGNMENT   : u64 = 12
+  pub let PGVW_OFF_RECT        : u64 = 16
+  pub let PGVW_OFF_SCROLL      : u64 = 24
+  pub let PGVW_OFF_STYLE       : u64 = 32
+  pub let PGVW_OFF_LINE_COUNT  : u64 = 40
+
+  // Schema name ("ParagraphView@0.1", NUL-terminated -- the string a
+  // M2-009 BLAKE3-based schema-hash constant would be computed against,
+  // kept here as the authoritative source so the M2-009 hash landing
+  // has exactly one string to hash and there is no risk of a
+  // byte-for-byte drift between the packer and the hash computation).
+  pub let PGVW_SCHEMA_NAME : [u8; 18] = "ParagraphView@0.1\0"
+  pub let PGVW_SCHEMA_NAME_LEN : u64 = 17
+
+  // ==========================================================================
+  // paragraph_spec_init(dst, rect, text_ptr, scroll_offset,
+  //                     wrap_and_align, style) -> ()
+  //
+  // Pack a ParagraphSpec into 48 bytes at [dst..dst+48). Six args --
+  // exactly the SysV register-arg budget (rdi/rsi/rdx/rcx/r8/r9). The
+  // wrap and alignment fields are combined into one u64 argument so
+  // the spec constructor stays inside the register-arg budget without
+  // spilling a 7th arg onto the caller's stack:
+  //
+  //   wrap_and_align bits:
+  //     [ 0..32)  wrap_mode  (PARA_WRAP_* ordinal 0..2)
+  //     [32..64)  alignment  (PARA_ALIGN_* ordinal 0..2)
+  //
+  // The two fields are extracted at store time (mask 0xFFFFFFFF via
+  // shl 32; shr 32 for the low, shr 32 for the high) and stored as
+  // full u64 slots in the spec at their fixed offsets. A caller
+  // passing junk in bits [40..64) of the alignment half or bits [8..32)
+  // of the wrap half sees that junk end up in the spec's field verbatim
+  // (constructor is total; paragraph_draw catches wrap_mode > 2 at
+  // render time via PGR_ERR_BAND, and out-of-range alignment is silent
+  // at v1 -- alignment is not consulted in the draw body).
+  //
+  // Register plan: rdi=dst, rsi=rect, rdx=text_ptr, rcx=scroll_offset,
+  // r8=wrap_and_align, r9=style, rax=extract scratch. Pure leaf: no
+  // callee-save touched, no push/pop, no nested call. Effect `!{mem}`
+  // (six 8-byte stores).
+  // ==========================================================================
+  pub let paragraph_spec_init : (u64, u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (rect: u64) (text_ptr: u64) (scroll_offset: u64) (wrap_and_align: u64) (style: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-004 (postui#13): paragraph_spec_init writes 48 bytes of ParagraphSpec into [rdi..rdi+48). Six 8-byte stores at offsets 0/8/16/24/32/40 for rect/text_ptr/scroll_offset/wrap_mode/alignment/style. Wrap+alignment share one arg (r8): low 32 bits are wrap_mode, high 32 bits are alignment. Extract low via `mov rax, r8; shl rax, 32; shr rax, 32` (mask 0xFFFFFFFF without needing an imm64 mask -- the shift-pair trick cell_set_style already uses for the same imm64 avoidance), store at +24. Extract high via `mov rax, r8; shr rax, 32`, store at +32. Both stores as full qword; the u64 spec slot is naturally sized for a u32 payload with the high 32 bits zero. Every immediate (0, 8, 16, 24, 32, 40) fits imm32 trivially; every shift count (32) is imm8. No `test`, no `imul`, no `and reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (six qword stores).",
+      block: {
+        // ---- [rdi + 0] = rect ------------------------------------------------
+        mov [rdi + 0], rsi;
+
+        // ---- [rdi + 8] = text_ptr --------------------------------------------
+        mov [rdi + 8], rdx;
+
+        // ---- [rdi + 16] = scroll_offset --------------------------------------
+        mov [rdi + 16], rcx;
+
+        // ---- [rdi + 24] = wrap_mode (low 32 of r8) ---------------------------
+        mov rax, r8;
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdi + 24], rax;
+
+        // ---- [rdi + 32] = alignment (high 32 of r8) --------------------------
+        mov rax, r8;
+        shr rax, 32;
+        mov [rdi + 32], rax;
+
+        // ---- [rdi + 40] = style ----------------------------------------------
+        mov [rdi + 40], r9;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // paragraph_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature -- postui.M1-007's WidgetKind
+  // dispatch keys against exactly this shape when routing WK_PARAGRAPH
+  // (ordinal 1) to this function. `rows` is not read by this body
+  // (buffer indexing uses cols, not rows) kept for signature uniformity
+  // with every other widget_draw variant.
+  //
+  // Returns 0 on OK, PGR_ERR_BAND (0xFFFFEBCB) on wrap_mode > 2 or
+  // scroll_offset > line_count.
+  //
+  // Register plan (5 SysV callee-save pushes = 40 B; entry rsp%16==8,
+  // +40==0; sub rsp, 672 keeps rsp aligned for the nested line_break_
+  // positions call):
+  //   rbx = buf_ptr            r12 = cols               r13 = spec_ptr
+  //   r14 = packed rect        r15 = text_ptr
+  //
+  // Stack scratch (672 bytes) -- offsets relative to rsp AFTER the
+  // sub rsp, 672:
+  //   [+  0.. 512)  break_positions[0..64]   (64-slot u64 array)
+  //   [+512.. 520)  cur_y                    (current output row)
+  //   [+520.. 528)  line_idx                 (current logical line)
+  //   [+528.. 536)  line_cursor              (address of current Line struct)
+  //   [+536.. 544)  break_count              (from line_break_positions)
+  //   [+544.. 552)  seg_idx                  (visual segment within line)
+  //   [+552.. 560)  seg_start                (byte offset)
+  //   [+560.. 568)  total_bytes              (sum of span.byte_len this line)
+  //   [+568.. 576)  scroll_offset            (cached from spec+16)
+  //   [+576.. 584)  line_count               (cached from text_ptr+8)
+  //   [+584.. 592)  wrap_mode                (cached from spec+24)
+  //   [+592.. 600)  style                    (cached from spec+40)
+  //   [+600.. 608)  seg_end                  (byte offset)
+  //   [+608.. 616)  bx                       (cached from rect)
+  //   [+616.. 624)  by                       (cached)
+  //   [+624.. 632)  bw                       (cached)
+  //   [+632.. 640)  bh                       (cached)
+  //   [+640.. 648)  xe = bx + bw             (cached)
+  //   [+648.. 656)  ye = by + bh             (cached)
+  //   [+656.. 664)  span_ptr                 (current span's byte pointer)
+  //   [+664.. 672)  span_hi                  (hi byte-offset bound in span)
+  //
+  //   Alignment: entry rsp%16==8; +40==48; +672==720; both aligned to 16.
+  //
+  // Labels prefixed pg_ per docs fingerprint discipline (pg_line_loop,
+  // pg_seg_loop, pg_span_walk, pg_byte_loop, pg_line_done, pg_done_ok,
+  // pg_err, and various sub-labels).
+  // ==========================================================================
+  pub let paragraph_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-004 (postui#13): paragraph_draw is the widget_draw entry for WK_PARAGRAPH. Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) then sub rsp, 672 for the stack scratch area (48 slots + a 64-entry break-position array; 672 %16 == 0 so rsp remains aligned for the nested line_break_positions call). Phase 0 (prologue): cache buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (from [r13+0]), text_ptr in r15 (from [r13+8]). Extract rect fields (bx/by/bw/bh) into stack slots [rsp+608..640) via mov/shr/and 0xFFFF chains; precompute xe = bx+bw and ye = by+bh into [rsp+640..656). Early exits: text_ptr == 0, bw == 0, or bh == 0 -> jmp pg_done_ok (rax = 0). Cache scroll_offset ([rsp+568]), wrap_mode ([rsp+584] after cmp <=2 gate; > 2 -> pg_err), style ([rsp+592]) from spec fields. Load line_count from [r15+8] into [rsp+576]. Validate scroll_offset <= line_count: > -> pg_err; == -> pg_done_ok (empty draw is not an error). Initialize line_idx = scroll_offset, line_cursor = lines_ptr + scroll_offset * 24 (imul reg,reg with 24 staged in rdi, paideia-as-safe), cur_y = by. Phase 1 (line loop, label pg_line_loop): cmp cur_y >= ye OR line_idx >= line_count -> pg_done_ok. If wrap_mode == 1 (WORD): call line_break_positions(line_cursor, bw, rsp, 64). Return in rax; > 64 is either an error sentinel or an over-cap count -- either way, cmp rax, 64; ja triggers a degrade path that zeroes break_count for THIS line (line renders as one visual row truncated). This avoids needing to compare against 0xFFFFEB80 which does not fit imm32. Store break_count into [rsp+536]. Compute total_bytes: walk the line's Span array (span_count from [line_cursor+8], stride 24 via imul rcx=24), sum span.byte_len from each [span+8] into r8; store to [rsp+560]. Initialize seg_idx = 0, seg_start = 0. Phase 2 (segment loop, label pg_seg_loop): cmp cur_y >= ye -> pg_line_done. Compute seg_end: if seg_idx < break_count, seg_end = break_positions[seg_idx] (index via `mov rdi, rcx; shl rdi, 3; mov rax, [rsp + rdi + 0]`, imm8 shift); else seg_end = total_bytes. Store to [rsp+600]. Draw segment [seg_start, seg_end): walk spans linearly (spans_ptr from [line_cursor+0], span_count -> spans_end via imul reg,reg), maintaining span_start_abs in r13 (repurposed post-prologue; spec_ptr is no longer needed since all needed fields are cached). Per span: skip if span_len == 0; span_end_abs = span_start_abs + span_len (in r11 temp, but recompute each iteration); compute lo = max(span_start_abs, seg_start) and hi = min(span_end_abs, seg_end); if hi <= lo, skip. Store span_ptr ([rsi+0]) to [rsp+656], store hi to [rsp+664]. Byte loop (label pg_byte_loop): cmp rax, [rsp+664]; jae pg_span_next. col = rax - seg_start; if col >= bw, jae pg_seg_written (right-edge truncation). byte_index = rax - span_start_abs; byte_addr = [rsp+656] + byte_index; xor r15, r15; mov_b r15, [byte_addr]. Compute dst = buf_ptr + (cur_y * cols + bx + col) * 16 via `mov r11, cur_y; imul r11, r12; add r11, bx; add r11, rdi; shl r11, 4; add r11, rbx`. Cell write: mov_d [r11+0], r15 (symbol slot, low byte = char, upper 3 zero); reload style into r15 from [rsp+592]; shl r15, 8; shr r15, 8 (defensively zero pad byte, same discipline cell_set_style uses to guarantee cell byte 11 == 0); mov [r11+4], r15 (8-byte fg/bg/mods slot). Cell bytes 12..15 not touched -- retain zero from buffer_init. add rax, 1; jmp pg_byte_loop. pg_span_next: span_start_abs += span_len (from [rsi+8] since r8 was overwritten inside byte loop); span cursor += 24; jmp pg_span_walk. pg_seg_written: seg_start = seg_end ([rsp+600]); cur_y++; seg_idx++; if seg_idx < break_count + 1, jmp pg_seg_loop; else fall through to pg_line_done. pg_line_done: line_idx++; line_cursor += 24; jmp pg_line_loop. Phase 4 (epilogue): pg_done_ok: xor rax, rax; add rsp, 672; pop 5 callee-save; ret. pg_err: mov rax, 0xFFFFEBCB (movabs; imm > 0x7FFFFFFF, legal for mov not cmp); same unwind. Every cmp/and immediate (0, 1, 2, 24, 64, 0xFFFF, 3, 4, 8, 16, 32, 48) fits imm32. Every shift count (3 for u64-array index, 4 for CELL_BYTES address math, 8 for style pad zeroing, 16/32/48 for rect field extraction) is imm8. No `test`, no 2-op `imul reg, imm` (only `imul rax, rcx` / `imul r11, r12` patterns, all reg,reg). No `and reg, imm64`. No `lea` in the body -- paideia-as r11 LEA-scratch discipline never touches r11 mid-use. One nested call site (line_break_positions); rsp aligned before the call. Effect `!{mem}` covers reads through r13/r15/rsi/rbx and writes through r11 (cell) and [rsp] (break array). Labels prefixed pg_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 672;
+
+        // ---- Phase 0: cache args into callee-save regs ----------------------
+        mov r13, rdi;                       // r13 = spec_ptr
+        mov rbx, rsi;                       // rbx = buf_ptr
+        mov r12, rcx;                       // r12 = cols
+        mov r14, [r13 + 0];                 // r14 = packed rect
+        mov r15, [r13 + 8];                 // r15 = text_ptr
+
+        // ---- Extract bx / by / bw / bh into stack ---------------------------
+        mov rax, r14;
+        and rax, 0xFFFF;
+        mov [rsp + 608], rax;               // bx
+
+        mov rax, r14;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 616], rax;               // by
+
+        mov rax, r14;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 624], rax;               // bw
+
+        mov rax, r14;
+        shr rax, 48;
+        mov [rsp + 632], rax;               // bh
+
+        // xe = bx + bw
+        mov rax, [rsp + 608];
+        add rax, [rsp + 624];
+        mov [rsp + 640], rax;
+
+        // ye = by + bh
+        mov rax, [rsp + 616];
+        add rax, [rsp + 632];
+        mov [rsp + 648], rax;
+
+        // ---- Early exits (trivially empty) ----------------------------------
+        cmp r15, 0;
+        je  pg_done_ok;
+
+        mov rax, [rsp + 624];               // bw
+        cmp rax, 0;
+        je  pg_done_ok;
+
+        mov rax, [rsp + 632];               // bh
+        cmp rax, 0;
+        je  pg_done_ok;
+
+        // ---- Cache scroll_offset / wrap_mode (validated) / style -----------
+        mov rax, [r13 + 16];
+        mov [rsp + 568], rax;               // scroll_offset
+
+        mov rax, [r13 + 24];
+        cmp rax, 2;
+        ja  pg_err;                         // wrap_mode > 2 -> error
+        mov [rsp + 584], rax;               // wrap_mode
+
+        mov rax, [r13 + 40];
+        mov [rsp + 592], rax;               // style
+
+        // ---- Load line_count from Text struct ------------------------------
+        mov rax, [r15 + 8];
+        mov [rsp + 576], rax;               // line_count
+
+        // ---- Validate scroll_offset vs line_count --------------------------
+        mov rcx, [rsp + 568];
+        cmp rcx, rax;
+        ja  pg_err;
+        je  pg_done_ok;                     // scroll == count: nothing to draw
+
+        // ---- Initialize line_idx, line_cursor, cur_y -----------------------
+        mov [rsp + 520], rcx;               // line_idx = scroll_offset
+
+        // line_cursor = lines_ptr + scroll_offset * 24
+        mov rax, rcx;
+        mov rdi, 24;
+        imul rax, rdi;
+        mov rdx, [r15 + 0];                 // lines_ptr
+        add rax, rdx;
+        mov [rsp + 528], rax;               // line_cursor
+
+        // cur_y = by
+        mov rax, [rsp + 616];
+        mov [rsp + 512], rax;
+
+        // =====================================================================
+        // Phase 1: outer line loop
+        // =====================================================================
+      pg_line_loop:
+        // cur_y >= ye ?
+        mov rax, [rsp + 512];
+        mov rdx, [rsp + 648];
+        cmp rax, rdx;
+        jae pg_done_ok;
+
+        // line_idx >= line_count ?
+        mov rax, [rsp + 520];
+        mov rdx, [rsp + 576];
+        cmp rax, rdx;
+        jae pg_done_ok;
+
+        // Compute break positions if WordWrap
+        mov rax, [rsp + 584];
+        cmp rax, 1;
+        jne pg_no_wrap;
+
+        // WordWrap: call line_break_positions(line_cursor, bw, rsp, 64)
+        mov rdi, [rsp + 528];               // line_cursor
+        mov rsi, [rsp + 624];               // bw = max_width
+        mov rdx, rsp;                       // out_positions_ptr (base of array)
+        mov rcx, 64;                        // out_max
+        call line_break_positions;
+
+        // If rax > 64 (either error sentinel or over-cap), degrade to NoWrap.
+        cmp rax, 64;
+        jbe pg_bp_ok;
+        xor rax, rax;
+      pg_bp_ok:
+        mov [rsp + 536], rax;               // break_count
+        jmp pg_wrap_ready;
+
+      pg_no_wrap:
+        xor rax, rax;
+        mov [rsp + 536], rax;               // break_count = 0
+
+      pg_wrap_ready:
+        // Compute total_bytes for this line
+        mov rdi, [rsp + 528];               // line_cursor
+        mov rsi, [rdi + 0];                 // spans_ptr
+        mov rdx, [rdi + 8];                 // span_count
+        xor r8,  r8;                        // total
+        xor rcx, rcx;                       // i
+      pg_total_loop:
+        cmp rcx, rdx;
+        jae pg_total_done;
+        // ptr = spans_ptr + i * 24
+        mov r9, rcx;
+        mov r10, 24;
+        imul r9, r10;
+        add r9, rsi;
+        mov r10, [r9 + 8];                  // span.byte_len
+        add r8, r10;
+        add rcx, 1;
+        jmp pg_total_loop;
+      pg_total_done:
+        mov [rsp + 560], r8;                // total_bytes
+
+        // Init seg_idx = 0, seg_start = 0
+        xor rax, rax;
+        mov [rsp + 544], rax;               // seg_idx
+        mov [rsp + 552], rax;               // seg_start
+
+        // =====================================================================
+        // Phase 2: inner segment loop
+        // =====================================================================
+      pg_seg_loop:
+        // cur_y >= ye ?
+        mov rax, [rsp + 512];
+        mov rdx, [rsp + 648];
+        cmp rax, rdx;
+        jae pg_line_done;
+
+        // Determine seg_end
+        mov rcx, [rsp + 544];               // seg_idx
+        mov rdx, [rsp + 536];               // break_count
+        cmp rcx, rdx;
+        jae pg_seg_last;
+        // seg_end = break_positions[seg_idx] -- compute address via
+        // scratch reg to avoid SIB-with-rsp-base encoding concerns.
+        mov rdi, rcx;
+        shl rdi, 3;
+        mov r15, rsp;
+        add r15, rdi;
+        mov rax, [r15 + 0];
+        jmp pg_seg_end_ready;
+      pg_seg_last:
+        mov rax, [rsp + 560];               // seg_end = total_bytes
+      pg_seg_end_ready:
+        mov [rsp + 600], rax;               // seg_end
+
+        // ---- Draw segment [seg_start, seg_end) at cur_y --------------------
+        mov rdx, [rsp + 552];               // rdx = seg_start (pinned)
+
+        // Walk spans of current line
+        mov rdi, [rsp + 528];               // line_cursor
+        mov r8,  [rdi + 0];                 // spans_ptr
+        mov r10, [rdi + 8];                 // span_count
+
+        // spans_end = spans_ptr + span_count * 24
+        mov r9, r10;
+        mov r11, 24;
+        imul r9, r11;
+        add r9, r8;                         // r9 = spans_end
+        mov rsi, r8;                        // rsi = span cursor
+        xor r13, r13;                       // span_start_abs = 0
+
+      pg_span_walk:
+        cmp rsi, r9;
+        jae pg_seg_written;
+
+        mov r8, [rsi + 8];                  // span_len
+        cmp r8, 0;
+        je  pg_span_next;
+
+        // span_end_abs = span_start_abs + span_len -> r11
+        mov r11, r13;
+        add r11, r8;
+
+        // lo = max(r13, rdx) into rax
+        cmp r13, rdx;
+        jae pg_use_span_lo;
+        mov rax, rdx;
+        jmp pg_have_lo;
+      pg_use_span_lo:
+        mov rax, r13;
+      pg_have_lo:
+        // hi = min(r11, seg_end) into rcx
+        mov rcx, r11;
+        mov r15, [rsp + 600];               // seg_end
+        cmp rcx, r15;
+        jbe pg_have_hi;
+        mov rcx, r15;
+      pg_have_hi:
+        // If hi <= lo, span contributes nothing to this segment
+        cmp rax, rcx;
+        jae pg_span_next;
+
+        // Cache span_ptr and hi for the byte loop
+        mov r15, [rsi + 0];
+        mov [rsp + 656], r15;               // span_ptr
+        mov [rsp + 664], rcx;               // span_hi
+
+        // ---- Byte loop ----------------------------------------------------
+      pg_byte_loop:
+        mov rcx, [rsp + 664];               // reload hi (was in rcx but rcx clobbered)
+        cmp rax, rcx;
+        jae pg_span_next;
+
+        // col = rax - seg_start (rdx)
+        mov rdi, rax;
+        sub rdi, rdx;
+
+        // If col >= bw, done with THIS segment entirely (right-edge trunc)
+        mov r15, [rsp + 624];               // bw
+        cmp rdi, r15;
+        jae pg_seg_written;
+
+        // byte_index_in_span = rax - r13
+        mov r15, rax;
+        sub r15, r13;
+
+        // byte_addr = span_ptr + byte_index
+        mov r11, [rsp + 656];
+        add r11, r15;
+
+        // Load byte (zero-extended)
+        xor r15, r15;
+        mov_b r15, [r11 + 0];
+
+        // dst = buf_ptr + (cur_y * cols + bx + col) * 16
+        mov r11, [rsp + 512];               // cur_y
+        imul r11, r12;                      // cur_y * cols (reg,reg)
+        add r11, [rsp + 608];               // + bx
+        add r11, rdi;                       // + col
+        shl r11, 4;                         // * CELL_BYTES (16)
+        add r11, rbx;                       // + buf_ptr
+
+        // Cell write: symbol slot (4 bytes, low byte = char)
+        mov_d [r11 + 0], r15;
+
+        // Cell write: style word (8 bytes at +4)
+        mov r15, [rsp + 592];               // style
+        shl r15, 8;
+        shr r15, 8;                         // defensively zero pad byte
+        mov [r11 + 4], r15;
+
+        add rax, 1;
+        jmp pg_byte_loop;
+
+      pg_span_next:
+        // span_start_abs += span_len (reload span_len; r8 was clobbered)
+        mov r15, [rsi + 8];
+        add r13, r15;
+        // span cursor += TEXT_SPAN_BYTES (24)
+        add rsi, 24;
+        jmp pg_span_walk;
+
+      pg_seg_written:
+        // Advance to next segment
+        mov rax, [rsp + 600];               // seg_end
+        mov [rsp + 552], rax;               // seg_start = seg_end
+
+        mov rax, [rsp + 512];               // cur_y++
+        add rax, 1;
+        mov [rsp + 512], rax;
+
+        mov rax, [rsp + 544];               // seg_idx++
+        add rax, 1;
+        mov [rsp + 544], rax;
+
+        // Total segments = break_count + 1
+        mov rdx, [rsp + 536];
+        add rdx, 1;
+        cmp rax, rdx;
+        jb  pg_seg_loop;
+        // fall through to pg_line_done
+
+      pg_line_done:
+        // Advance to next logical line
+        mov rax, [rsp + 520];
+        add rax, 1;
+        mov [rsp + 520], rax;
+
+        mov rax, [rsp + 528];
+        add rax, 24;
+        mov [rsp + 528], rax;
+
+        jmp pg_line_loop;
+
+      pg_done_ok:
+        xor rax, rax;
+        add rsp, 672;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pg_err:
+        mov rax, 0xFFFFEBCB;
+        add rsp, 672;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // paragraph_view_pack(spec_ptr, dst) -> u64 (record_len = 48)
+  //
+  // Pack a ParagraphView@0.1 record into [dst..dst+48). Fixed size; no
+  // variable-length payload (Paragraph's own text bytes live behind
+  // text_ptr and are per-process, not stream-copyable through the
+  // semantic pipe -- the view is a control-plane snapshot).
+  //
+  // Field marshalling matches the wire block in the module header:
+  //   +0   magic       (u32) = PGVW_MAGIC
+  //   +4   record_len  (u32) = 48
+  //   +8   wrap_mode   (u32) from spec+24 (u64 truncated)
+  //   +12  alignment   (u32) from spec+32 (u64 truncated)
+  //   +16  rect_pack   (u64) from spec+0  verbatim
+  //   +24  scroll_off  (u64) from spec+16 verbatim
+  //   +32  style       (u64) from spec+40 verbatim
+  //   +40  line_count  (u64) from Text::text_line_count via text_ptr
+  //                             (spec+8); if text_ptr == 0, line_count = 0.
+  //
+  // Register plan: rdi=spec_ptr (read-only), rsi=dst (write-only until
+  // return), rax=scratch/return. Pure leaf: no callee-save touched, no
+  // push/pop, no nested call. Effect `!{mem}` (reads through rdi and
+  // through rdi's text_ptr; writes through rsi).
+  // Labels prefixed pg_pv_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let paragraph_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-004 (postui#13): paragraph_view_pack lays a ParagraphView@0.1 record at [rsi..rsi+48). Fixed size; NO variable-length payload (Paragraph text is per-process behind text_ptr, not stream-copyable). Header phase: `mov rax, 1465272144` (PGVW_MAGIC = 0x57564750, fits imm32 so paideia-as emits the compact 5-byte mov r32, imm32 form, not a 10-byte movabs), mov_d [rsi+0], rax; `mov rax, 48`, mov_d [rsi+4], rax. Wrap_mode + alignment: load u64 from spec+24 / spec+32, store as 4-byte u32 slot via mov_d (upper 32 bits silently truncated; a spec-level value > 0xFFFFFFFF would already be a documented caller bug). Rect / scroll / style: three verbatim u64 copies at +16/+24/+32 (rect wire is identical between ParagraphSpec+0 and this view+16, so no per-field marshalling). line_count: load text_ptr from spec+8; cmp text_ptr, 0; je pg_pv_no_text (zero fallback); else mov rax, [text_ptr + 8] (Text struct's line_count field per src/text.pdx TEXT_TEXT_OFF_LINE_COUNT = 8); jmp pg_pv_write_count. pg_pv_no_text: xor rax, rax. pg_pv_write_count: mov [rsi+40], rax. Return record_len = 48. Every immediate (0, 4, 8, 12, 16, 24, 32, 40, 48, 1_465_272_144) fits imm32. No `test`, no `imul`, no `and reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (reads through rdi and transitively through the text_ptr in [rdi+8]; writes through rsi). Labels prefixed pg_pv_ per docs fingerprint discipline.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 1465272144;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 48;
+        mov_d [rsi + 4], rax;
+
+        // ---- wrap_mode (u32) at [rsi + 8] ----------------------------------
+        mov rax, [rdi + 24];
+        mov_d [rsi + 8], rax;
+
+        // ---- alignment (u32) at [rsi + 12] ---------------------------------
+        mov rax, [rdi + 32];
+        mov_d [rsi + 12], rax;
+
+        // ---- rect_pack (u64) at [rsi + 16] verbatim ------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 16], rax;
+
+        // ---- scroll_offset (u64) at [rsi + 24] verbatim --------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 24], rax;
+
+        // ---- style (u64) at [rsi + 32] verbatim ----------------------------
+        mov rax, [rdi + 40];
+        mov [rsi + 32], rax;
+
+        // ---- line_count (u64) at [rsi + 40] via text_ptr -------------------
+        mov rax, [rdi + 8];                 // text_ptr
+        cmp rax, 0;
+        je  pg_pv_no_text;
+        mov rax, [rax + 8];                 // Text.line_count
+        jmp pg_pv_write_count;
+      pg_pv_no_text:
+        xor rax, rax;
+      pg_pv_write_count:
+        mov [rsi + 40], rax;
+
+        // ---- Return record_len = 48 ----------------------------------------
+        mov rax, 48;
+        ret;
+      }
+    }
+
+}
