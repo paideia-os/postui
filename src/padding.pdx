@@ -1,0 +1,283 @@
+// src/padding.pdx -- postui.M4-004 (paideia-os/postui#30)
+//
+// Padding: shared inset utility (parent Rect + four sides -> new Rect).
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M4-004)
+// =============================================================================
+//
+// Padding is a UTILITY module, not a widget: it ships no state record,
+// no draw entry, no view_pack, no WidgetKind ordinal, and no error
+// sentinel. Its job is to shrink an axis-aligned Rect by per-side pad
+// amounts and return a new packed Rect -- the same computation
+// block_inner (src/block.pdx) already performs inline for its own
+// border+padding shrink, factored out so downstream widgets (popup
+// overlays, containers layered on top of a Clear, Ratatui-parity
+// Padding wrapper) do not each re-derive the inset math.
+//
+// Two public entries:
+//
+//   padding_inset(parent, top, right, bottom, left) -> u64 packed Rect
+//     Shrink parent by the four per-side amounts. On underflow (any
+//     paddings-sum exceeding the corresponding parent dimension) return
+//     the zero-Rect (0,0,0,0) rather than an error sentinel -- see the
+//     "Error posture" section below for why.
+//
+//   padding_uniform(parent, pad) -> u64 packed Rect
+//     Convenience: same pad on all four sides. Inlines the inset math
+//     (rather than tail-calling padding_inset) to keep every Padding
+//     entry a pure leaf with no push/pop stack management.
+//
+// =============================================================================
+// INSET MATH
+// =============================================================================
+//
+// Let (x, y, w, h) = unpack(parent). Then:
+//
+//   x' = x + left
+//   y' = y + top
+//   w' = w - (left + right)    -- if w  < left + right : return zero-Rect
+//   h' = h - (top  + bottom)   -- if h  < top  + bottom: return zero-Rect
+//
+// The subtractions are checked with `cmp reg, reg; jb pad_zero` BEFORE
+// the sub, so an underflow never actually happens on the wire and no
+// two's-complement wrap corrupts a valid dimension. If EITHER dimension
+// underflows the whole return is (0,0,0,0), not "underflow in w, keep
+// h" -- a Rect with one zero dimension is functionally empty (its area
+// is zero and every draw body early-returns), so collapsing both to
+// zero on any underflow is the simpler contract callers can reason
+// about.
+//
+// Every padding argument is masked to 16 bits at entry as a defensive
+// posture: if a caller passes `left = 0xFFFFFFFFFFFFFFFF` (a u64 all-
+// ones garbage value), the sum `left + right` would wrap to a small
+// number and the `cmp reg, reg; jb` guard would fail to detect the
+// underflow. Masking to 16 bits (matching Rect's own per-field wire
+// bound, rect.pdx L41) bounds every sum to at most 0x1FFFE which
+// cannot wrap a u64. RECT_DIM_MAX = 4096 (rect.pdx L56) is a tighter
+// semantic ceiling higher layers enforce -- this module only enforces
+// the wire-shape bound.
+//
+// =============================================================================
+// ERROR POSTURE (zero-Rect vs error sentinel)
+// =============================================================================
+//
+// Padding is a UTILITY (not a widget) so:
+//
+//   (a) There is no widget_draw dispatch to key an error sentinel band
+//       to, and no view_pack schema to attach a semantic-pipe failure
+//       record to.
+//   (b) The natural "empty rect" return path already exists in every
+//       widget's draw body -- a Rect of bw==0 or bh==0 is short-
+//       circuited before any cell is written (see gauge_draw L326,
+//       clear_draw L167). Returning a zero-Rect on underflow lets a
+//       caller compose padding into an existing draw pipeline without
+//       any conditional error-check.
+//   (c) A zero-Rect is deterministically distinguishable from a
+//       legitimate result: rect_w(0) == 0 AND rect_h(0) == 0, exactly
+//       the guard shape rect_intersect already returns on non-overlap
+//       (rect.pdx L323 ri_empty). Callers that need "did padding
+//       collapse the rect?" test rect_w/rect_h of the return, not the
+//       packed word.
+//
+// This matches the posture the issue text explicitly calls out:
+// "if underflow (paddings exceed dimensions), return zero-Rect (0,0,0,0)
+// rather than error sentinel".
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Padding`), matches file basename
+//     (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`. Underflow
+//     checks are `cmp reg, reg; jb`.
+//   - All immediates in cmp/and fit imm32: 0xFFFF (65535), 0, shift
+//     counts 16/32/48. No `cmp reg, imm64`, no `and reg, imm64` anywhere.
+//   - No `imul` (Padding has no multiplicative arithmetic; every
+//     computation is add/sub/shift/or).
+//   - Every entry is a PURE LEAF: no push/pop, no callee-save touched,
+//     no nested call, no memory access. All state lives in registers.
+//     Effect row `!{} @{}` throughout.
+//   - Labels prefixed `pad_` per docs/design.md fingerprint discipline.
+
+module Padding = structure {
+
+  // ==========================================================================
+  // padding_inset(parent, top, right, bottom, left) -> u64 packed Rect
+  //
+  // Shrink parent by the four per-side pad amounts. On underflow (any
+  // paddings-sum exceeding the corresponding parent dimension) return
+  // the zero-Rect (0,0,0,0).
+  //
+  // Register plan (pure leaf):
+  //   rdi = parent (read-only, unpacked field-by-field into rax scratch)
+  //   rsi = top    (masked to u16 at entry)
+  //   rdx = right  (masked to u16 at entry)
+  //   rcx = bottom (masked to u16 at entry)
+  //   r8  = left   (masked to u16 at entry)
+  //   r9  = intermediate sum (left+right, top+bottom)
+  //   r10 = w' (surviving through pack)
+  //   r11 = h' (surviving through pack)
+  //   rax = extract scratch / final pack accumulator / return
+  //
+  // All caller-save; no push/pop. Labels prefixed pad_ per docs
+  // fingerprint discipline.
+  // ==========================================================================
+  pub let padding_inset : (u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (parent: u64) (top: u64) (right: u64) (bottom: u64) (left: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M4-004 (postui#30): padding_inset shrinks a packed Rect by four per-side amounts. Pure leaf: no push/pop, no callee-save touched, no memory access, no nested call. Phase 0 (mask paddings to u16 defensively): and rsi/rdx/rcx/r8, 0xFFFF -- bounds every argument to at most 0xFFFF so any subsequent sum is <= 0x1FFFE (cannot wrap u64), defending against a caller passing garbage high bits. Phase 1 (width underflow check + shrink): extract w = (parent >> 32) & 0xFFFF into rax; compute r9 = left + right (mov r9, r8; add r9, rdx); if w < r9 -> jb pad_zero. Else sub rax, r9 -> rax = w'; mov r10, rax. Phase 2 (height underflow check + shrink): extract h = parent >> 48 into rax (no mask needed -- h occupies top 16 bits so shr zero-extends); compute r9 = top + bottom (mov r9, rsi; add r9, rcx); if h < r9 -> jb pad_zero. Else sub rax, r9 -> rax = h'; mov r11, rax. Phase 3 (translate origin): extract x = parent & 0xFFFF into rax; add rax, r8 -> rax = x' (still <= 0x1FFFE, mask later before pack). Extract y = (parent >> 16) & 0xFFFF into r9; add r9, rsi -> r9 = y'. Phase 4 (pack): mask all four fields to u16 (and rax/r9/r10/r11, 0xFFFF), shift y'/w'/h' into their slots (16/32/48), OR into rax. Immediates 0xFFFF, 16, 32, 48 all fit imm32/imm8. pad_zero epilogue: xor rax, rax; ret. Every cmp is cmp reg, reg (no imm-gate concern). No `test`. No `imul`. No memory access. Labels prefixed pad_ per docs fingerprint discipline.",
+      block: {
+        // ---- Phase 0: defensive mask of paddings to u16 -------------------
+        and rsi, 0xFFFF;                  // top
+        and rdx, 0xFFFF;                  // right
+        and rcx, 0xFFFF;                  // bottom
+        and r8,  0xFFFF;                  // left
+
+        // ---- Phase 1: width underflow check + shrink ----------------------
+        // w = (parent >> 32) & 0xFFFF
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        // r9 = left + right
+        mov r9, r8;
+        add r9, rdx;
+        // if w < left + right -> zero
+        cmp rax, r9;
+        jb  pad_zero;
+        sub rax, r9;
+        mov r10, rax;                     // r10 = w'
+
+        // ---- Phase 2: height underflow check + shrink ---------------------
+        // h = parent >> 48 (top 16 bits, no mask needed)
+        mov rax, rdi;
+        shr rax, 48;
+        // r9 = top + bottom
+        mov r9, rsi;
+        add r9, rcx;
+        // if h < top + bottom -> zero
+        cmp rax, r9;
+        jb  pad_zero;
+        sub rax, r9;
+        mov r11, rax;                     // r11 = h'
+
+        // ---- Phase 3: translate origin ------------------------------------
+        // x' = (parent & 0xFFFF) + left
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        add rax, r8;                      // rax = x' (unmasked)
+
+        // y' = ((parent >> 16) & 0xFFFF) + top
+        mov r9, rdi;
+        shr r9, 16;
+        and r9, 0xFFFF;
+        add r9, rsi;                      // r9 = y' (unmasked)
+
+        // ---- Phase 4: pack (x' | y'<<16 | w'<<32 | h'<<48) ----------------
+        and rax, 0xFFFF;
+        and r9,  0xFFFF;
+        and r10, 0xFFFF;
+        and r11, 0xFFFF;
+
+        shl r9,  16;
+        shl r10, 32;
+        shl r11, 48;
+
+        or  rax, r9;
+        or  rax, r10;
+        or  rax, r11;
+        ret;
+
+      pad_zero:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // padding_uniform(parent, pad) -> u64 packed Rect
+  //
+  // Convenience: shrink parent by the same pad amount on all four sides.
+  // Inlines the inset math (rather than tail-calling padding_inset) to
+  // keep every Padding entry a pure leaf with no push/pop -- a nested
+  // SysV call would require pushing one callee-save to re-align rsp.
+  //
+  // Register plan (pure leaf):
+  //   rdi = parent (read-only)
+  //   rsi = pad    (masked to u16 at entry; reused as top/right/bottom/left)
+  //   r9  = intermediate 2*pad
+  //   r10 = w' (surviving through pack)
+  //   r11 = h' (surviving through pack)
+  //   rax = extract scratch / final pack accumulator / return
+  //
+  // All caller-save; no push/pop. Labels prefixed pad_u_ per docs
+  // fingerprint discipline.
+  // ==========================================================================
+  pub let padding_uniform : (u64, u64) -> u64 !{} @{} =
+    fn (parent: u64) (pad: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M4-004 (postui#30): padding_uniform is the (parent, pad) -> Rect convenience over padding_inset (parent, pad, pad, pad, pad). Inlined rather than tail-called so this entry stays a pure leaf with no push/pop -- a nested SysV call would require pushing one callee-save to keep rsp%16==0. Pure leaf: no push/pop, no callee-save touched, no memory access, no nested call. Phase 0 (mask pad to u16 defensively): and rsi, 0xFFFF. Compute r9 = 2*pad = pad + pad (mov r9, rsi; add r9, rsi) -- reused for both width and height underflow check since left+right == top+bottom == 2*pad. Phase 1 (width underflow check + shrink): extract w = (parent >> 32) & 0xFFFF into rax; if w < r9 -> jb pad_u_zero. sub rax, r9 -> rax = w'; mov r10, rax. Phase 2 (height underflow check + shrink): extract h = parent >> 48 into rax; if h < r9 -> jb pad_u_zero. sub rax, r9 -> rax = h'; mov r11, rax. Phase 3 (translate origin): extract x = parent & 0xFFFF into rax; add rax, rsi -> rax = x'. Extract y = (parent >> 16) & 0xFFFF into r9; add r9, rsi -> r9 = y'. Phase 4 (pack): mask, shift, OR (identical to padding_inset's pack). pad_u_zero epilogue: xor rax, rax; ret. Every immediate (0xFFFF, 0, 16, 32, 48) fits imm32/imm8. Every cmp is cmp reg, reg. No `test`. No `imul`. No memory access. Labels prefixed pad_u_ per docs fingerprint discipline.",
+      block: {
+        // ---- Phase 0: defensive mask of pad to u16 ------------------------
+        and rsi, 0xFFFF;
+
+        // r9 = 2 * pad (== left + right == top + bottom)
+        mov r9, rsi;
+        add r9, rsi;
+
+        // ---- Phase 1: width underflow check + shrink ----------------------
+        // w = (parent >> 32) & 0xFFFF
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        cmp rax, r9;
+        jb  pad_u_zero;
+        sub rax, r9;
+        mov r10, rax;                     // r10 = w'
+
+        // ---- Phase 2: height underflow check + shrink ---------------------
+        // h = parent >> 48
+        mov rax, rdi;
+        shr rax, 48;
+        cmp rax, r9;
+        jb  pad_u_zero;
+        sub rax, r9;
+        mov r11, rax;                     // r11 = h'
+
+        // ---- Phase 3: translate origin ------------------------------------
+        // x' = (parent & 0xFFFF) + pad
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        add rax, rsi;
+
+        // y' = ((parent >> 16) & 0xFFFF) + pad
+        mov r9, rdi;
+        shr r9, 16;
+        and r9, 0xFFFF;
+        add r9, rsi;
+
+        // ---- Phase 4: pack (x' | y'<<16 | w'<<32 | h'<<48) ----------------
+        and rax, 0xFFFF;
+        and r9,  0xFFFF;
+        and r10, 0xFFFF;
+        and r11, 0xFFFF;
+
+        shl r9,  16;
+        shl r10, 32;
+        shl r11, 48;
+
+        or  rax, r9;
+        or  rax, r10;
+        or  rax, r11;
+        ret;
+
+      pad_u_zero:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+}

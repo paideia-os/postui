@@ -1,0 +1,377 @@
+// src/widgets/clear.pdx -- postui.M4-004 (paideia-os/postui#30)
+//
+// Clear widget: blank an axis-aligned region with a space glyph + style.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M4-004)
+// =============================================================================
+//
+// Clear is the smallest possible widget in the catalog. Its job is to
+// blank a rectangular region so that a subsequent widget (typically a
+// floating overlay -- popup, modal, tooltip, dropdown menu) can render
+// on top of a stable "erased" background without inheriting whatever
+// cells the previous frame left there. Ratatui's `Clear` primitive
+// serves the same role and callers reach for it in the same pattern
+// (draw the base UI, draw a Clear over the popup Rect, then draw the
+// popup widget itself), so postui.M4-004 mirrors the shape.
+//
+// The implementation is intentionally boring: it is the empty-fill path
+// of gauge_draw (src/widgets/gauge.pdx L508 -- gau_x_empty branch), with
+// the glyph hard-wired to ASCII space (U+0020) and no per-cell branch
+// because every cell in the Rect gets the same word0/word1 pair. That
+// makes Clear the fastest widget in the catalog on a per-cell basis --
+// no fill_cells math, no glyph select, no kind dispatch, and no imul
+// beyond the y*cols address stride shared by every widget.
+//
+// This module lands:
+//   - ClearSpec state record (16-byte struct, one packed Rect + one
+//     packed Style; the smallest spec in the catalog).
+//   - CLEAR_GLYPH_SPACE constant (U+0020 zero-padded to a u32 dword).
+//   - clear_draw: widget_draw-shape entry that stamps every cell in
+//     the Rect with (space, style).
+//   - clear_view_pack: pack a ClearView@0.1 semantic-pipe record into
+//     caller-provided memory (M2-009 wires the actual send_record).
+//   - CLR_ERR_BAND sentinel (defensive; unused at v1).
+//
+// =============================================================================
+// CLEARSPEC WIRE (16 bytes, CLEAR_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect     u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  style    u64 packed (fg | bg<<24 | mods<<48) per Style wire
+//
+// Deviation from postui#30 issue text: the issue prose says
+// "ClearSpec (~24B): Rect (16B), style : u64", but the postui codebase
+// packs a Rect into ONE u64 (rect.pdx L55 RECT_BYTES = 8) -- an
+// unpacked 16-byte Rect would break every widget spec's rect+... layout
+// and every layout_split u64 output cell shape (docs/design.md §2.4).
+// Landing ClearSpec as 16 bytes total keeps it consistent with every
+// other WidgetSpec in the catalog (BlockSpec, GaugeSpec, ...); the
+// "~24B" in the issue is the ClearView@0.1 record size (magic + len +
+// rect + style = 4+4+8+8 = 24), which the issue's "Fixed 24B
+// (magic+len+rect+style)" bullet just below already commits to.
+//
+// =============================================================================
+// SPACE GLYPH WORD (U+0020, zero-padded to a u32)
+// =============================================================================
+//
+// A Cell's symbol field lives at cell bytes [+0..+4) (Cell wire, §2.1).
+// U+0020 is a single ASCII byte 0x20; the three trailing bytes are 0x00,
+// giving little-endian u32 = 0x00000020. Storing this as the low 32 bits
+// of word0 stamps the symbol slot with the trailing zeros cleared as a
+// side effect, guaranteeing a prior multi-byte glyph left behind by an
+// earlier writer (a Paragraph, a Block title) does not bleed into bytes
+// 1..3 of the symbol slot.
+//
+// 0x00000020 fits imm32 (<< 0x80000000) so paideia-as emits the compact
+// 5-byte mov r32, imm32 form when loaded via `mov reg, imm`.
+//
+// =============================================================================
+// CLEARVIEW@0.1 WIRE (semantic-pipe record, 24 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic        u32 = 0x57565243 ("CRVW" LE)
+//   [+4..+8)   record_len   u32 = 24 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack    u64 verbatim from ClearSpec+0
+//   [+16..+24) style        u64 verbatim from ClearSpec+8
+//
+// Every field is included in the semantic-pipe record -- unlike Gauge
+// (which excludes visual `kind`/`style_*`) or Block (which excludes
+// `fill_cell`), Clear has ONLY two semantic fields and both are load-
+// bearing: a downstream reader asking "was this region blanked, and to
+// what visual" wants both. Skipping style would elide the difference
+// between "cleared to default" and "cleared to a themed background".
+//
+// record_len is fixed at 24 bytes and already 8-aligned, so no padding
+// loop is needed -- the header stores are exact. Both rect and style are
+// stored as u64 (verbatim, no per-field marshalling) because both share
+// the identical wire layout with their spec-side counterparts.
+//
+// CRVW_MAGIC = 0x57565243 = 1_465_202_755 (< 0x7FFFFFFF, imm32 form).
+// Bytes 'C','R','V','W' = 0x43,0x52,0x56,0x57, LE u32 = 0x57565243.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Clear`), matches file basename
+//     (per manifest.pdxproj `sources:` entry).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` -- no byte
+//     loads needed in this module (every spec field is 8-byte aligned
+//     and read as a qword).
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 0,
+//     shift counts <= 56. The error sentinel 0xFFFFEBE6 (> 0x7FFFFFFF)
+//     would be loaded via `mov reg, imm64` (movabs) if ever emitted;
+//     v1 draw body never returns it. No `cmp reg, imm64`, no
+//     `and reg, imm64` anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). The one imul is
+//     2-op `imul reg, reg` for the y*cols address stride.
+//   - Labels prefixed `clr_` per docs/design.md fingerprint discipline.
+//   - clear_draw pushes 5 SysV callee-save regs (rbx, r12, r13, r14, r15)
+//     = 40 bytes; entry rsp%16==8, +40==48 (aligned). Body makes NO
+//     nested calls; alignment is a discipline anchor mirroring block_draw
+//     / scrollbar_draw / gauge_draw.
+//   - clear_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save regs,
+//     matching gauge_view_pack / block_view_pack.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments). No cap / sysreg effect.
+
+module Clear = structure {
+
+  // ==========================================================================
+  // ClearSpec layout (16 bytes -- smallest spec in the catalog).
+  // ==========================================================================
+  pub let CLEAR_SPEC_BYTES : u64 = 16
+  pub let CLEAR_OFF_RECT   : u64 = 0
+  pub let CLEAR_OFF_STYLE  : u64 = 8
+
+  // ==========================================================================
+  // Space glyph (U+0020, single ASCII byte, zero-padded to 4 bytes).
+  // Fits imm32 (5-byte mov r32, imm32 form).
+  // ==========================================================================
+  pub let CLEAR_GLYPH_SPACE : u64 = 0x00000020
+
+  // ==========================================================================
+  // ClearView@0.1 wire constants.
+  //
+  // CRVW_MAGIC = 0x57565243 = 1_465_202_755 (< 0x7FFFFFFF, imm32 form).
+  // Bytes 'C','R','V','W' = 0x43,0x52,0x56,0x57, LE u32 = 0x57565243.
+  // ==========================================================================
+  pub let CRVW_MAGIC          : u64 = 0x57565243
+  pub let CRVW_RECORD_BYTES   : u64 = 24
+  pub let CRVW_OFF_MAGIC      : u64 = 0
+  pub let CRVW_OFF_RECORD_LEN : u64 = 4
+  pub let CRVW_OFF_RECT       : u64 = 8
+  pub let CRVW_OFF_STYLE      : u64 = 16
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // via the M4 slice (0xFFFFEBE0..0xFFFFEBEF; per issue text). Clear
+  // takes 0xFFFFEBE6 (M4-004 ordinal-mapped inside the batch).
+  //
+  // At v1 no clear_draw path returns this -- the body accepts any
+  // spec (a rect of 0x0 returns 0 with no cells written). The sentinel
+  // is reserved for a future revision that may want to trap e.g. a rect
+  // that overflows the canvas. 0xFFFFEBE6 > 0x7FFFFFFF so `mov reg,
+  // imm64` (movabs) is the only legal load path; NEVER usable in
+  // cmp/and.
+  // ==========================================================================
+  pub let CLR_ERR_BAND : u64 = 0xFFFFEBE6
+
+  // ==========================================================================
+  // clear_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry. `rows` is unread (back region starts at
+  // buf_ptr+0). Returns 0 (OK) in every case; a zero-sized rect
+  // (bw==0 || bh==0) returns 0 with no cells written.
+  //
+  // Draw sequence:
+  //   1. Cache invariants (buf_ptr, cols, packed rect, style).
+  //   2. Extract bw / bh from packed rect; early-return 0 if either 0.
+  //   3. Precompute the single (word0, word1) cell pair from
+  //      (CLEAR_GLYPH_SPACE, style). Kept in r13 (word0) / r14 (word1)
+  //      for the entire paint loop -- every cell gets the SAME pair,
+  //      so no per-cell composition or per-cell branch is needed
+  //      (contrast gauge_draw's per-cell filled-vs-empty branch).
+  //   4. Loop y in [by, by+bh), x in [bx, bx+bw); stamp each cell as
+  //      two 8-byte stores.
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the
+  // canvas's stamped rows/cols; matches block_draw / gauge_draw posture.
+  //
+  // Register plan (5 pushes = 40 B; entry rsp%16==8, +40==48, aligned):
+  //   rbx = buf_ptr        r12 = cols
+  //   r13 = word0 (space glyph + style)     -- survives entire loop
+  //   r14 = word1 (style tail)              -- survives entire loop
+  //   r15 = y_end (by + bh)                 -- survives entire loop
+  //   rdx = y counter      rcx = x counter
+  //   rsi = xe (bx + bw)   rdi = bx (x-reset each row)
+  //   rax = scratch (compose / dst address / return)
+  //   r8..r11 = extract scratch (freed after Phase 3)
+  //
+  // Labels prefixed clr_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let clear_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-004 (postui#30): clear_draw is the widget_draw-shape entry for WK_CLEAR. Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV; entry rsp%16==8, +40==48). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / gauge_draw / scrollbar_draw. Phase 0 (prologue): cache buf_ptr in rbx, cols in r12; load packed rect into r10 from [rdi+0]. Phase 1 (early-return on zero rect): bw = (r10 >> 32) & 0xFFFF into r8; if 0 -> clr_ret_zero. bh = r10 >> 48 into r9; if 0 -> clr_ret_zero. Phase 2 (precompute the single cell-word pair; every cell in the Rect gets the same pair, no per-cell composition needed): load CLEAR_GLYPH_SPACE (0x00000020) into rax (fits imm32, 5-byte mov r32, imm32). Load style into r11 from [rdi+8]. word0 = glyph | ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56): mov rcx, r11; and rcx, 0xFFFFFF; shl rcx, 32; or rax, rcx; mov rcx, r11; shr rcx, 24; and rcx, 0xFF; shl rcx, 56; or rax, rcx; mov r13, rax (survives entire loop). word1 = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16): mov rax, r11; shr rax, 32; and rax, 0xFFFF; mov rcx, r11; shr rcx, 48; and rcx, 0xFF; shl rcx, 16; or rax, rcx; mov r14, rax (survives entire loop). Phase 3 (re-extract bx, by from r10; set up outer y-range): rdi = bx = r10 & 0xFFFF (survives, used to reset x each row); r9 = by = (r10 >> 16) & 0xFFFF. rsi = xe = bx + bw. r15 = y_end = by + bh. rdx = y counter = by. r10, r11 free after this. Phase 4 (paint loop): outer clr_yloop: cmp rdx, r15; jae clr_ret_zero. rcx = x counter = rdi (bx). Inner clr_xloop: cmp rcx, rsi; jae clr_ynext. dst compute: mov rax, rdx; imul rax, r12 (2-op reg,reg); add rax, rcx; shl rax, 4; add rax, rbx. Store: mov [rax+0], r13; mov [rax+8], r14. add rcx, 1; jmp clr_xloop. clr_ynext: add rdx, 1; jmp clr_yloop. Epilogue clr_ret_zero: xor rax, rax; pop r15/r14/r13/r12/rbx (reverse); ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0x00000020, 0, 1, shift counts 4/16/24/32/48/56) fits imm32/imm8. 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. No 2-op `imul reg, imm`. Effect `!{mem}` (fill loop + spec reads). Labels prefixed clr_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Phase 0: cache invariants -----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r10, [rdi + 0];               // r10 = packed rect (temp)
+
+        // ---- Phase 1: early-return on zero-sized rect --------------------
+        // bw = (r10 >> 32) & 0xFFFF
+        mov r8, r10;
+        shr r8, 32;
+        and r8, 0xFFFF;
+        cmp r8, 0;
+        je  clr_ret_zero;
+        // bh = r10 >> 48 (top 16 bits, no mask needed)
+        mov r9, r10;
+        shr r9, 48;
+        cmp r9, 0;
+        je  clr_ret_zero;
+
+        // ==================================================================
+        // Phase 2: precompute the single (word0, word1) cell pair.
+        // Every cell in the Rect stamps this SAME pair; no per-cell
+        // composition needed (contrast gauge_draw's per-cell branch).
+        // ==================================================================
+
+        // Space glyph (U+0020, zero-padded to 4 bytes).
+        mov rax, 0x00000020;
+
+        // style
+        mov r11, [rdi + 8];               // r11 = style
+
+        // word0 = glyph | ((style & 0xFFFFFF) << 32)
+        //               | (((style >> 24) & 0xFF) << 56)
+        mov rcx, r11;
+        and rcx, 0xFFFFFF;                // fg (low 24 bits of style)
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r11;
+        shr rcx, 24;
+        and rcx, 0xFF;                    // bg.r
+        shl rcx, 56;
+        or  rax, rcx;
+        mov r13, rax;                     // r13 = word0 (survives loop)
+
+        // word1 = ((style >> 32) & 0xFFFF)
+        //         | (((style >> 48) & 0xFF) << 16)
+        mov rax, r11;
+        shr rax, 32;
+        and rax, 0xFFFF;                  // bg.g | bg.b in low 16 bits
+        mov rcx, r11;
+        shr rcx, 48;
+        and rcx, 0xFF;                    // mods
+        shl rcx, 16;
+        or  rax, rcx;
+        mov r14, rax;                     // r14 = word1 (survives loop)
+
+        // ==================================================================
+        // Phase 3: re-extract bx / by from r10, set up outer y-range.
+        // r10 and r11 free after this block.
+        // ==================================================================
+
+        // rdi = bx (survives as x-reset each row)
+        mov rdi, r10;
+        and rdi, 0xFFFF;
+
+        // r9 = by
+        mov r9, r10;
+        shr r9, 16;
+        and r9, 0xFFFF;
+
+        // xe = bx + bw -> rsi  (bw was captured in r8 during Phase 1)
+        mov rsi, rdi;
+        add rsi, r8;
+
+        // y_end = by + bh -> r15. bh was captured in r9 during Phase 1's
+        // shr r9, 48, but we just clobbered r9 with `r9 = by`. Re-extract
+        // bh from r10 (which still holds the packed rect).
+        mov r15, r10;
+        shr r15, 48;                      // r15 = bh
+        add r15, r9;                      // r15 = by + bh = y_end
+
+        // y counter starts at by
+        mov rdx, r9;                      // rdx = y counter = by
+
+        // ==================================================================
+        // Phase 4: paint loop
+        // ==================================================================
+
+      clr_yloop:
+        cmp rdx, r15;
+        jae clr_ret_zero;
+
+        mov rcx, rdi;                     // x counter = bx
+
+      clr_xloop:
+        cmp rcx, rsi;
+        jae clr_ynext;
+
+        // dst = buf_ptr + (y * cols + x) * 16
+        mov rax, rdx;
+        imul rax, r12;                    // 2-op reg,reg
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        mov [rax + 0], r13;
+        mov [rax + 8], r14;
+
+        add rcx, 1;
+        jmp clr_xloop;
+
+      clr_ynext:
+        add rdx, 1;
+        jmp clr_yloop;
+
+      clr_ret_zero:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // clear_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a ClearView@0.1 semantic-pipe record into [dst..dst+24).
+  // record_len is fixed at 24 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to postui.M2-009 -- this packer is the wire-format authority so
+  // M2-009's registry glue only has to know the schema-name string
+  // (for BLAKE3 hashing) and this packer (for the byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call. Effect `!{mem}` (reads
+  // through rdi, writes through rsi).
+  // ==========================================================================
+  pub let clear_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-004 (postui#30): clear_view_pack lays a fixed-24-byte ClearView@0.1 record at [rsi..rsi+24). Header phase writes four scalar fields in one straight-line sequence: mov rax, 0x57565243 then mov_d [rsi+0], rax stamps the 'CRVW' magic (0x57565243 = 1_465_202_755 fits imm32 signed positive so paideia-as emits the compact 5-byte mov r32, imm32 form, not the 10-byte movabs -- matches gauge_view_pack's GGVW and block_view_pack's BLKV magic idiom). record_len is a hard 24 (no variable-length data), stored via mov rax, 24; mov_d [rsi+4], rax. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store -- ClearSpec's rect slot and ClearView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. The 8-byte packed Style at [rdi+8] is copied verbatim to [rsi+16] -- same wire (fg u24 | bg u24 | mods u8 | pad u8). return rax = 24. Every immediate (0x57565243, 24, 0, 4, 8, 16) fits imm32 (0x57565243 < 0x7FFFFFFF; the rest are small). No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 2 qword-loads / 2 qword-stores / 1 dword-magic-store / 1 dword-record_len-store. Labels prefixed clr_bv_ per docs fingerprint discipline (none needed at v1 -- record is fixed-length, no branches).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57565243;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 24;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- packed style (u64) at [rsi + 16] ------------------------------
+        mov rax, [rdi + 8];
+        mov [rsi + 16], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 24;
+        ret;
+      }
+    }
+
+}
