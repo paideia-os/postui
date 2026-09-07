@@ -1,0 +1,722 @@
+// src/widgets/barchart.pdx -- postui.M3-004 (paideia-os/postui#23)
+//
+// BarChart widget: N discrete bars, each a `bar_width`-column stripe
+// separated by `gap` background columns, growing bottom-up over the
+// Rect's height with 8-tier partial-block glyphs for smooth-topped
+// bar summits.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog, §5.1 M3-004)
+// =============================================================================
+//
+// BarChart is the 8th ordinal (WK_BARCHART = 7 -- 0-indexed slot in
+// the closed widget catalog, see src/widget_kind.pdx L129) and the
+// third M3 widget-body landing after Gauge (M3-002) and Sparkline
+// (M3-003). It is the first widget in the M3 batch whose height
+// mapping is a value-space projection rather than a track-position
+// projection: Sparkline projects one bar per column of the Rect;
+// BarChart projects N caller-selected bars each spanning `bar_width`
+// columns with `gap` background columns between them.
+//
+// This file ships:
+//   - The BarChartSpec state record (64-byte struct laid out in
+//     memory; see WIRE block below).
+//   - The 8 vertical block-fill glyphs (▁▂▃▄▅▆▇█) encoded as a single
+//     base-plus-eighths formula rather than a lookup table (see GLYPH
+//     WORDS block below).
+//   - barchart_draw: the widget_draw-shape entry that fills the Rect
+//     with background cells, computes an effective ceiling (either the
+//     caller's `max_override` or the auto-max scan of the input bars),
+//     then overlays each bar bottom-up with partial-block glyphs.
+//   - barchart_view_pack: pack a BarChartView@0.1 semantic-pipe record
+//     into caller-provided memory (fixed 32 bytes, matches
+//     ScrollbarView@0.1's "state scalars only, styles excluded" shape).
+//
+// =============================================================================
+// BARCHARTSPEC WIRE (64 bytes, BARCHART_SPEC_BYTES)
+// =============================================================================
+//
+//   [+0..+8)   rect             u64 packed (x, y, w, h) per Rect wire
+//   [+8..+16)  bars_ptr         u64 pointer to bars[bar_count] (each u64)
+//   [+16..+24) bar_count        u64 number of bars in the input array
+//   [+24..+32) bar_width        u64 cells per bar stripe (>= 1)
+//   [+32..+40) gap              u64 cells of background between bars
+//   [+40..+48) max_override     u64 ceiling; 0 = compute auto-max from bars
+//   [+48..+56) style_bar        u64 Style-packed (fg | bg<<24 | mods<<48)
+//   [+56..+64) style_bg         u64 Style-packed for background cells
+//
+// 64 bytes rather than the issue-text's aspirational "~64B" is exact
+// -- rect (8) + 7 u64 fields (56) = 64. Every runtime numeric field
+// is a u64 because bars[i] are u64 values from user data (a Fixed64
+// caller downcasting to u64 for the bar-height projection is the
+// intended M3-005 pipeline), max_override is a u64 for the same
+// reason, and bar_width / gap / bar_count are u64 for uniform
+// spec-load shape (`mov reg, [spec+off]`). 64 is one cache line on
+// x86_64 -- the draw prologue reads all 8 slots and copies them into
+// stack scratch, keeping the whole spec-load sequence in one cache
+// miss.
+//
+// =============================================================================
+// GLYPH WORDS (3-byte UTF-8 packed into u32 dword slot)
+// =============================================================================
+//
+// The 8 lower-block glyphs (▁ 1/8 ..  █ 8/8) share the byte pattern
+//   0xE2 0x96 0x8X  where X = 1..8
+// Little-endian u32 encoding of the byte sequence [0xE2, 0x96, 0x8X, 0]:
+//   glyph_u32 = 0xE2 | (0x96 << 8) | (0x8X << 16) | (0 << 24)
+//            = 0x008X96E2
+//
+// Base value: 0x008096E2 (byte 2 = 0x80 -- what would be "▀" if we
+// treated it as the full-8-eighths reference, but is actually the
+// upper-half glyph U+2580; we never emit this byte alone, only 0x81..0x88).
+// Compute the actual glyph for `eighths in [1, 8]`:
+//   glyph_u32 = 0x008096E2 + (eighths << 16)
+//
+// (bits 16..23 of 0x008096E2 are 0x80; bits 0..2 are clear so add and
+// or agree for eighths in [1, 8]; using ADD is emitted as the compact
+// add-imm form and matches the same shape scrollbar uses to load its
+// glyph words.)
+//
+// Both the base (0x008096E2) and (base + 8<<16 = 0x008896E2) fit imm32
+// (< 0x80000000) so paideia-as emits the compact 5-byte mov r32, imm32
+// form when loaded via `mov reg, imm`.
+//
+// Background glyph: U+0020 SPACE, single byte 0x20; u32 = 0x00000020.
+//
+// =============================================================================
+// HEIGHT MATH (integer-only, eighths-of-a-cell precision)
+// =============================================================================
+//
+// For each bar i (0-indexed) with value V and effective ceiling M (max),
+// over a Rect of height H cells, the bar's total height in eighths of a
+// cell is:
+//   height_eighths = (V * H * 8) / M         -- integer division
+//
+// This gives values in [0, H*8]; full_rows = height_eighths / 8 and
+// fractional_top = height_eighths % 8. Rather than compute full_rows /
+// fractional_top explicitly and pick between two code paths, we iterate
+// row-from-bottom in [0, H) with a running "remaining eighths" gate:
+//
+//   remaining_eighths = height_eighths - row_from_bottom * 8
+//   if remaining_eighths <= 0:  stop this column (rest is background)
+//   if remaining_eighths >= 8:  emit full-block █ (eighths clamp = 8)
+//   else:                       emit partial(remaining) 1..7 eighths
+//
+// The clamp is a single `cmp reg, 8; jbe/mov reg, 8` chain; the glyph
+// select is the eighths-in-header formula above with the clamped value.
+// Because Phase 1 already stamped the whole Rect with the background
+// cell, "stop this column" needs no explicit background-fill loop -- the
+// existing bg cells are what the reader sees.
+//
+// Div-by-zero guards:
+//   - max == 0 (both max_override == 0 AND every bar is zero): skip
+//     the entire draw phase; the bg fill from Phase 1 IS the render.
+//   - bar_count == 0 or bar_width == 0: skip the bar loop entirely
+//     (bg fill only).
+//   - Rect.w == 0 or Rect.h == 0: early-return 0 with no cells written.
+//   - Rect.h == 0 in the height_eighths formula: unreachable after the
+//     bh==0 early return.
+//
+// =============================================================================
+// BAR STRIDE (per-bar x-offset math)
+// =============================================================================
+//
+// For bar i:
+//   x_offset = i * (bar_width + gap)
+//   x_start  = bx + x_offset
+//   x_end    = x_start + bar_width
+//   break condition: x_offset + bar_width > bw  (bar would extend past
+//                                                the Rect's right edge)
+//
+// A single `imul reg, reg` (2-op reg,reg, paideia-as-safe) computes the
+// x_offset per iteration -- we do NOT try to maintain a running x-cursor
+// across the outer loop because the break-early behavior on a partial
+// last bar is cleaner as a fresh multiplication with an early-exit check.
+//
+// The tail bar (whose full width would spill past bw) is DROPPED, not
+// clipped. Clipping a partial bar would require a per-column bounds check
+// in the inner loop and would render a truncated glyph string that is
+// visually indistinguishable from a "missing" bar -- worse UX than a hard
+// drop, and it doubles the inner-loop cost. Callers that need to fit a
+// specific bar count into a specific width should widen the Rect or
+// shrink bar_width/gap in the caller.
+//
+// =============================================================================
+// BARCHARTVIEW@0.1 WIRE (semantic-pipe record, 32 bytes)
+// =============================================================================
+//
+//   [+0..+4)   magic            u32 = 0x57564342 ("BCVW" LE)
+//   [+4..+8)   record_len       u32 = 32 (fixed, already 8-aligned)
+//   [+8..+16)  rect_pack        u64 verbatim from BarChartSpec+0
+//   [+16..+24) bar_count        u64 verbatim from BarChartSpec+16
+//   [+24..+32) max_override     u64 verbatim from BarChartSpec+40
+//                                  (0 = auto-max; downstream reader must
+//                                   walk bars[] if the actual ceiling is
+//                                   needed)
+//
+// bars_ptr, bar_width, gap, style_bar, style_bg are deliberately excluded
+// from the semantic-pipe record: bars_ptr is process-address-space-local
+// (not portable across the pipe); bar_width/gap are geometry-only visual
+// attributes; style_bar/style_bg are pure skin. This matches
+// BlockView@0.1 / ScrollbarView@0.1's discipline of shipping only the
+// state fields a semantic-pipe consumer cares about.
+//
+// record_len is fixed at 32 bytes (already 8-aligned) so no padding loop
+// is needed -- the header stores are exact.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Barchart`, single word single
+//     capital), matches file basename `barchart.pdx` per manifest.pdxproj
+//     `sources:` entry.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64). No byte
+//     loads are needed in this module -- every spec field is 8-byte
+//     aligned and read as a qword.
+//   - All immediates in cmp/and fit imm32: 0xFFFF, 0xFFFFFF, 0xFF, 0,
+//     1, 2, 4, 7, 8, shift counts <= 56. The error sentinel 0xFFFFEBD4
+//     and the glyph-word imm 0x008096E2 / 0x57564342 magic are loaded
+//     via `mov reg, imm` -- the sentinel (> 0x7FFFFFFF) emits movabs
+//     (10-byte imm64 form; legal for mov, NOT legal for cmp/and), the
+//     glyph-word and magic imms (< 0x80000000) emit `mov r32, imm32`
+//     (5-byte form). No `cmp reg, imm64` and no `and reg, imm64`
+//     anywhere.
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). Every imul is 2-op
+//     `imul reg, reg`. Division uses `xor rdx, rdx; div reg`.
+//   - Labels prefixed `bc_` per docs/design.md fingerprint discipline
+//     (bc_max_ for the auto-max scan, bc_fill_ for the phase 1 bg
+//     stamp loops, bc_bar_ for the outer per-bar loop, bc_col_ for
+//     the per-column loop inside a bar, bc_row_ for the row-from-
+//     bottom loop, bc_glyph_ for the eighths clamp branch, bc_ret_
+//     for the shared success epilogue, bc_bv_ for the view packer).
+//   - barchart_draw pushes 5 SysV callee-save regs (rbx, r12, r13,
+//     r14, r15) = 40 bytes plus `sub rsp, 96` for cell-word + rect +
+//     spec-field scratch; entry rsp%16==8, +40==48 (aligned), +96==144
+//     (aligned). Body makes NO nested calls (all cell writes, address
+//     math, divisions, and the auto-max scan are inline). Alignment
+//     is a discipline anchor mirroring block_draw / scrollbar_draw.
+//   - barchart_view_pack is a pure leaf (no push/pop, no callee-save
+//     writes, no nested calls) -- all state fits in caller-save
+//     registers, matching scrollbar_view_pack's shape.
+//   - Effect row `!{mem}` on both bodies (both read and write memory
+//     through their pointer arguments). No cap / sysreg effect.
+
+module Barchart = structure {
+
+  // ==========================================================================
+  // BarChartSpec layout (64 bytes)
+  // ==========================================================================
+  pub let BARCHART_SPEC_BYTES         : u64 = 64
+
+  pub let BARCHART_OFF_RECT           : u64 = 0
+  pub let BARCHART_OFF_BARS_PTR       : u64 = 8
+  pub let BARCHART_OFF_BAR_COUNT      : u64 = 16
+  pub let BARCHART_OFF_BAR_WIDTH      : u64 = 24
+  pub let BARCHART_OFF_GAP            : u64 = 32
+  pub let BARCHART_OFF_MAX_OVERRIDE   : u64 = 40
+  pub let BARCHART_OFF_STYLE_BAR      : u64 = 48
+  pub let BARCHART_OFF_STYLE_BG       : u64 = 56
+
+  // ==========================================================================
+  // Glyph words (base + eighths<<16 gives the 8 partial-block glyphs).
+  // Base 0x008096E2 and the space glyph 0x00000020 are both < 0x80000000
+  // so paideia-as emits the compact 5-byte mov r32, imm32 form.
+  // ==========================================================================
+  pub let BARCHART_GLYPH_BASE  : u64 = 0x008096E2
+  pub let BARCHART_GLYPH_SPACE : u64 = 0x00000020
+
+  // ==========================================================================
+  // BarChartView@0.1 wire constants (fixed 32 bytes; see WIRE block above).
+  // BCVW magic = 0x57564342 ("W" 0x57 << 24 | "V" 0x56 << 16 | "C" 0x43 << 8 | "B" 0x42).
+  // ==========================================================================
+  pub let BCVW_MAGIC           : u64 = 0x57564342
+  pub let BCVW_RECORD_LEN      : u64 = 32
+  pub let BCVW_OFF_MAGIC       : u64 = 0
+  pub let BCVW_OFF_RECORD_LEN  : u64 = 4
+  pub let BCVW_OFF_RECT        : u64 = 8
+  pub let BCVW_OFF_BAR_COUNT   : u64 = 16
+  pub let BCVW_OFF_MAX         : u64 = 24
+
+  // ==========================================================================
+  // Schema name string (17 bytes including trailing null). Matches the
+  // ScrollbarView@0.1 / BlockView@0.1 pattern (see block.pdx L219 and
+  // list.pdx L287). Consumed by semantic_registry.pdx (M2-009) which
+  // BLAKE3-hashes the string for the wire schema-hash slot.
+  // ==========================================================================
+  pub let BCVW_SCHEMA_NAME     : [u8; 17] = "BarChartView@0.1\0"
+  pub let BCVW_SCHEMA_NAME_LEN : u64 = 16
+
+  // ==========================================================================
+  // Error sentinel. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
+  // + 0x54 offset = 0xFFFFEBD4, within the M3 batch slice
+  // 0xFFFFEBD0..0xFFFFEBDF (design/architecture.md §5.1). Sits after
+  // Fixed64 (0xFFFFEBD0..1), Gauge (0xFFFFEBD2), Sparkline (0xFFFFEBD3)
+  // -- BarChart takes 0xFFFFEBD4 by ordinal position in the M3 catalog.
+  // > 0x7FFFFFFF so `mov reg, imm` emits movabs (10-byte imm64); NEVER
+  // usable in cmp/and.
+  //
+  // At v1 no barchart_draw path returns this -- the body accepts any
+  // spec (a rect of 0x0 returns 0 with no cells written; max == 0
+  // short-circuits to a bg-only fill; bar_count / bar_width == 0
+  // short-circuit similarly). The sentinel is reserved for a future
+  // revision that may want to trap e.g. a rect that overflows the
+  // canvas.
+  // ==========================================================================
+  pub let BC_ERR_BAND : u64 = 0xFFFFEBD4
+
+  // ==========================================================================
+  // barchart_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Widget_draw-shape entry (matches the WidgetKind::widget_draw dispatch
+  // signature, see src/widget_kind.pdx L216). `rows` is unread (back
+  // region starts at buf_ptr+0). Returns 0 (OK) in every non-trivially-
+  // empty case; returns 0 for a zero-sized rect (bw==0 || bh==0) with no
+  // cells written.
+  //
+  // Draw sequence:
+  //   Phase 0 (precompute): cache pointers/dims in callee-save regs;
+  //     precompute style_bar_lo/hi (the two "static" halves of a bar
+  //     cell word without the glyph) and bg_word0/word1 (the fully-
+  //     baked background cell) into stack scratch.
+  //   Phase 1 (bg fill): stamp bg cell across the whole Rect.
+  //   Phase 2 (auto-max): if max_override != 0 use it as the ceiling;
+  //     else scan bars[0..bar_count] for the max value. If ceiling
+  //     is 0 (empty spec OR all-zero bars), jump to epilogue -- the
+  //     bg fill IS the whole render.
+  //   Phase 3 (bar overlay): for each i in [0, bar_count), compute
+  //     x_offset = i * (bar_width + gap); if x_offset + bar_width > bw
+  //     break; else compute height_eighths = value * bh * 8 / max;
+  //     for each column c in [0, bar_width), for each row_from_bottom
+  //     in [0, bh) walking bottom-up, gate on remaining eighths
+  //     (see HEIGHT MATH block above): full block for >= 8 eighths,
+  //     partial glyph for [1, 7] eighths, stop early on 0.
+  //
+  // Bounds discipline: NO clipping against (rows, cols). Every producer
+  // of the rect is expected to have already clamped against the canvas's
+  // stamped rows/cols; adding a gate here would double-charge every cell
+  // write for no marginal safety (same posture Buffer::buffer_at and
+  // block_draw / scrollbar_draw take).
+  //
+  // Register plan (5 pushes = 40 B; sub rsp, 96; entry rsp%16==8,
+  // +40==48, +96==144, aligned):
+  //   rbx = buf_ptr        r12 = cols            r13 = spec_ptr
+  //   r14 = packed rect    r15 = effective max ceiling
+  //   Stack scratch (96 bytes = 12 slots):
+  //     [rsp+0..8)   style_bar_lo (glyph-empty low; OR-mask for word0)
+  //     [rsp+8..16)  style_bar_hi (word1)
+  //     [rsp+16..24) bg_word0    (fully-baked bg cell, low half)
+  //     [rsp+24..32) bg_word1    (fully-baked bg cell, high half)
+  //     [rsp+32..40) bars_ptr    (cached from spec+8)
+  //     [rsp+40..48) bar_count   (cached from spec+16)
+  //     [rsp+48..56) bar_width   (cached from spec+24)
+  //     [rsp+56..64) gap         (cached from spec+32)
+  //     [rsp+64..72) bx          (extracted from packed rect)
+  //     [rsp+72..80) by          (extracted from packed rect)
+  //     [rsp+80..88) bw          (extracted from packed rect)
+  //     [rsp+88..96) bh          (extracted from packed rect)
+  //
+  // Labels prefixed bc_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let barchart_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-004 (postui#23): barchart_draw is the widget_draw-shape entry for WK_BARCHART (7). Push rbx/r12/r13/r14/r15 (5 pushes, 40 B, rsp aligned per SysV) + sub rsp, 96 (cell-word + rect + spec-field scratch, keeps rsp%16==0). Body makes NO nested calls; alignment is a discipline anchor mirroring block_draw / scrollbar_draw. Phase 0 (precompute): cache buf_ptr in rbx, cols in r12, spec_ptr in r13, packed rect in r14 (loaded once from [r13+0]). Extract bw and bh; early-return 0 if either is 0. Compute the two style_bar precompute halves: style_bar_lo = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56), style_bar_hi = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16); mask/shift/or chains use imm32-fitting constants (0xFFFFFF, 0xFF, 0xFFFF and shift counts 24/32/48/56 all fit imm32/imm8). Store to [rsp+0]/[rsp+8]. Repeat for the bg cell but fully baked (glyph 0x20 space merged in): bg_word0 = 0x20 | ((bg_style & 0xFFFFFF) << 32) | (((bg_style >> 24) & 0xFF) << 56); bg_word1 = ((bg_style >> 32) & 0xFFFF) | (((bg_style >> 48) & 0xFF) << 16); store to [rsp+16]/[rsp+24]. Cache bars_ptr/bar_count/bar_width/gap from spec into [rsp+32..64]. Extract bx/by/bw/bh from r14 (via and 0xFFFF / shr 16/32/48 chains) into [rsp+64..96]. Phase 1 (fill entire rect with bg cell): outer y loop rdx from by to ye-1, inner x loop rcx from bx to xe-1; each iteration computes dst = buf_ptr + (y*cols + x)*16 into rax via `mov rax, rdx; imul rax, r12 (2-op reg,reg); add rax, rcx; shl rax, 4; add rax, rbx`; two 8-byte load/store pairs copy bg_word0/bg_word1 from [rsp+16]/[rsp+24] into [rax+0]/[rax+8] (transit through r10, safe to clobber). Phase 2 (compute effective max): load max_override from [r13+40] into rax; if nonzero, r15 = rax and jump to bar loop. Else initialize rax=0 (running max), rcx=0 (index), r8 = bars_ptr; loop: cmp rcx, bar_count -> jae done; load rdx = [r8+0]; if rdx > rax then rax = rdx; add r8, 8; inc rcx; loop. Store into r15. If r15 == 0, jump epilogue (no bars to draw; bg fill IS the render). Phase 3 (per-bar overlay): early-out if bar_count==0 or bar_width==0. Outer bar loop rdi from 0 to bar_count-1: compute stride = bar_width + gap; x_offset = i * stride via 2-op `imul rax, r8` (paideia-as-safe reg,reg); if x_offset + bar_width > bw break to epilogue. Stash x_offset in rsi. Load value = bars[i] via `mov r8, [rsp+32]; mov r9, rdi; shl r9, 3; mov rdx, [r8+r9+0]` (base+index+disp8 addressing, matches paragraph.pdx L500-ish pattern). If value == 0, skip. Compute height_eighths = value * bh * 8 / max via `mov r8, [rsp+88]; shl r8, 3; mov rax, value; imul rax, r8; xor rdx, rdx; div r15`; stash in r10. Column loop rcx from 0 to bar_width-1: x = bx + x_offset + c (into r8). Row loop r9 from 0 to bh-1: remaining eighths gate: `mov rax, r9; shl rax, 3; cmp rax, r10; jae col_next` (r9*8 >= height_eighths means we are above the bar top). Compute glyph: remaining = r10 - r9*8; clamp <= 8; glyph_u32 = 0x008096E2 + (remaining << 16); word0 = glyph_u32 | style_bar_lo (from [rsp+0]); word1 = style_bar_hi (from [rsp+8]). Cell address: y = by + bh - 1 - r9; dst = buf_ptr + (y*cols + x)*16; two 8-byte stores. inc r9; loop. Epilogue: xor rax, rax; add rsp, 96; pop 5 callee-save; ret. Every immediate (0xFFFF, 0xFFFFFF, 0xFF, 0, 1, 8, and shift counts 3/4/16/24/32/48/56) fits imm32/imm8; glyph base 0x008096E2 and space glyph 0x20 fit imm32. 2-op imul is only ever reg,reg. No `test`. No `cmp reg, imm64`. No `and reg, imm64`. Effect `!{mem}` (bg fill + bar overlay cell writes + spec/stack reads). Labels prefixed bc_ per docs fingerprint discipline: bc_ret_ok / bc_ret_zero for the epilogue; bc_fill_y/x/ynext/done for phase 1; bc_max_scan/skip/ready for the auto-max compute; bc_bar_loop/next for the outer per-bar iteration; bc_col_loop/next for the per-column iteration; bc_row_loop for the row-from-bottom iteration; bc_glyph_ok for the eighths clamp.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 96;
+
+        // ---- Prologue: cache invariants ----------------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+        mov r14, [r13 + 0];               // r14 = packed rect
+
+        // ---- Early-return on zero-sized rect -----------------------------
+        // bw = (r14 >> 32) & 0xFFFF
+        mov r8, r14;
+        shr r8, 32;
+        and r8, 0xFFFF;
+        cmp r8, 0;
+        je  bc_ret_zero;
+        // bh = r14 >> 48 (top 16 bits, no mask needed)
+        mov r9, r14;
+        shr r9, 48;
+        cmp r9, 0;
+        je  bc_ret_zero;
+
+        // ---- Precompute style_bar_lo -------------------------------------
+        // style_bar_lo = ((style & 0xFFFFFF) << 32) | (((style >> 24) & 0xFF) << 56)
+        mov r10, [r13 + 48];              // r10 = style_bar
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        mov rax, r10;
+        shr rax, 24;
+        and rax, 0xFF;
+        shl rax, 56;
+        or  rax, rcx;
+        mov [rsp + 0], rax;               // style_bar_lo
+
+        // ---- Precompute style_bar_hi (word1) -----------------------------
+        // style_bar_hi = ((style >> 32) & 0xFFFF) | (((style >> 48) & 0xFF) << 16)
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 8], rax;               // style_bar_hi
+
+        // ---- Precompute bg_word0 (fully baked with space glyph) ----------
+        mov rax, 0x20;                    // space glyph in symbol slot
+        mov r10, [r13 + 56];              // r10 = style_bg
+        mov rcx, r10;
+        and rcx, 0xFFFFFF;
+        shl rcx, 32;
+        or  rax, rcx;
+        mov rcx, r10;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        shl rcx, 56;
+        or  rax, rcx;
+        mov [rsp + 16], rax;              // bg_word0
+
+        // ---- Precompute bg_word1 -----------------------------------------
+        mov rax, r10;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov rcx, r10;
+        shr rcx, 48;
+        and rcx, 0xFF;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov [rsp + 24], rax;              // bg_word1
+
+        // ---- Cache bars_ptr / bar_count / bar_width / gap ----------------
+        mov rax, [r13 + 8];
+        mov [rsp + 32], rax;              // bars_ptr
+        mov rax, [r13 + 16];
+        mov [rsp + 40], rax;              // bar_count
+        mov rax, [r13 + 24];
+        mov [rsp + 48], rax;              // bar_width
+        mov rax, [r13 + 32];
+        mov [rsp + 56], rax;              // gap
+
+        // ---- Extract bx / by / bw / bh from packed rect ------------------
+        mov rax, r14;
+        and rax, 0xFFFF;
+        mov [rsp + 64], rax;              // bx
+
+        mov rax, r14;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 72], rax;              // by
+
+        mov rax, r14;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        mov [rsp + 80], rax;              // bw
+
+        mov rax, r14;
+        shr rax, 48;
+        mov [rsp + 88], rax;              // bh
+
+        // =====================================================================
+        // Phase 1: fill entire rect with background cell
+        // =====================================================================
+
+        // Load bx (r8), by (r9), bw (r10), bh (r11) from stack scratch
+        mov r8,  [rsp + 64];              // bx
+        mov r9,  [rsp + 72];              // by
+        mov r10, [rsp + 80];              // bw
+        mov r11, [rsp + 88];              // bh
+
+        // xe (rsi) = bx + bw; ye (rdi) = by + bh
+        mov rsi, r8;
+        add rsi, r10;
+        mov rdi, r9;
+        add rdi, r11;
+
+        // y counter: rdx = by
+        mov rdx, r9;
+
+      bc_fill_yloop:
+        cmp rdx, rdi;
+        jae bc_fill_done;
+
+        // x counter: rcx = bx
+        mov rcx, r8;
+
+      bc_fill_xloop:
+        cmp rcx, rsi;
+        jae bc_fill_ynext;
+
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, rdx;
+        imul rax, r12;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp bg_word0 / bg_word1 (transit through r10, safe to clobber
+        // -- reloaded from stack at Phase 3 prologue).
+        mov r10, [rsp + 16];
+        mov [rax + 0], r10;
+        mov r10, [rsp + 24];
+        mov [rax + 8], r10;
+
+        add rcx, 1;
+        jmp bc_fill_xloop;
+
+      bc_fill_ynext:
+        add rdx, 1;
+        jmp bc_fill_yloop;
+
+      bc_fill_done:
+
+        // =====================================================================
+        // Phase 2: compute effective ceiling (max_override or auto-max)
+        // =====================================================================
+
+        mov rax, [r13 + 40];              // max_override
+        cmp rax, 0;
+        jne bc_max_ready;
+
+        // Auto-max scan: walk bars[0..bar_count]
+        mov r8,  [rsp + 32];              // bars_ptr (walking cursor)
+        mov r9,  [rsp + 40];              // bar_count
+        xor rax, rax;                     // running max = 0
+        xor rcx, rcx;                     // i = 0
+
+      bc_max_scan:
+        cmp rcx, r9;
+        jae bc_max_ready;
+
+        mov rdx, [r8 + 0];                // value = bars[i]
+        cmp rdx, rax;
+        jbe bc_max_skip;
+        mov rax, rdx;                     // new running max
+
+      bc_max_skip:
+        add r8, 8;
+        add rcx, 1;
+        jmp bc_max_scan;
+
+      bc_max_ready:
+        mov r15, rax;                     // r15 = effective max
+
+        // If effective max == 0 -> only bg fill; done.
+        cmp r15, 0;
+        je  bc_ret_zero;
+
+        // =====================================================================
+        // Phase 3: per-bar overlay (bottom-up column stamps)
+        // =====================================================================
+
+        // Early-out: bar_count == 0 or bar_width == 0 -> nothing to draw.
+        mov r8, [rsp + 40];
+        cmp r8, 0;
+        je  bc_ret_zero;
+        mov r8, [rsp + 48];
+        cmp r8, 0;
+        je  bc_ret_zero;
+
+        // Outer bar loop: rdi = i
+        xor rdi, rdi;
+
+      bc_bar_loop:
+        mov r8, [rsp + 40];               // bar_count
+        cmp rdi, r8;
+        jae bc_ret_zero;
+
+        // stride = bar_width + gap
+        mov rax, [rsp + 48];
+        mov r8,  [rsp + 56];
+        add rax, r8;
+        mov r8, rax;                      // r8 = stride
+
+        // x_offset = i * stride  (2-op imul reg,reg)
+        mov rax, rdi;
+        imul rax, r8;                     // rax = x_offset
+
+        // if x_offset + bar_width > bw -> break
+        mov r8, rax;
+        mov r9, [rsp + 48];               // bar_width
+        add r8, r9;                       // x_offset + bar_width
+        mov r9, [rsp + 80];               // bw
+        cmp r8, r9;
+        ja  bc_ret_zero;
+
+        // Stash x_offset in rsi (survives value load + height div below)
+        mov rsi, rax;
+
+        // value = bars[i]  (base + index*8 + disp8)
+        mov r8, [rsp + 32];               // bars_ptr
+        mov r9, rdi;
+        shl r9, 3;
+        mov rdx, [r8 + r9 + 0];           // rdx = value
+
+        cmp rdx, 0;
+        je  bc_bar_next;
+
+        // height_eighths = value * bh * 8 / max
+        mov r8, [rsp + 88];               // bh
+        shl r8, 3;                        // bh * 8
+        mov rax, rdx;
+        imul rax, r8;                     // rax = value * (bh*8)  (2-op reg,reg)
+        xor rdx, rdx;
+        div r15;                          // rax = height_eighths
+
+        cmp rax, 0;
+        je  bc_bar_next;
+
+        mov r10, rax;                     // r10 = height_eighths
+
+        // Column loop: rcx = c in [0, bar_width)
+        xor rcx, rcx;
+
+      bc_col_loop:
+        mov r8, [rsp + 48];               // bar_width
+        cmp rcx, r8;
+        jae bc_bar_next;
+
+        // Row loop: r9 = row_from_bottom in [0, bh); walks bottom-up.
+        xor r9, r9;
+
+      bc_row_loop:
+        mov r8, [rsp + 88];               // bh
+        cmp r9, r8;
+        jae bc_col_next;
+
+        // remaining = height_eighths - row_from_bottom * 8
+        // Gate: if row_from_bottom * 8 >= height_eighths -> stop column
+        mov rax, r9;
+        shl rax, 3;
+        cmp rax, r10;
+        jae bc_col_next;
+
+        // Compute remaining eighths in rdx = height_eighths - r9*8
+        // (rax currently holds r9*8; r10 holds height_eighths)
+        mov rdx, r10;
+        sub rdx, rax;                     // rdx = remaining eighths (>= 1)
+
+        // Clamp remaining to 8 (full block)
+        cmp rdx, 8;
+        jbe bc_glyph_ok;
+        mov rdx, 8;
+      bc_glyph_ok:
+
+        // glyph_u32 = 0x008096E2 + (remaining << 16)
+        shl rdx, 16;
+        add rdx, 0x008096E2;              // rdx low 32 bits = glyph word
+
+        // word0 = glyph_u32 | style_bar_lo
+        or  rdx, [rsp + 0];               // rdx = full cell word0
+
+        // Compute x = bx + x_offset + c into r8
+        mov r8, [rsp + 64];               // bx
+        add r8, rsi;                      // + x_offset
+        add r8, rcx;                      // + c
+
+        // Compute y = by + bh - 1 - row_from_bottom into r11
+        mov r11, [rsp + 72];              // by
+        add r11, [rsp + 88];              // + bh
+        sub r11, 1;
+        sub r11, r9;                      // r11 = y
+
+        // dst = buf_ptr + (y*cols + x)*16 into rax
+        mov rax, r11;
+        imul rax, r12;                    // 2-op reg,reg
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Stamp cell: word0 (in rdx), word1 (from [rsp+8])
+        mov [rax + 0], rdx;
+        mov r11, [rsp + 8];               // style_bar_hi
+        mov [rax + 8], r11;
+
+        add r9, 1;
+        jmp bc_row_loop;
+
+      bc_col_next:
+        add rcx, 1;
+        jmp bc_col_loop;
+
+      bc_bar_next:
+        add rdi, 1;
+        jmp bc_bar_loop;
+
+      bc_ret_zero:
+        xor rax, rax;
+        add rsp, 96;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // barchart_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a BarChartView@0.1 semantic-pipe record into [dst..dst+32).
+  // record_len is fixed at 32 bytes (already 8-aligned, no pad loop
+  // needed). The actual `semantic_pipe::send_record` call is deferred
+  // to postui.M2-009 -- this packer is the wire-format authority so
+  // M2-009's registry glue only has to know the schema-name string
+  // BCVW_SCHEMA_NAME (for BLAKE3 hashing) and this packer (for the
+  // byte payload).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-only
+  // until return), rax = scratch/return. Pure leaf: no callee-save
+  // touched, no push/pop, no nested call.
+  // Effect `!{mem}` (reads through rdi, writes through rsi).
+  // Labels prefixed bc_bv_ per docs fingerprint discipline (none
+  // needed at v1 -- record is fixed-length, no branches).
+  // ==========================================================================
+  pub let barchart_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-004 (postui#23): barchart_view_pack lays a fixed-32-byte BarChartView@0.1 record at [rsi..rsi+32). Header phase writes five scalar fields in one straight-line sequence: `mov rax, 0x57564342` then `mov_d [rsi+0], rax` stamps the 'BCVW' magic (0x57564342 = 1_465_270_594 fits imm32 signed positive so paideia-as emits the compact 5-byte `mov r32, imm32` form, not the 10-byte movabs -- matches block_view_pack's BLKV magic and scrollbar_view_pack's SBVW magic idioms). record_len is a hard 32 (no title/tail variable data), stored via `mov rax, 32; mov_d [rsi+4], rax`. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] in one qword store -- BarChartSpec's rect slot and BarChartView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, no per-field marshalling. bar_count (u64) is loaded from [rdi+16] via qword mov and stored to [rsi+16] as u64. max_override (u64) is loaded from [rdi+40] and stored to [rsi+24] as u64 (0 = auto-max; downstream reader must walk bars[] if the actual ceiling is needed). return rax = 32. Every immediate (0x57564342, 32, 0, 4, 8, 16, 24) fits imm32 (0x57564342 = 1_465_270_594 < 0x7FFFFFFF; the rest are small). No `test`. No `imul`. No `and`. No `cmp reg, imm64`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- 3 qword-loads / 3 qword-stores / 1 dword-magic-store / 1 dword-record_len-store. Labels prefixed bc_bv_ per docs fingerprint discipline (none needed at v1 -- record is fixed-length, no branches).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564342;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 32;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (u64) at [rsi + 8] --------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- bar_count (u64) at [rsi + 16] ---------------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 16], rax;
+
+        // ---- max_override (u64) at [rsi + 24] ------------------------------
+        mov rax, [rdi + 40];
+        mov [rsi + 24], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 32;
+        ret;
+      }
+    }
+
+}

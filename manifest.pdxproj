@@ -47,6 +47,10 @@ sources:
   - src/widgets/tabs.pdx          # M2-007: Tabs + TabsView@0.1
   - src/widgets/scrollbar.pdx     # M2-008: Scrollbar + ScrollbarView@0.1
   - src/semantic_registry.pdx     # M2-009: schema-hash constants + Send/Binding glue
+  - src/fixed64.pdx               # M3-001: Q32.32 signed fixed-point (paideia-as-native)
+  - src/widgets/gauge.pdx         # M3-002: Gauge/LineGauge + GaugeView@0.1
+  - src/widgets/sparkline.pdx     # M3-003: Sparkline + SparklineView@0.1
+  - src/widgets/barchart.pdx      # M3-004: BarChart + BarChartView@0.1
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at
