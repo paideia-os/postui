@@ -1,0 +1,592 @@
+// tests/boot_chart_canvas_smoke.pdx -- postui.M3-007 (paideia-os/postui#26)
+//
+// BootChartCanvasSmoke: third-wave boot smoke -- witness that Chart and
+// Canvas render DETERMINISTICALLY. For each widget, render the same
+// input twice into two independent .bss-allocated buffers and prove the
+// two renders are byte-for-byte identical over the widget's Rect region
+// via an inline memcmp loop.
+//
+// =============================================================================
+// SCOPE (docs/design.md §5.1 M3-007, design/architecture.md §7)
+// =============================================================================
+//
+// M3-007 lands the THIRD tests/*.pdx module in postui (after M1-008
+// tests/boot_block_smoke.pdx and M2-010 tests/boot_list_table_smoke.pdx)
+// and is the first test whose entire premise is a DETERMINISM witness
+// (identical input -> byte-identical output) rather than a check against
+// hand-baked expected cell bytes. Determinism matters here because both
+// widgets under test compose the Fixed64 (Q32.32) module through
+// fx_from_i64 / fx_sub / fx_scale (chart_draw's axis mapping) and the
+// integer Bresenham dot-plot (chart_draw's line phase, canvas_line's
+// dot loop); a non-deterministic rounding or a stale-register leak
+// would surface as a per-run mismatch, and no downstream widget-composition
+// test would catch that on its own.
+//
+// Structure follows the tests/boot_list_table_smoke.pdx precedent verbatim:
+//
+//   1. Reserve fixture-sized .bss slabs (two rendering buffers, chart
+//      points/dataset/spec, canvas bitmap/spec).
+//   2. Zero both rendering buffers at test entry (uninit .bss may hold
+//      arbitrary bytes from an earlier run's stack frame; every cell
+//      OUTSIDE the widget's Rect stays at its pre-render value, so a
+//      per-buffer zero-init makes the "identical input, identical output"
+//      contract cover the whole buffer even though each draw only stamps
+//      cells inside its own Rect).
+//   3. Init the Chart fixture (3 points via fx_from_i64, a 1-dataset
+//      spec covering x/y in [0, 10]). Call chart_draw TWICE, once into
+//      buffer_a, once into buffer_b, and memcmp the Chart region (20 x 6
+//      cells x 16 B = 1920 B = 240 qwords starting at buffer offset 0).
+//   4. Init the Canvas fixture (a 120-byte braille bitmap slot, a spec
+//      covering x in [0, 20] and y in [0, 12]). For each buffer:
+//      canvas_clear -> canvas_line(fx(0), fx(0), fx(19), fx(11)) ->
+//      canvas_draw. Memcmp the Canvas region (20 x 6 cells x 16 B =
+//      1920 B = 240 qwords starting at buffer offset 1920).
+//   5. Return 0 on all-pass. First mismatch short-circuits with a
+//      family-specific 0xFFFFEDCx sentinel so a smoke harness can
+//      attribute the failure without a full-value table lookup.
+//
+// The M1-008 / M2-010 precedent's rationale carries through: postui is a
+// userspace LIBRARY (design/architecture.md §2, no _start, no boot log),
+// so this "boot smoke" is a TEST module invoked by a downstream harness
+// (postui-top, postui-hex, postui-dmesg or a future dedicated
+// postui-smoke) as one entry in its smoke suite -- not a witness in a
+// kernel boot log.
+//
+// =============================================================================
+// FIXTURE
+// =============================================================================
+//
+// Buffer (each of two): 20 cols x 12 rows x 16 bytes = 3840 bytes =
+//                       480 u64 slots, .bss-allocated at 16-byte
+//                       alignment (matches Cell::CELL_BYTES = 16 so
+//                       every (y*cols+x)*16 offset lands on a cell
+//                       boundary). Two independent buffers so the
+//                       second render cannot accidentally see the first
+//                       render's state (a determinism harness that
+//                       shared one buffer would trivially "pass" -- the
+//                       second draw would land on top of an already-
+//                       identical fill).
+//
+// Chart:
+//   Rect: (x=0, y=0, w=20, h=6) -- top half of the 20 x 12 buffer.
+//   Dataset (1 dataset):
+//     points_ptr  -> 3 points (x_fx, y_fx pairs)
+//     point_count = 3
+//     kind        = 0 (CHART_DS_KIND_LINE)
+//     marker      = 0 (unused for LINE kind)
+//   Points (each 16 B, built via fx_from_i64 per issue directive):
+//     point 0: (fx(0),  fx(0))
+//     point 1: (fx(5),  fx(5))
+//     point 2: (fx(10), fx(10))
+//   ChartSpec (72 B):
+//     rect          = packed (0, 0, 20, 6) = 0x0006_0014_0000_0000
+//     datasets_ptr  = &_bccs_chart_dataset
+//     dataset_count = 1
+//     x_min         = fx(0) = 0
+//     x_max         = fx(10) = 0x0000_000A_0000_0000
+//     y_min         = fx(0) = 0
+//     y_max         = fx(10) = 0x0000_000A_0000_0000
+//     style_line    = 1
+//     style_axis    = 0 (reserved at v1 per chart.pdx WIRE block)
+//
+// Canvas:
+//   Rect: (x=0, y=6, w=20, h=6) -- bottom half of the 20 x 12 buffer.
+//                                  Chart's rect (rows 0..6) and Canvas's
+//                                  rect (rows 6..12) are disjoint, so
+//                                  no cell is written by both widgets.
+//   Bitmap: 20 * 6 = 120 bytes (bw * bh byte-per-cell braille backing),
+//           .bss-allocated at 8-byte alignment. canvas_clear zeroes it
+//           at the top of each render pass; canvas_line stamps the
+//           diagonal dot pattern into it; canvas_draw reads it back
+//           to compose braille glyphs into buffer cells.
+//   CanvasSpec (64 B):
+//     rect        = packed (0, 6, 20, 6) = 0x0006_0014_0006_0000
+//     x_min       = fx(0) = 0
+//     x_max       = fx(20) = 0x0000_0014_0000_0000
+//     y_min       = fx(0) = 0
+//     y_max       = fx(12) = 0x0000_000C_0000_0000
+//     bitmap_ptr  = &_bccs_canvas_bitmap
+//     style       = 2 (arbitrary non-zero to exercise the style_high /
+//                      style_word1 masking chain end-to-end)
+//     _reserved   = 0
+//   Line: (fx(0), fx(0)) -> (fx(19), fx(11)) -- near-corner diagonal.
+//         Value-space (0..20, 0..12) maps to dot-space (0..40, 0..24)
+//         which maps to cell-space (0..20, 0..6). Every dot along the
+//         diagonal falls inside the rect, exercising the full Bresenham
+//         + set-dot + draw chain.
+//
+// =============================================================================
+// DETERMINISM CHECK (memcmp region + fail attribution)
+// =============================================================================
+//
+// After each widget's two renders complete, an inline memcmp loop walks
+// the widget's Rect region qword-by-qword through both buffers; a
+// single mismatched u64 short-circuits to a family-specific sentinel.
+// Every cell in the Rect is a 16-byte pair of naturally-aligned u64s
+// (Cell::CELL_BYTES = 16); qword-for-qword equivalence over the region
+// is byte-for-byte equivalence (no sub-qword byte can differ without
+// its enclosing qword differing).
+//
+// Chart region: 20 x 6 cells x 16 B = 1920 B = 240 qwords, starting at
+//               buffer offset 0 (Rect y=0).
+// Canvas region: 20 x 6 cells x 16 B = 1920 B = 240 qwords, starting at
+//                buffer offset 1920 (Rect y=6; stride = cols * 16 =
+//                20 * 16 = 320 B/row; 6 * 320 = 1920 B offset).
+//
+// Cells OUTSIDE each widget's Rect are also implicitly compared as
+// zeros: neither widget's draw path stamps cells outside its own Rect,
+// and both buffers were zero-initialized at test entry, so any leak
+// (e.g. a stale-register write past the rect boundary) would surface
+// as a mismatch too. The two region-scoped memcmps thus cover every
+// buffer byte between them (Chart covers [0, 1920), Canvas covers
+// [1920, 3840); no gap, no overlap).
+//
+// =============================================================================
+// FAIL SENTINELS (band 0xFFFFEDC0..0xFFFFEDCF)
+// =============================================================================
+//
+// Anchored per architecture.md §7 (Fail-code family table). The M1-008
+// test_boot_smoke slot owns 0xFFFFEDA0..0xFFFFEDAF; M2-010
+// test_boot_list_table_smoke owns 0xFFFFEDB0..0xFFFFEDBF; this landing
+// takes the next 16-slot band 0xFFFFEDC0..0xFFFFEDCF for the M3 boot
+// smoke. Disjoint from the postui M3 library error bands (Fixed64
+// 0xFFFFEBD0..D4, Chart 0xFFFFEBD5, Canvas 0xFFFFEBD6) and from every
+// prior widget band (Layout / Text / List / Table / Tabs / Scrollbar in
+// 0xFFFFEBC0..CF, kernel KIND_TUI_CANVAS in 0xFFFFEB10..1F).
+//
+//   0xFFFFEDC0  BCCS_ERR_CHART_DRAW_RC     chart_draw returned non-zero
+//   0xFFFFEDC1  BCCS_ERR_CHART_MISMATCH    chart region differs between
+//                                          buffer_a and buffer_b
+//   0xFFFFEDC2  BCCS_ERR_CANVAS_CLEAR_RC   canvas_clear returned non-zero
+//   0xFFFFEDC3  BCCS_ERR_CANVAS_LINE_RC    canvas_line returned non-zero
+//   0xFFFFEDC4  BCCS_ERR_CANVAS_DRAW_RC    canvas_draw returned non-zero
+//   0xFFFFEDC5  BCCS_ERR_CANVAS_MISMATCH   canvas region differs
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BootChartCanvasSmoke`), matches
+//     file basename `boot_chart_canvas_smoke.pdx`.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` and every
+//     small-value compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF.
+//   - Every packed rect literal (0x0006001400000000, 0x0006001400060000)
+//     and every Fixed64 constant that overflows imm32
+//     (0x0000000A00000000 = fx(10), 0x0000001400000000 = fx(20),
+//     0x0000000C00000000 = fx(12), 0x0000001300000000 = fx(19),
+//     0x0000000B00000000 = fx(11)) is loaded via `mov reg, imm64`
+//     (movabs, 10-byte form) -- legal for mov, NOT for cmp/and. Every
+//     fail sentinel (0xFFFFEDCx) is likewise a movabs (imm > 0x7FFFFFFF).
+//   - The three chart points are built via bare `call fx_from_i64`
+//     (per issue directive), not via movabs; the two spec bounds
+//     (x_max/y_max) and the four canvas_line coord args use movabs
+//     directly because they're constants known at assemble time and
+//     staging them through fx_from_i64 would need scratch stack slots
+//     for no observable benefit (Fixed64 semantics are equivalent).
+//   - The rendering-buffer memcmp loops use base+displacement addressing
+//     only (`[rbx + 0]`, `[rcx + 0]`, pointer walk via `add rbx, 8`);
+//     no SIB (base+index*scale) addressing anywhere -- matches the
+//     addressing modes every other tests/*.pdx module uses.
+//   - No 2-op `imul reg, imm`; no imul used at all in this module.
+//   - No `and reg, imm64`; no `and` used at all in this module.
+//   - No `cmp reg, [mem]` (paideia-as encoder does not implement it;
+//     documented at canvas.pdx L1483). Every compare stages memory
+//     through a register first when needed.
+//   - Single-line pub let for every declaration.
+//   - r11 discipline: r11 is used only inside the memcmp loops as a
+//     transit for the second-buffer load, never preserved across a call.
+//   - SysV alignment: `push rbx` (8 B) rounds SysV entry rsp%16==8 to 0,
+//     aligned for every nested call. No `sub rsp, N` (no stack scratch
+//     needed -- every intermediate lives in .bss slots or caller-save
+//     registers between calls; the compare loops make no calls). rbx
+//     caches whichever spec/point/dataset/buffer base the current
+//     locality is writing into; every callee is SysV-conformant and
+//     preserves rbx.
+//   - Cross-module bare calls (`call chart_draw`, `call canvas_clear`,
+//     `call canvas_line`, `call canvas_draw`, `call fx_from_i64`)
+//     resolve via paideia-as's flat ELF symbol namespace -- same pattern
+//     boot_list_table_smoke.pdx uses to reach list_draw / table_draw /
+//     span_init / etc.
+//   - Effect row `!{mem} @{}` on boot_chart_canvas_smoke -- writes to
+//     every fixture slab and both rendering buffers (transitively via
+//     chart_draw / canvas_* / fx_from_i64), reads back for the memcmps.
+//     No sysreg, no cap.
+//   - Labels prefixed `bccs_` per docs fingerprint discipline.
+
+module BootChartCanvasSmoke = structure {
+
+  // ==========================================================================
+  // Fail sentinels (band 0xFFFFEDC0..0xFFFFEDCF per architecture.md §7)
+  // ==========================================================================
+  pub let BCCS_ERR_CHART_DRAW_RC    : u64 = 0xFFFFEDC0
+  pub let BCCS_ERR_CHART_MISMATCH   : u64 = 0xFFFFEDC1
+  pub let BCCS_ERR_CANVAS_CLEAR_RC  : u64 = 0xFFFFEDC2
+  pub let BCCS_ERR_CANVAS_LINE_RC   : u64 = 0xFFFFEDC3
+  pub let BCCS_ERR_CANVAS_DRAW_RC   : u64 = 0xFFFFEDC4
+  pub let BCCS_ERR_CANVAS_MISMATCH  : u64 = 0xFFFFEDC5
+
+  // ==========================================================================
+  // Fixture-shape constants (exported so a downstream harness can replay
+  // the same geometry without decoding raw numerals from this file).
+  // ==========================================================================
+  pub let BCCS_ROWS : u64 = 12
+  pub let BCCS_COLS : u64 = 20
+
+  // ==========================================================================
+  // Two rendering buffers: 20 cols x 12 rows x 16 bytes = 3840 bytes =
+  // 480 u64 slots each. @align(16) so every (y*cols+x)*16 offset lands
+  // on a Cell boundary (matches Cell::CELL_BYTES = 16, per src/cell.pdx).
+  // ==========================================================================
+  pub let mut _bccs_buffer_a : [u64; 480] = uninit @align(16)
+  pub let mut _bccs_buffer_b : [u64; 480] = uninit @align(16)
+
+  // ==========================================================================
+  // Chart fixture slots.
+  //
+  //   _bccs_chart_points  : 3 Points x 16 B = 48 B = 6 u64
+  //                         point i lives at &_bccs_chart_points + i*16
+  //                         with x_fx at [+0], y_fx at [+8].
+  //   _bccs_chart_dataset : 1 Dataset x 32 B = 32 B = 4 u64
+  //                         (points_ptr, point_count, kind, marker)
+  //   _bccs_chart_spec    : 1 ChartSpec x 72 B = 9 u64
+  // ==========================================================================
+  pub let mut _bccs_chart_points  : [u64; 6] = uninit @align(8)
+  pub let mut _bccs_chart_dataset : [u64; 4] = uninit @align(8)
+  pub let mut _bccs_chart_spec    : [u64; 9] = uninit @align(8)
+
+  // ==========================================================================
+  // Canvas fixture slots.
+  //
+  //   _bccs_canvas_bitmap : bw * bh = 20 * 6 = 120 bytes = 15 u64
+  //                         (byte-per-cell braille dot backing;
+  //                          canvas_clear zeroes it, canvas_line stamps
+  //                          dots into it, canvas_draw reads it back)
+  //   _bccs_canvas_spec   : 1 CanvasSpec x 64 B = 8 u64
+  // ==========================================================================
+  pub let mut _bccs_canvas_bitmap : [u64; 15] = uninit @align(8)
+  pub let mut _bccs_canvas_spec   : [u64; 8]  = uninit @align(8)
+
+  // ==========================================================================
+  // boot_chart_canvas_smoke() -> u64
+  //
+  // Runs the determinism witness end-to-end:
+  //
+  //   Phase 0: zero both rendering buffers (uninit .bss may hold arbitrary
+  //            bytes from an earlier run's stack frame; a per-buffer
+  //            zero-init makes the "identical input, identical output"
+  //            contract cover every buffer byte, not just the cells that
+  //            the widget draws into).
+  //   Phase 1: build the 3 Chart points via fx_from_i64 (rdi=integer,
+  //            rax=fx result); direct-store the Dataset (32 B) and the
+  //            ChartSpec (72 B).
+  //   Phase 2: chart_draw into buffer_a; chart_draw into buffer_b. Memcmp
+  //            the Chart region (20 x 6 cells x 16 B = 1920 B = 240
+  //            qwords starting at offset 0). First mismatch -> sentinel.
+  //   Phase 3: direct-store the CanvasSpec (64 B).
+  //   Phase 4: for each of buffer_a and buffer_b: canvas_clear (zeroes
+  //            bitmap) -> canvas_line (fx(0), fx(0)) to (fx(19), fx(11))
+  //            (stamps diagonal dots) -> canvas_draw (composes braille
+  //            glyphs into cells). Memcmp the Canvas region (20 x 6
+  //            cells x 16 B = 1920 B = 240 qwords starting at offset 1920).
+  //
+  // Returns 0 on ALL passes. First mismatch short-circuits with a
+  // family-specific sentinel; the smoke harness can attribute the
+  // failure without a full-value table lookup.
+  //
+  // Register plan: nullary entry. 1-push (rbx) = 8 B -- rsp%16 goes
+  // from entry 8 to 0, aligned for every nested call. rbx is used as a
+  // scratch base-address register during the direct-store phases (each
+  // spec/dataset/point-group re-lea's rbx as it starts) and as the
+  // buffer_a base in the memcmp loops. rbx is SysV callee-save so every
+  // called function (fx_from_i64, chart_draw, canvas_clear, canvas_line,
+  // canvas_draw) preserves it end-to-end.
+  //
+  // Labels prefixed `bccs_` per docs fingerprint discipline.
+  // ==========================================================================
+  pub let boot_chart_canvas_smoke : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M3-007 (postui#26): boot_chart_canvas_smoke witnesses that Chart and Canvas render deterministically -- identical input produces byte-identical cell output. Structure follows tests/boot_list_table_smoke.pdx: 1-push (rbx) = 8 B rounds SysV entry rsp%16==8 to 0, aligned for every nested call; no `sub rsp, N` (no stack scratch needed -- every intermediate lives in .bss slots or caller-save regs between calls, and the memcmp loops make no calls). Phase 0 zeros both rendering buffers (480 qwords each = 3840 B each = 7680 B total) via two identical qword-store loops seeded with rax=0 (uninit .bss may hold arbitrary bytes from a prior stack frame; per-buffer zero-init makes the determinism contract cover every buffer byte, not just cells the widget stamps). Phase 1 builds 3 Chart points via bare `call fx_from_i64` (rdi=integer, rax=fx raw; each result stored to [&_bccs_chart_points+i*16+0] as x_fx and [+i*16+8] as y_fx -- x==y along the y=x diagonal per issue directive), direct-stores Dataset (points_ptr=&_bccs_chart_points at [+0], point_count=3 at [+8], kind=0 (LINE) at [+16], marker=0 at [+24]), then direct-stores ChartSpec: rect (0,0,20,6) packed 0x0006001400000000 via movabs (imm > 0x7FFFFFFF; legal for mov), datasets_ptr=&_bccs_chart_dataset at [+8], dataset_count=1 at [+16], x_min=0 at [+24], x_max=fx(10)=0x0000000A00000000 via movabs at [+32], y_min=0 at [+40], y_max=fx(10) at [+48], style_line=1 at [+56], style_axis=0 at [+64]. Phase 2 calls chart_draw(spec, buffer_a, 12, 20); cmp rax, 0; jne bccs_fail_chart_draw_rc. Then chart_draw(spec, buffer_b, 12, 20) with the same check. Then memcmp Chart region: lea rbx, [rip + _bccs_buffer_a]; lea rcx, [rip + _bccs_buffer_b]; mov r8, 240; loop `cmp r8, 0; je done; mov rax, [rbx+0]; mov r11, [rcx+0]; cmp rax, r11; jne bccs_fail_chart_mismatch; add rbx, 8; add rcx, 8; sub r8, 1; jmp loop`. Region = 20 cols x 6 rows x 16 B = 1920 B = 240 qwords starting at buffer offset 0. Phase 3 direct-stores CanvasSpec: rect (0,6,20,6) packed 0x0006001400060000 via movabs at [+0], x_min=0 at [+8], x_max=fx(20)=0x0000001400000000 via movabs at [+16], y_min=0 at [+24], y_max=fx(12)=0x0000000C00000000 via movabs at [+32], bitmap_ptr=&_bccs_canvas_bitmap at [+40], style=2 at [+48], _reserved=0 at [+56]. Phase 4 for each buffer: canvas_clear(spec) with rc check; canvas_line(spec, fx(0)=0, fx(0)=0, fx(19)=0x0000001300000000 via movabs into rcx, fx(11)=0x0000000B00000000 via movabs into r8) with rc check; canvas_draw(spec, buffer, 12, 20) with rc check. Then memcmp Canvas region: same loop shape but starting at buffer offset 1920 (6 rows * 20 cols * 16 B/row-cell = 1920 B; that is the byte offset of the first Canvas cell) walking 240 qwords. Success path: xor rax, rax; pop rbx; ret. Each fail arm: mov rax, 0xFFFFEDCx via movabs (imm > 0x7FFFFFFF; legal for mov); pop rbx; ret. Every immediate that reaches cmp (0, 1, 3, 240, 480) fits imm32; every immediate in shift/add contexts (1, 3, 8, 16, 24, 32, 40, 48, 56, 64, 1920) fits imm32; every large constant (packed rects, Fixed64 constants, fail sentinels) is loaded via mov reg, imm64 (movabs, legal for mov). No `test`, no `imul`, no `and`, no `cmp reg, imm > 0x7FFFFFFF`, no `cmp reg, [mem]`. Every callee resolves via paideia-as's flat ELF symbol namespace: fx_from_i64 from Fixed64; chart_draw from Chart; canvas_clear / canvas_line / canvas_draw from Canvas. Effect `!{mem}` covers every store into the fixture slabs and both rendering buffers (transitively via chart_draw / canvas_* / fx_from_i64) and every readback for compare. rbx caches whichever spec/dataset/points/buffer base the current locality reads or writes; every callee is SysV-conformant and preserves rbx. Labels prefixed bccs_ per docs fingerprint discipline (bccs_za_loop / bccs_za_done for buffer_a zero, bccs_zb_loop / bccs_zb_done for buffer_b zero, bccs_chart_cmp_loop / bccs_chart_cmp_done for Chart region memcmp, bccs_canvas_cmp_loop / bccs_canvas_cmp_done for Canvas region memcmp, bccs_fail_* for the six fail-arm epilogues).",
+      block: {
+        push rbx;
+
+        // ==================================================================
+        // Phase 0: zero both rendering buffers (480 qwords each).
+        // Uninit .bss may hold arbitrary bytes; per-buffer zero-init makes
+        // the determinism contract cover every byte, not just stamped cells.
+        // ==================================================================
+
+        // ---- Zero buffer_a --------------------------------------------
+        xor rax, rax;
+        lea rbx, [rip + _bccs_buffer_a];
+        mov rcx, 480;
+      bccs_za_loop:
+        cmp rcx, 0;
+        je  bccs_za_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bccs_za_loop;
+      bccs_za_done:
+
+        // ---- Zero buffer_b --------------------------------------------
+        xor rax, rax;
+        lea rbx, [rip + _bccs_buffer_b];
+        mov rcx, 480;
+      bccs_zb_loop:
+        cmp rcx, 0;
+        je  bccs_zb_done;
+        mov [rbx + 0], rax;
+        add rbx, 8;
+        sub rcx, 1;
+        jmp bccs_zb_loop;
+      bccs_zb_done:
+
+        // ==================================================================
+        // Phase 1: build Chart fixture (3 points via fx_from_i64,
+        // Dataset direct-store, ChartSpec direct-store).
+        // ==================================================================
+
+        // ---- Point 0: (fx(0), fx(0)) ----------------------------------
+        mov rdi, 0;
+        call fx_from_i64;
+        lea rbx, [rip + _bccs_chart_points];
+        mov [rbx + 0], rax;                 // x_fx
+        mov [rbx + 8], rax;                 // y_fx (== x_fx along y=x)
+
+        // ---- Point 1: (fx(5), fx(5)) ----------------------------------
+        mov rdi, 5;
+        call fx_from_i64;
+        lea rbx, [rip + _bccs_chart_points];
+        mov [rbx + 16], rax;                // x_fx
+        mov [rbx + 24], rax;                // y_fx
+
+        // ---- Point 2: (fx(10), fx(10)) --------------------------------
+        mov rdi, 10;
+        call fx_from_i64;
+        lea rbx, [rip + _bccs_chart_points];
+        mov [rbx + 32], rax;                // x_fx
+        mov [rbx + 40], rax;                // y_fx
+
+        // ---- Dataset direct-store (32 B) ------------------------------
+        lea rbx, [rip + _bccs_chart_dataset];
+        lea rax, [rip + _bccs_chart_points];
+        mov [rbx + 0], rax;                 // points_ptr
+        mov rax, 3;
+        mov [rbx + 8], rax;                 // point_count = 3
+        xor rax, rax;
+        mov [rbx + 16], rax;                // kind = 0 (LINE)
+        mov [rbx + 24], rax;                // marker = 0 (unused for LINE)
+
+        // ---- ChartSpec direct-store (72 B) ----------------------------
+        // rect = (x=0, y=0, w=20, h=6) packed = (20<<32) | (6<<48)
+        //      = 0x0006_0014_0000_0000 (imm64 -> movabs; legal for mov)
+        lea rbx, [rip + _bccs_chart_spec];
+        mov rax, 0x0006001400000000;
+        mov [rbx + 0], rax;                 // rect
+        lea rax, [rip + _bccs_chart_dataset];
+        mov [rbx + 8], rax;                 // datasets_ptr
+        mov rax, 1;
+        mov [rbx + 16], rax;                // dataset_count = 1
+        xor rax, rax;
+        mov [rbx + 24], rax;                // x_min = fx(0) = 0
+        mov rax, 0x0000000A00000000;
+        mov [rbx + 32], rax;                // x_max = fx(10)
+        xor rax, rax;
+        mov [rbx + 40], rax;                // y_min = fx(0) = 0
+        mov rax, 0x0000000A00000000;
+        mov [rbx + 48], rax;                // y_max = fx(10)
+        mov rax, 1;
+        mov [rbx + 56], rax;                // style_line = 1
+        xor rax, rax;
+        mov [rbx + 64], rax;                // style_axis = 0 (reserved)
+
+        // ==================================================================
+        // Phase 2: chart_draw twice; memcmp Chart region for determinism.
+        // ==================================================================
+
+        // ---- First render into buffer_a ------------------------------
+        lea rdi, [rip + _bccs_chart_spec];
+        lea rsi, [rip + _bccs_buffer_a];
+        mov rdx, 12;
+        mov rcx, 20;
+        call chart_draw;
+        cmp rax, 0;
+        jne bccs_fail_chart_draw_rc;
+
+        // ---- Second render into buffer_b -----------------------------
+        lea rdi, [rip + _bccs_chart_spec];
+        lea rsi, [rip + _bccs_buffer_b];
+        mov rdx, 12;
+        mov rcx, 20;
+        call chart_draw;
+        cmp rax, 0;
+        jne bccs_fail_chart_draw_rc;
+
+        // ---- Memcmp Chart region: 240 qwords at buffer offset 0 -------
+        // 20 cols x 6 rows x 16 B/cell = 1920 B = 240 qwords.
+        // Base+displacement addressing only (no SIB); pointer walk via
+        // add rbx, 8 / add rcx, 8 keeps both buffer cursors in step.
+        lea rbx, [rip + _bccs_buffer_a];
+        lea rcx, [rip + _bccs_buffer_b];
+        mov r8, 240;
+      bccs_chart_cmp_loop:
+        cmp r8, 0;
+        je  bccs_chart_cmp_done;
+        mov rax, [rbx + 0];
+        mov r11, [rcx + 0];
+        cmp rax, r11;
+        jne bccs_fail_chart_mismatch;
+        add rbx, 8;
+        add rcx, 8;
+        sub r8, 1;
+        jmp bccs_chart_cmp_loop;
+      bccs_chart_cmp_done:
+
+        // ==================================================================
+        // Phase 3: build Canvas fixture (CanvasSpec direct-store).
+        // ==================================================================
+
+        // ---- CanvasSpec direct-store (64 B) ---------------------------
+        // rect = (x=0, y=6, w=20, h=6) packed = (6<<16)|(20<<32)|(6<<48)
+        //      = 0x0006_0014_0006_0000 (imm64 -> movabs; legal for mov)
+        lea rbx, [rip + _bccs_canvas_spec];
+        mov rax, 0x0006001400060000;
+        mov [rbx + 0], rax;                 // rect
+        xor rax, rax;
+        mov [rbx + 8], rax;                 // x_min = fx(0) = 0
+        mov rax, 0x0000001400000000;
+        mov [rbx + 16], rax;                // x_max = fx(20)
+        xor rax, rax;
+        mov [rbx + 24], rax;                // y_min = fx(0) = 0
+        mov rax, 0x0000000C00000000;
+        mov [rbx + 32], rax;                // y_max = fx(12)
+        lea rax, [rip + _bccs_canvas_bitmap];
+        mov [rbx + 40], rax;                // bitmap_ptr
+        mov rax, 2;
+        mov [rbx + 48], rax;                // style = 2
+        xor rax, rax;
+        mov [rbx + 56], rax;                // _reserved = 0
+
+        // ==================================================================
+        // Phase 4: for each buffer, canvas_clear -> canvas_line -> canvas_draw;
+        // memcmp Canvas region for determinism.
+        // ==================================================================
+
+        // ---- Render 1: buffer_a --------------------------------------
+        // canvas_clear(spec)
+        lea rdi, [rip + _bccs_canvas_spec];
+        call canvas_clear;
+        cmp rax, 0;
+        jne bccs_fail_canvas_clear_rc;
+
+        // canvas_line(spec, x0=fx(0), y0=fx(0), x1=fx(19), y1=fx(11))
+        // Fixed64 constants loaded via movabs directly into arg regs:
+        //   fx(19) = 19 << 32 = 0x0000_0013_0000_0000
+        //   fx(11) = 11 << 32 = 0x0000_000B_0000_0000
+        lea rdi, [rip + _bccs_canvas_spec];
+        xor rsi, rsi;                       // x0 = fx(0) = 0
+        xor rdx, rdx;                       // y0 = fx(0) = 0
+        mov rcx, 0x0000001300000000;        // x1 = fx(19)
+        mov r8,  0x0000000B00000000;        // y1 = fx(11)
+        call canvas_line;
+        cmp rax, 0;
+        jne bccs_fail_canvas_line_rc;
+
+        // canvas_draw(spec, buffer_a, 12, 20)
+        lea rdi, [rip + _bccs_canvas_spec];
+        lea rsi, [rip + _bccs_buffer_a];
+        mov rdx, 12;
+        mov rcx, 20;
+        call canvas_draw;
+        cmp rax, 0;
+        jne bccs_fail_canvas_draw_rc;
+
+        // ---- Render 2: buffer_b (identical input; determinism witness)
+        // canvas_clear(spec)
+        lea rdi, [rip + _bccs_canvas_spec];
+        call canvas_clear;
+        cmp rax, 0;
+        jne bccs_fail_canvas_clear_rc;
+
+        // canvas_line(spec, fx(0), fx(0), fx(19), fx(11))
+        lea rdi, [rip + _bccs_canvas_spec];
+        xor rsi, rsi;
+        xor rdx, rdx;
+        mov rcx, 0x0000001300000000;
+        mov r8,  0x0000000B00000000;
+        call canvas_line;
+        cmp rax, 0;
+        jne bccs_fail_canvas_line_rc;
+
+        // canvas_draw(spec, buffer_b, 12, 20)
+        lea rdi, [rip + _bccs_canvas_spec];
+        lea rsi, [rip + _bccs_buffer_b];
+        mov rdx, 12;
+        mov rcx, 20;
+        call canvas_draw;
+        cmp rax, 0;
+        jne bccs_fail_canvas_draw_rc;
+
+        // ---- Memcmp Canvas region: 240 qwords at buffer offset 1920 --
+        // 20 cols x 6 rows x 16 B/cell = 1920 B = 240 qwords, starting
+        // at Rect y=6 -> byte offset = 6 * (20 * 16) = 6 * 320 = 1920.
+        lea rbx, [rip + _bccs_buffer_a];
+        add rbx, 1920;
+        lea rcx, [rip + _bccs_buffer_b];
+        add rcx, 1920;
+        mov r8, 240;
+      bccs_canvas_cmp_loop:
+        cmp r8, 0;
+        je  bccs_canvas_cmp_done;
+        mov rax, [rbx + 0];
+        mov r11, [rcx + 0];
+        cmp rax, r11;
+        jne bccs_fail_canvas_mismatch;
+        add rbx, 8;
+        add rcx, 8;
+        sub r8, 1;
+        jmp bccs_canvas_cmp_loop;
+      bccs_canvas_cmp_done:
+
+        // ==================================================================
+        // All checks passed.
+        // ==================================================================
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      bccs_fail_chart_draw_rc:
+        mov rax, 0xFFFFEDC0;
+        pop rbx;
+        ret;
+
+      bccs_fail_chart_mismatch:
+        mov rax, 0xFFFFEDC1;
+        pop rbx;
+        ret;
+
+      bccs_fail_canvas_clear_rc:
+        mov rax, 0xFFFFEDC2;
+        pop rbx;
+        ret;
+
+      bccs_fail_canvas_line_rc:
+        mov rax, 0xFFFFEDC3;
+        pop rbx;
+        ret;
+
+      bccs_fail_canvas_draw_rc:
+        mov rax, 0xFFFFEDC4;
+        pop rbx;
+        ret;
+
+      bccs_fail_canvas_mismatch:
+        mov rax, 0xFFFFEDC5;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
