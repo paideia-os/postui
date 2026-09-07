@@ -59,7 +59,8 @@ sources:
   - src/widgets/calendar.pdx      # M4-003: Calendar + CalendarView@0.1
   - src/widgets/clear.pdx         # M4-004: Clear widget + ClearView@0.1
   - src/input/event.pdx           # M4-005: Event enum + Key/Resize/Mouse/Paste kinds
-  - src/input/esc_parser.pdx      # M4-005: CSI/SS3/OSC ESC-sequence state machine
+  - src/input/esc_parser.pdx      # M4-005: CSI/SS3/OSC ESC-sequence state machine (+M4-006 mouse/paste)
+  - src/terminal.pdx              # M4-007: Terminal input dispatcher (KIND_TTY primary vs sys_read fallback)
 
 # --- Library dependencies -----------------------------------------------
 # postui's rendering path does not need libpdx-cap or libpdx-argv at

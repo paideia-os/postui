@@ -1,0 +1,411 @@
+// src/terminal.pdx -- postui.M4-007 (paideia-os/postui#33)
+//
+// Terminal module: primary-path KIND_TTY raw-mode input dispatcher.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.5 input handling, §5.1 M4-007)
+// =============================================================================
+//
+// This module is the compile-time gate that switches postui's input
+// path from the M1-005 sys_read(0) fallback (Frame::frame_next_event)
+// to the KIND_TTY raw-mode TTY_OP_READ primary path (docs/design.md
+// §2.5, §2.7) once paideia-os #1986 (R66v2.POS-001, TTY_OP_READ +
+// raw-mode toggle) lands.
+//
+// At M4-007 landing time paideia-os #1986 is FILED but NOT LANDED.
+// This module therefore ships:
+//
+//   * The new primary entry point terminal_read_input(buf, len). Its
+//     body compiles BOTH branches (primary KIND_TTY cap-invoke shape
+//     AND sys_read(0) fallback shape) unconditionally; a compile-time
+//     source-editable gate (TERMINAL_KIND_TTY_LIVE, hardcoded into
+//     the body's `mov rax, 0` prologue) decides which branch runs.
+//
+//   * A .bss cap slot (_terminal_tty_cap[0]) plus a setter
+//     (terminal_set_tty_cap) so the consumer's exec-time seeding
+//     path (its InitCap sidecar per caps.decl KIND_TTY(read)) can
+//     stash the kernel-provided KIND_TTY cap slot for the primary
+//     path to reach.
+//
+// The design honors the postui M1 no-churn discipline: Frame keeps
+// its existing surface (frame_next_event stays the historical fallback
+// wrapper), and a wire-through inside frame_next_event (a cross-
+// module `call terminal_read_input` with a matching `sub rsp, 8` /
+// `add rsp, 8` alignment adjust) forwards every existing caller
+// through this gate without touching Frame's ABI. Once
+// #1986 lands and stabilizes, the FLIP procedure is exactly two source
+// edits (documented below).
+//
+// =============================================================================
+// THE FLIP (post-paideia-os #1986)
+// =============================================================================
+//
+// When paideia-os #1986 lands and its KIND_TTY raw-mode TTY_OP_READ
+// surface stabilizes, this module is switched to the primary path
+// via TWO source edits, no ABI change:
+//
+//   1. Change `pub let TERMINAL_KIND_TTY_LIVE : u64 = 0` (below) to
+//      `= 1`. This is the human-facing constant; downstream tests
+//      (postui.M4-008 boot smoke) assert against it.
+//
+//   2. Change the `mov rax, 0` prologue inside terminal_read_input's
+//      block: to `mov rax, 1`. paideia-as inlines named `let`
+//      constants at compile time, but the asm-sublanguage does NOT
+//      accept named constants as immediate operands (see
+//      tui_canvas_client.pdx: every op ordinal is a literal 0..7 in
+//      `mov rsi, N`, never a symbolic name). The literal in the body
+//      is therefore the true gate; the named constant is the
+//      contract mirror consumers read.
+//
+//   3. Verify the TTY_OP_READ op ordinal against paideia-os #1986's
+//      landed value. This module carries TRM_TTY_OP_READ = 1 as a
+//      DEFENSIVE STUB (matches TTY_OP_SET_RAW discipline in
+//      docs/design.md §2.5 which reserves the low ordinal for the
+//      raw-mode toggle and TTY_OP_READ for the read op). If the
+//      landed ordinal differs, update both TRM_TTY_OP_READ (below)
+//      and the `mov rsi, 1` immediate inside terminal_read_input's
+//      block.
+//
+// Post-flip the fallback path becomes dead code but STAYS COMPILED --
+// M5 release-manifest work will emit the removal in a separate
+// landing once the primary path has soaked (docs/design.md §2.5
+// "Removal" clause: "the fallback path is explicitly temporary").
+//
+// =============================================================================
+// _TERMINAL_TTY_CAP LAYOUT (one u64, one .bss word, @align(8))
+// =============================================================================
+//
+//   [0]   tty_cap   (u64)   KIND_TTY cap slot the consumer stashed
+//                            via terminal_set_tty_cap. Zero-init at
+//                            load (.bss). Zero = unset; primary path
+//                            refuses fast with TRM_ERR_NO_TTY_CAP
+//                            rather than fall back silently (a fast
+//                            refusal is loud enough to catch a
+//                            miswired consumer that flipped
+//                            TERMINAL_KIND_TTY_LIVE without seeding
+//                            the cap).
+//
+// Kept as a `[u64; 1]` array rather than a bare u64 to match the
+// _terminal_state precedent in frame.pdx (line 250) -- paideia-as
+// has one confirmed .bss mutable-array declaration shape in postui,
+// and reusing it here avoids introducing a second syntactic path.
+//
+// =============================================================================
+// ERROR BAND
+// =============================================================================
+//
+// TRM_ERR_BAND base is 0xFFFFEBE7 in the M4 band (design/architecture.md
+// §5.1 aggregate table: 0xFFFFEBE0..0xFFFFEBEF reserved for M4). The
+// single sentinel exported at M4-007 is TRM_ERR_NO_TTY_CAP -- the
+// defensive refusal when the primary path is reached with an unset
+// cap slot. Additional sentinels (TRM_ERR_TTY_READ_REFUSED,
+// TRM_ERR_RAW_MODE_UNAVAILABLE) are reserved for the post-#1986
+// probe body that lands as part of the flip.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Terminal`), matches file
+//     basename. Consumers reference `Terminal::terminal_read_input`.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - Every mov_b byte-load is preceded by xor of the destination
+//     (none needed in this module -- every load/store is qword).
+//   - Every immediate in cmp / and fits imm32 (0, 1, 4). The error
+//     sentinel 0xFFFFEBE7 is ONLY used in `mov reg, imm` form (>
+//     0x7FFFFFFF triggers paideia-as's 10-byte movabs -- legal for
+//     mov, not for cmp/and; same posture frame.pdx uses for
+//     0xFFFFEB9x sentinels).
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). No imul used at
+//     all in this module.
+//   - `not reg` is NOT encoded by paideia-as (see madt.pdx §G2).
+//     None used.
+//   - r11 is scratch (paideia-as conformance) throughout. No r11
+//     use anywhere; SYSCALL clobbers r11 on the CPU side but that
+//     is harmless (SysV caller-save).
+//   - Cross-module wire-through (Frame::frame_next_event `call
+//     terminal_read_input`) relies on paideia-as's flat ELF symbol
+//     namespace, same pattern kernel/core/cap/cap_handler_tui_canvas.pdx
+//     uses when it calls tty_row_id across the KIND_TTY module
+//     boundary.
+//   - Reserved labels: none (labels prefixed `trm_` per docs/design.md
+//     fingerprint discipline; `loop` / `if` are paideia-as reserved
+//     and NOT used bare).
+//   - SysV stack alignment: terminal_read_input and
+//     terminal_set_tty_cap are LEAVES (no nested call). SYSCALL is
+//     NOT a call in the SysV sense; it does not need rsp%16==0.
+//     No push/pop needed anywhere. This is the same leaf-shape
+//     tui_canvas_client.pdx's eight wrappers use.
+//   - Effect row `!{mem, sysreg} @{cap}` on terminal_read_input
+//     (transitively invokes the KIND_TTY cap via sys_cap_invoke on
+//     the primary branch, and issues sys_read on the fallback branch
+//     -- the union of both paths is the declared row; the sys_read
+//     branch fits inside {mem, sysreg} without needing a cap effect
+//     because sys_read is a plain-fd op). `!{mem}` on
+//     terminal_set_tty_cap (single qword store).
+
+module Terminal = structure {
+
+  // ==========================================================================
+  // Compile-time input-path gate.
+  //
+  // TERMINAL_KIND_TTY_LIVE is the SOURCE-of-TRUTH constant a consumer
+  // reads to know whether the primary KIND_TTY read path is live.
+  // 0 = fallback (sys_read(0)) active; 1 = primary (KIND_TTY
+  // TTY_OP_READ) active.
+  //
+  // The asm body of terminal_read_input hardcodes this into a `mov
+  // rax, 0` prologue -- paideia-as's asm sublanguage does NOT inline
+  // named `let` constants as immediate operands (see the eight
+  // literal `mov rsi, N` op ordinals in tui_canvas_client.pdx), so
+  // this constant and the literal must be kept in sync BY HAND at
+  // the flip. See "THE FLIP" in the module header.
+  // ==========================================================================
+  pub let TERMINAL_KIND_TTY_LIVE : u64 = 0
+
+  // ==========================================================================
+  // KIND_TTY op ordinals (defensive stubs pending paideia-os #1986).
+  //
+  // TRM_TTY_OP_READ is the ordinal terminal_read_input's primary
+  // branch passes as sys_cap_invoke's op_arg. Verified against
+  // paideia-os #1986's landed KIND_TTY op table AT THE FLIP; today
+  // this is a placeholder matching the docs/design.md §2.5 hint that
+  // TTY_OP_SET_RAW would take the low ordinal and TTY_OP_READ the
+  // next. Consumers MUST NOT flip TERMINAL_KIND_TTY_LIVE without
+  // reconciling this against the landed value.
+  // ==========================================================================
+  pub let TRM_TTY_OP_READ : u64 = 1
+
+  // ==========================================================================
+  // SC+ sysno mirrors. TRM_SYS_CAP_INVOKE = 4 mirrors
+  // TCC_SYS_CAP_INVOKE (design/user/syscall-table.md row 4,
+  // paideia-os); TRM_SYSNO_READ = 0 mirrors FRAME_SYS_READ (row 0);
+  // TRM_STDIN_FD = 0 mirrors FRAME_STDIN_FD. Named here so
+  // terminal_read_input names both entrance points in ONE place per
+  // sub-branch.
+  // ==========================================================================
+  pub let TRM_SYS_CAP_INVOKE : u64 = 4
+  pub let TRM_SYSNO_READ     : u64 = 0
+  pub let TRM_STDIN_FD       : u64 = 0
+
+  // ==========================================================================
+  // Error sentinels (M4 band 0xFFFFEBE0..0xFFFFEBEF per
+  // design/architecture.md §5.1 aggregate table).
+  //
+  // TRM_ERR_NO_TTY_CAP is the ONE sentinel M4-007 needs today: the
+  // primary path was reached (TERMINAL_KIND_TTY_LIVE=1) but the
+  // consumer never called terminal_set_tty_cap, so the .bss slot is
+  // still zero. Defensive refusal, not a silent fallback, so a
+  // miswired consumer surfaces its bug on the first read attempt.
+  //
+  // TRM_ERR_BAND is exposed as an alias so downstream code can `>> 8`
+  // and switch on the band without hardcoding the sentinel value.
+  // ==========================================================================
+  pub let TRM_ERR_BAND        : u64 = 0xFFFFEBE7
+  pub let TRM_ERR_NO_TTY_CAP  : u64 = 0xFFFFEBE7
+
+  // ==========================================================================
+  // _terminal_tty_cap: [u64; 1] .bss slot for the consumer-provided
+  // KIND_TTY cap slot. Zero-init at load; zero = unset; the setter
+  // terminal_set_tty_cap writes it once at the consumer's InitCap
+  // seeding time (post-flip only; today no consumer calls the setter
+  // because the primary path is gated off).
+  //
+  // Array of length 1 rather than a bare u64 to match the
+  // _terminal_state precedent in frame.pdx (line 250) -- reuses the
+  // one confirmed .bss mutable-array declaration shape in postui.
+  // ==========================================================================
+  pub let mut _terminal_tty_cap : [u64; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // terminal_set_tty_cap(cap_slot) -> u64
+  //
+  // Stash the consumer-provided KIND_TTY cap slot for
+  // terminal_read_input's primary branch to reach. Returns 0 always
+  // (no validation: the primary branch's cmp rax, 0 catches an
+  // accidentally zero cap slot via TRM_ERR_NO_TTY_CAP; deeper
+  // validation is the kernel's job at sys_cap_invoke dispatch).
+  //
+  // NOT re-entrancy-guarded: a consumer that re-invokes overwrites
+  // the slot. Intended shape for a re-bind after a KIND_TTY re-mint
+  // (e.g. after a session's TTY row is rotated).
+  //
+  // Leaf: single qword store. rdi=cap_slot; SysV entry. No push/pop.
+  // Effect !{mem} (single qword store).
+  //
+  // Labels: none (linear body).
+  // ==========================================================================
+  pub let terminal_set_tty_cap : (u64) -> u64 !{mem} @{} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-007 (#33): terminal_set_tty_cap stashes rdi=cap_slot into _terminal_tty_cap[0]. Leaf: no push/pop, no callee-save touched, no nested call. Body: lea rax, [rip + _terminal_tty_cap]; mov [rax + 0], rdi; xor rax, rax (return 0=OK); ret. Effect !{mem}: single qword store to a .bss word. No cap effect (writes plain memory, not through a cap-invoke). Every immediate fits imm32 (0). No test, no imul, no r11 use.",
+      block: {
+        lea rax, [rip + _terminal_tty_cap];
+        mov [rax + 0], rdi;
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // terminal_read_input(buf_ptr, buf_len) -> u64
+  //
+  // The M4-007 primary-path dispatcher. Reads up to `buf_len` bytes
+  // into `buf_ptr` via the input transport selected by
+  // TERMINAL_KIND_TTY_LIVE:
+  //
+  //   * TERMINAL_KIND_TTY_LIVE = 0 (M4-007 landing default):
+  //     falls through to sys_read(0, buf, len) -- the exact shape
+  //     frame_next_event ships (docs/design.md §2.5 fallback path).
+  //
+  //   * TERMINAL_KIND_TTY_LIVE = 1 (post-#1986 flip):
+  //     issues sys_cap_invoke(_terminal_tty_cap[0], TRM_TTY_OP_READ,
+  //     buf_ptr, buf_len) against the consumer-stashed KIND_TTY cap
+  //     (docs/design.md §2.5 primary path). If the cap slot is
+  //     unset (zero), refuses with TRM_ERR_NO_TTY_CAP -- a fast
+  //     refusal so a miswired consumer surfaces its bug on the first
+  //     read.
+  //
+  // Returns:
+  //   * on fallback: raw sys_read result (bytes read; 0 = EOF; or
+  //     -errno as a value in the 0xFFFF...F800..F80 unsigned band).
+  //   * on primary + OK: raw kernel bytes-read count (as sys_cap_invoke
+  //     forwards from the KIND_TTY handler).
+  //   * on primary + no cap: TRM_ERR_NO_TTY_CAP = 0xFFFFEBE7.
+  //   * on primary + kernel refusal: whatever the kernel returned
+  //     (TTY_TAIL_* sentinel band in the KIND_TTY page, disjoint
+  //     from the postui M4 error band).
+  //
+  // NOT gated on any state predicate. Consumers that need to gate
+  // on Frame::frame_state()==INITIALIZED check themselves.
+  //
+  // Register plan. SysV rdi=buf_ptr, rsi=buf_len.
+  //
+  //   Common prologue (gate check):
+  //     mov rax, 0    ; TERMINAL_KIND_TTY_LIVE literal (source-flip
+  //                   ; edit target); imm32-safe
+  //     cmp rax, 0
+  //     je  trm_read_fallback
+  //
+  //   Primary path (KIND_TTY cap-invoke):
+  //     lea rax, [rip + _terminal_tty_cap]
+  //     mov rax, [rax + 0]           ; rax = cap_slot
+  //     cmp rax, 0
+  //     je  trm_read_no_cap
+  //     mov r10, rsi                 ; SYSCALL arg3 = buf_len
+  //     mov rdx, rdi                 ; SYSCALL arg2 = buf_ptr
+  //     mov rdi, rax                 ; SYSCALL arg0 = cap_slot
+  //     mov rsi, 1                   ; SYSCALL arg1 = TRM_TTY_OP_READ
+  //     mov rax, 4                   ; SYSNO = TRM_SYS_CAP_INVOKE
+  //     syscall
+  //     ret
+  //
+  //     Move order matters. After entry rdi=buf_ptr, rsi=buf_len,
+  //     rax=cap_slot. (1) `mov r10, rsi` snapshots buf_len before
+  //     step 4 overwrites rsi. (2) `mov rdx, rdi` snapshots buf_ptr
+  //     before step 3 overwrites rdi. (3) `mov rdi, rax` overwrites
+  //     rdi with cap_slot (rdi's original value already saved in
+  //     rdx). (4) `mov rsi, 1` overwrites rsi with the op ordinal
+  //     (rsi's original value already saved in r10). (5) `mov rax,
+  //     4` sets SYSNO. Verified: every source register is saved
+  //     before its destination is stomped.
+  //
+  //   No-cap defensive refusal:
+  //     mov rax, 0xFFFFEBE7          ; TRM_ERR_NO_TTY_CAP
+  //     ret
+  //
+  //   Fallback path (sys_read(0, buf, len)) -- verbatim shape
+  //   Frame::frame_next_event ships (M1-005):
+  //     mov rdx, rsi                 ; SYSCALL arg2 = count
+  //     mov rsi, rdi                 ; SYSCALL arg1 = buf
+  //     xor rdi, rdi                 ; SYSCALL arg0 = fd = 0
+  //     xor rax, rax                 ; SYSNO = TRM_SYSNO_READ = 0
+  //     syscall
+  //     ret
+  //
+  // Leaf: no push/pop, no callee-save touched, no nested call.
+  // SYSCALL clobbers rcx and r11 (both SysV caller-save, harmless);
+  // r10 clobber is our own scratch, also harmless.
+  //
+  // Labels prefixed `trm_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let terminal_read_input : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (buf_ptr: u64) (buf_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "postui.M4-007 (#33): terminal_read_input is the primary-path input dispatcher, source-flippable between KIND_TTY TTY_OP_READ (primary, post-paideia-os #1986) and sys_read(0) (fallback, today). Gate: `mov rax, 0` (the source-editable TERMINAL_KIND_TTY_LIVE literal; flip to 1 at the M4-007 primary-path enable) then `cmp rax, 0; je trm_read_fallback`. imm32-safe (0). Primary branch: lea rax, [rip + _terminal_tty_cap]; mov rax, [rax + 0] (load consumer-stashed KIND_TTY cap slot); cmp rax, 0; je trm_read_no_cap (defensive refusal on unset cap slot). Then the SysV->SYSCALL shuffle for sys_cap_invoke(slot, op, buf, len) -- SysV entry rdi=buf_ptr, rsi=buf_len, rax=cap_slot; SYSCALL wants rdi=slot, rsi=op_arg=TRM_TTY_OP_READ=1, rdx=buf, r10=len. Five-move shuffle, ORDER-CRITICAL, verified: (1) mov r10, rsi snapshots buf_len before step (4) overwrites rsi; (2) mov rdx, rdi snapshots buf_ptr before step (3) overwrites rdi; (3) mov rdi, rax puts cap_slot in SYSCALL arg0 (rdi's original buf_ptr already in rdx); (4) mov rsi, 1 puts TRM_TTY_OP_READ in SYSCALL arg1 (rsi's original buf_len already in r10); (5) mov rax, 4 puts TRM_SYS_CAP_INVOKE in SYSNO. Then syscall; ret. rcx/r11 clobbered by SYSCALL are SysV caller-save (harmless); r10 clobber is our own scratch (harmless). No-cap fault path (trm_read_no_cap): mov rax, 0xFFFFEBE7 (TRM_ERR_NO_TTY_CAP; > 0x7FFFFFFF forces paideia-as 10-byte movabs form -- legal for mov, NOT for cmp/and; same pattern frame.pdx uses for 0xFFFFEB9x sentinels); ret. Fallback branch (trm_read_fallback): verbatim shape frame_next_event ships (M1-005) -- mov rdx, rsi (count->arg2); mov rsi, rdi (buf->arg1); xor rdi, rdi (fd=0->arg0); xor rax, rax (SYSNO=TRM_SYSNO_READ=0); syscall; ret. Leaf: no push/pop, no callee-save touched, no nested call. Every immediate in cmp/and fits imm32 (0, 1). No `test`. No `imul`. No r11 use (r11 CPU-side clobber by SYSCALL is caller-save). Effect !{mem, sysreg} @{cap}: primary branch transitively invokes the KIND_TTY cap via sys_cap_invoke; fallback branch invokes sys_read (fits in {mem, sysreg} without cap effect). The union is the declared row -- once TERMINAL_KIND_TTY_LIVE flips to 1 the fallback branch becomes dead code but stays compiled per docs/design.md §2.5 removal-deferred clause. Labels prefixed trm_ per fingerprint discipline.",
+      block: {
+        // ---- Gate on TERMINAL_KIND_TTY_LIVE (source-editable) -----------
+        // Change the `0` on the next line to `1` at the M4-007 flip.
+        mov rax, 0;
+        cmp rax, 0;
+        je trm_read_fallback;
+
+        // ---- Primary path (KIND_TTY TTY_OP_READ) ------------------------
+        lea rax, [rip + _terminal_tty_cap];
+        mov rax, [rax + 0];
+        cmp rax, 0;
+        je trm_read_no_cap;
+
+        mov r10, rsi;                        // SYSCALL arg3 = buf_len
+        mov rdx, rdi;                        // SYSCALL arg2 = buf_ptr
+        mov rdi, rax;                        // SYSCALL arg0 = cap_slot
+        mov rsi, 1;                          // SYSCALL arg1 = TRM_TTY_OP_READ
+        mov rax, 4;                          // SYSNO = TRM_SYS_CAP_INVOKE
+        syscall;
+        ret;
+
+      trm_read_no_cap:
+        mov rax, 0xFFFFEBE7;                 // TRM_ERR_NO_TTY_CAP
+        ret;
+
+      trm_read_fallback:
+        mov rdx, rsi;                        // SYSCALL arg2 = count
+        mov rsi, rdi;                        // SYSCALL arg1 = buf
+        xor rdi, rdi;                        // SYSCALL arg0 = fd = 0
+        xor rax, rax;                        // SYSNO = TRM_SYSNO_READ = 0
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // terminal_kind_tty_live() -> u64
+  //
+  // Return TERMINAL_KIND_TTY_LIVE as a callable so a downstream test
+  // (postui.M4-008 boot smoke) can assert the compile-time gate value
+  // without needing to link against the constant. Leaf.
+  // ==========================================================================
+  pub let terminal_kind_tty_live : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M4-007 (#33): terminal_kind_tty_live returns the TERMINAL_KIND_TTY_LIVE literal (0 at M4-007 landing, 1 post-flip). Leaf: no push/pop, no callee-save touched, no memory access. Body: mov rax, 0; ret. imm32-safe. Effect {}: pure. Keeps the compile-time gate value observable from downstream tests without needing constant-linkage.",
+      block: {
+        mov rax, 0;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // terminal_tty_cap() -> u64
+  //
+  // Return the current _terminal_tty_cap[0] value (consumer-stashed
+  // KIND_TTY cap slot; 0 = unset). Lets a downstream test verify
+  // terminal_set_tty_cap's stash without needing the layout.
+  // Leaf. Effect !{mem}.
+  // ==========================================================================
+  pub let terminal_tty_cap : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M4-007 (#33): terminal_tty_cap returns [_terminal_tty_cap + 0]. Leaf: no push/pop, no callee-save touched, no nested call. Body: lea rax, [rip + _terminal_tty_cap]; mov rax, [rax + 0]; ret. Effect !{mem} (single qword load).",
+      block: {
+        lea rax, [rip + _terminal_tty_cap];
+        mov rax, [rax + 0];
+        ret;
+      }
+    }
+
+}

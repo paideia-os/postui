@@ -84,23 +84,37 @@
 // Design says: probe KIND_TTY raw-mode via TTY_OP_SET_RAW; on refusal
 // fall back to sys_read(0). At paideia-os HEAD, TTY_OP_SET_RAW is not yet
 // landed (paideia-os #1986 / R66v2.POS-001 tracks it); postui.M4-007
-// switches to the primary path once #1986 stabilizes.
+// (this issue) introduces src/terminal.pdx as the AUTHORITATIVE input
+// dispatcher and wires frame_next_event through to it via a
+// cross-module call.
+// The primary-vs-fallback branching is source-flippable at one place
+// (Terminal::TERMINAL_KIND_TTY_LIVE + a literal inside
+// terminal_read_input's body -- see terminal.pdx "THE FLIP" header).
+// M1-005's inline sys_read shape below frame_next_event has been
+// replaced by the wire-through; the fallback behavior is preserved
+// today (Terminal::TERMINAL_KIND_TTY_LIVE = 0) and stays compiled
+// post-flip (docs/design.md §2.5 removal-deferred clause).
 //
-// At M1-005 the implementation is:
+// At M4-007 the implementation is:
 //   1. tcc_query_tty_id(canvas_cap) confirms a live TTY is BOUND to the
 //      canvas (the cap_handler_tui_canvas mint gate already validated
 //      this via tty_tail_valid, so this call is a probe-to-confirm plus
 //      a cache-into-state -- it should always succeed for a legitimately
 //      minted canvas).
 //   2. input_path is ALWAYS set to FRAME_INPUT_SYS_READ_FALLBACK at
-//      M1-005. The KIND_TTY primary path is a M4-007 tracked follow-up.
-//   3. frame_next_event issues a raw sys_read(0, buf, len) syscall.
+//      terminal_init time. The KIND_TTY-vs-fallback SELECTION now
+//      lives in Terminal::terminal_read_input, gated on
+//      Terminal::TERMINAL_KIND_TTY_LIVE; frame_input_path() still
+//      returns the compile-time-observed value for a caller that wants
+//      to know which branch was taken.
+//   3. frame_next_event forwards to terminal_read_input via a
+//      cross-module call (no argument shuffle -- rdi/rsi already
+//      match; rsp is realigned via a sub/add pair around the call).
 //
 // This is honestly-scoped: the input-path discriminator is written as if
-// the probe took the branching decision (M4-007's landing only has to
-// swap the constant), and frame_next_event's body can grow a state
-// dispatch on [_terminal_state + FRAME_OFF_INPUT_PATH] without changing
-// its signature.
+// the probe took the branching decision, and the actual gate at
+// Terminal::terminal_read_input's `mov rax, 0` prologue is
+// source-flippable in ONE PLACE without touching Frame's own body.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
@@ -143,8 +157,14 @@
 //     etc.) push nothing.
 //   - Effect row `!{mem, sysreg} @{cap}` on every function that reaches
 //     TuiCanvasClient (transitively invokes cap_invoke); `!{mem}` on
-//     pure-load accessors; `!{mem, sysreg}` (no cap) on
-//     frame_next_event (sys_read is fd-based, not cap-based).
+//     pure-load accessors. Post-postui.M4-007 (#33), frame_next_event
+//     forwards to Terminal::terminal_read_input via a cross-module
+//     call, which unions the
+//     KIND_TTY cap path with the sys_read fallback path, so
+//     frame_next_event's effect row widened from the M1-005
+//     `!{mem, sysreg} @{}` to `!{mem, sysreg} @{cap}` -- paideia-as
+//     effect-row inference requires the wire-through's declared row
+//     to superset the callee's.
 
 module Frame = structure {
 
@@ -590,44 +610,57 @@ module Frame = structure {
   // ==========================================================================
   // frame_next_event(buf_ptr, buf_len) -> u64
   //
-  // The sys_read(0) fallback input path (§2.5). At M1-005 this is a
-  // raw sys_read against fd 0 (stdin); the KIND_TTY primary path
-  // lands at M4-007 gated on paideia-os #1986 (TTY_OP_READ +
-  // raw-mode). The Event enum + CSI/SS3/OSC ESC-sequence parser
-  // lands at M4-005; consumers at M1-005 read raw bytes and defer
-  // parsing.
+  // Input entry point (§2.5). Post-postui.M4-007 (#33) this is a
+  // CROSS-MODULE CALL wire-through to Terminal::terminal_read_input,
+  // which
+  // owns the primary-path (KIND_TTY TTY_OP_READ) / fallback-path
+  // (sys_read(0)) dispatch gated on Terminal::TERMINAL_KIND_TTY_LIVE.
   //
-  // Returns the raw sys_read result: bytes read (0 = EOF; per Linux
-  // read semantics), or -errno (a negative i64, appears as a value
-  // in the 0xFFFF...F800..F80 band when interpreted unsigned).
+  // Signature and semantics unchanged from the M1-005 body: rdi=
+  // buf_ptr, rsi=buf_len. Returns whatever terminal_read_input
+  // returns: raw sys_read result on the fallback branch (bytes read;
+  // 0 = EOF; or -errno as unsigned), raw kernel bytes-read count on
+  // the primary branch when live, or a defensive Terminal error
+  // sentinel (TRM_ERR_NO_TTY_CAP = 0xFFFFEBE7) if the primary path is
+  // reached without a stashed KIND_TTY cap slot. The M4-005 Event-enum
+  // + ESC-sequence parser sits ABOVE this call in the pipeline;
+  // frame_next_event stays a raw-bytes entry point for downstream
+  // parser flexibility.
   //
   // NOT gated on state == INITIALIZED: an app may want to drain
   // input before or after Frame is initialized (e.g. a probe on
   // startup, or a final drain after teardown). Callers that need
   // the state gate can check frame_state() themselves.
   //
-  // Register plan: rdi=buf_ptr, rsi=buf_len. SYSCALL wants
-  // rdi=fd=0, rsi=buf, rdx=count. Two-move shuffle then zero rdi:
-  //   mov rdx, rsi   ; count -> SYSCALL arg2
-  //   mov rsi, rdi   ; buf   -> SYSCALL arg1
-  //   xor rdi, rdi   ; fd    -> SYSCALL arg0 (stdin = 0)
-  //   xor rax, rax   ; SYSNO_READ = 0
-  //   syscall; ret
+  // Rationale for the call-through wire (rather than duplicating the
+  // dispatch body here): keeps Terminal::terminal_read_input as the
+  // AUTHORITATIVE input-path gate in exactly one place, so the
+  // M4-007 flip (docs/design.md §2.5 removal clause) touches ONE
+  // file. rdi/rsi already match terminal_read_input's SysV
+  // convention, so no argument shuffle is needed at the wire point.
   //
-  // Leaf: no push/pop, no callee-save touched, no local frame.
-  // syscall clobbers rcx/r11 (both SysV caller-save, harmless).
+  // Register plan. SysV entry: rdi=buf_ptr, rsi=buf_len, rsp%16==8.
+  // A cross-module `call terminal_read_input` requires rsp%16==0 at
+  // the callsite -- realign with `sub rsp, 8`, then `add rsp, 8`
+  // after the call restores. terminal_read_input's return in rax
+  // becomes frame_next_event's return verbatim.
+  //
+  // Cross-module `call` (rather than a `jmp` tail) is used because
+  // every documented cross-module transition in postui uses `call`
+  // (see terminal_init's `call tcc_query_tty_id`, etc.); no bare
+  // `jmp` to a non-local label appears anywhere in the wave. Sticking
+  // to the confirmed pattern avoids exercising an unverified encoder
+  // path.
   // ==========================================================================
-  pub let frame_next_event : (u64, u64) -> u64 !{mem, sysreg} @{} =
+  pub let frame_next_event : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
     fn (buf_ptr: u64) (buf_len: u64) -> unsafe {
       effects: {mem, sysreg},
-      capabilities: {},
-      justification: "postui.M1-005 (#5): frame_next_event is the sys_read(0) fallback input path (§2.5). SysV rdi=buf_ptr, rsi=buf_len. SYSCALL wants rdi=fd=0, rsi=buf, rdx=count. Three-instruction shuffle: (1) mov rdx, rsi (count to SYSCALL arg2); (2) mov rsi, rdi (buf to SYSCALL arg1); (3) xor rdi, rdi (fd=0). Then xor rax, rax (sys_read = row 0 of design/user/syscall-table.md, paideia-os); syscall; ret. Register plan verified: after step 1 rdi still holds buf (overwritten in step 2), rsi still holds count (already saved to rdx). rcx/r11 clobbered by SYSCALL are SysV caller-save (harmless). Leaf: no push/pop, no callee-save touched. Effect !{mem, sysreg} -- kernel writes into buf_ptr and executes a syscall. No cap needed (sys_read is a plain-fd op, not a cap-invoke). This wrapper is EXPLICITLY temporary per §2.5; M4-007 tracks removal once paideia-os #1986 lands the primary KIND_TTY raw-mode path.",
+      capabilities: {cap},
+      justification: "postui.M4-007 (#33) wire-through: frame_next_event forwards to Terminal::terminal_read_input via cross-module call. SysV rdi=buf_ptr, rsi=buf_len already match terminal_read_input's own SysV convention (rdi=buf_ptr, rsi=buf_len) so no argument shuffle is needed. Body: `sub rsp, 8` (SysV entry rsp%16==8; -8 -> rsp%16==0 aligned for the nested call, matches the tail-adjust pattern shell/src/session.pdx uses for its single-call wrappers); `call terminal_read_input` (paideia-as's flat ELF symbol namespace resolves the cross-module symbol, same pattern terminal_init uses when it calls tcc_query_tty_id / tcc_query_rows / tcc_query_cols across the TuiCanvasClient module boundary); `add rsp, 8` (restore); `ret` (rax already holds terminal_read_input's return, propagated verbatim). Effect widened from M1-005's !{mem, sysreg} @{} to !{mem, sysreg} @{cap} because terminal_read_input's primary branch reaches the KIND_TTY cap via sys_cap_invoke -- the union of both branches carries the cap effect, and paideia-as's effect-row inference requires the wire-through's declared row to superset the callee's. Every immediate fits imm32 (8). No test, no imul, no r11 use. Not-a-leaf (one nested call); no callee-save touched (rsp adjust rather than push/pop keeps the register footprint at zero).",
       block: {
-        mov rdx, rsi;
-        mov rsi, rdi;
-        xor rdi, rdi;
-        xor rax, rax;
-        syscall;
+        sub rsp, 8;
+        call terminal_read_input;
+        add rsp, 8;
         ret;
       }
     }
