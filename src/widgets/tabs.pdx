@@ -1,0 +1,747 @@
+// src/widgets/tabs.pdx -- postui.M2-007 (paideia-os/postui#16)
+//
+// Tabs: horizontal tab-strip widget with a selected index, per-side
+// dividers, and per-tab styling.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog; §5.1 M2-007 issue text)
+// =============================================================================
+//
+// Tabs is the fourth text-consuming widget in the M2 batch after
+// Paragraph (M2-004), List (M2-005), Table (M2-006). It renders a
+// single-row horizontal strip of labeled tabs separated by a divider
+// glyph, with the currently-selected tab painted in a distinguished
+// style. Consumers are typically top-level TUI apps (postui-top, a
+// documentation reader, a config editor) that use it as a navigation
+// affordance across a mode-set.
+//
+// This landing adds the widget's own module (`Tabs`) under
+// src/widgets/. tools/build.sh already walks both src/*.pdx and
+// src/widgets/*.pdx (per the existing glob), so the manifest sources:
+// list is the only registry that needs the new entry.
+//
+// The widget_draw dispatch entry (widget_kind.pdx) wires WK_TABS to
+// tabs_draw at postui.M2-008 alongside every other M2 body -- this
+// module ships the callable but does not yet register itself in the
+// compare-chain. Callers that want to drive the widget directly at
+// M2-007 (e.g. tests/tabs_smoke.pdx) call tabs_draw explicitly.
+//
+// =============================================================================
+// TABSSPEC WIRE (56 bytes, TABS_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect            u64 packed (x, y, w, h) per Rect module wire
+//   [+ 8..+16)   titles_ptr      u64 ptr to a Span[] array (24 B per Span,
+//                                 same layout Text::span_init emits)
+//   [+16..+24)   tab_count       u64 number of Spans in the titles array
+//   [+24..+32)   selected        u64 index of the highlighted tab
+//   [+32..+40)   divider         u64 packed 4-byte UTF-8 codepoint used
+//                                 between consecutive tabs (byte 0 at LSB;
+//                                 e.g. U+2502 '|' encodes as 0xE2 0x94
+//                                 0x82 0x00 -> u32 LE = 0x008294E2). A
+//                                 zero value elects the default '|'
+//                                 (U+2502) via the tabs_draw fixup.
+//   [+40..+48)   style_active    u64 packed Style (Style module wire) for
+//                                 the selected tab's cells
+//   [+48..+56)   style_inactive  u64 packed Style for every non-selected
+//                                 tab's cells AND for the divider cells
+//
+// Total = 56 bytes. Rect is intentionally 8 bytes (matching every other
+// widget spec's Rect slot, e.g. block.pdx's BlockSpec+0) rather than a
+// 16-byte re-widening: postui's packed-Rect wire is one u64 by construc-
+// tion (rect.pdx §PACKED WIRE) and expanding here would drift the shared
+// convention that every downstream ".rect_pack" copy relies on.
+//
+// A degenerate tab_count == 0 is legal (empty strip). Every accessor
+// path returns 0 / no draw for it.
+//
+// =============================================================================
+// DIVIDER ENCODING
+// =============================================================================
+//
+// The divider is stored as ONE u64 whose low 32 bits are the four UTF-8
+// bytes of the glyph laid out little-endian: byte 0 at bits [0..8), byte
+// 1 at bits [8..16), byte 2 at bits [16..24), byte 3 at bits [24..32).
+// This matches Cell's symbol slot exactly (cell.pdx §WIRE FORMAT, bits
+// [0..32) of word0), so drawing the divider is a single 4-byte store:
+// `mov_d [dst + 0], divider_word` writes the 4 bytes verbatim.
+//
+// The default divider is U+2502 (BOX DRAWINGS LIGHT VERTICAL, '|'):
+//   codepoint         : U+2502
+//   UTF-8 bytes       : 0xE2, 0x94, 0x82
+//   little-endian u32 : 0x008294E2
+//
+// A caller that wants a different divider passes the packed u32 in
+// spec.divider. Only single-cell dividers are valid at v1 (the widget
+// advances cur_x by exactly one cell after a divider write); a multi-
+// cell divider (e.g. a two-cell fullwidth glyph) would misalign the
+// subsequent tab and is a documented v1 limitation. Every widely-used
+// TUI divider (U+2502 '|', U+2503 '#', U+250A ':', U+2551 '||', space,
+// '.') is single-cell so the constraint is not a practical one.
+//
+// A zero divider (u64 == 0) elects the default via a `cmp; je; mov`
+// fixup inside tabs_draw -- callers that want an explicit space
+// divider pass 0x00000020, not 0.
+//
+// =============================================================================
+// DRAW FORMAT
+// =============================================================================
+//
+// The rendered strip has the shape:
+//
+//   ` Title1 | Title2 | Title3 `
+//
+// where each ` Ti ` is one tab body (leading space, title bytes,
+// trailing space) styled with either style_active (if i == selected) or
+// style_inactive, and each `|` between tabs is one divider cell styled
+// with style_inactive.
+//
+// Cell layout for a tabs strip with 3 tabs of widths w0, w1, w2 laid at
+// bx (rect.x):
+//
+//   x = bx      : ' ' (tab 0's leading space)
+//   x = bx+1..bx+w0 : title 0 bytes
+//   x = bx+1+w0 : ' ' (tab 0's trailing space)
+//   x = bx+2+w0 : '|' (divider)
+//   x = bx+3+w0 : ' ' (tab 1's leading space)
+//   ...
+//   x = bx+3+w0+w1 : ' ' (tab 1's trailing space)
+//   x = bx+4+w0+w1 : '|' (divider)
+//   ...
+//
+// Tab-i cell count = 2 + wi (leading + title + trailing). Divider cell
+// count = 1. Whole-strip cell count = 2 + w0 + 1 + 2 + w1 + 1 + ... +
+// 2 + w_{k-1} = 2*k + sum(wi) + (k-1) for k tabs.
+//
+// Only the top row of Rect (y == rect.y) is written. Rows y+1..y+h are
+// untouched; a caller placing Tabs above a downstream widget must clear
+// the intervening rows themselves. The widget's Rect is nominally 1
+// high but a bigger h is legal (the extra rows just don't get written).
+//
+// =============================================================================
+// TRUNCATION POLICY
+// =============================================================================
+//
+// Each tab that FULLY FITS the remaining cells of the strip is
+// rendered. The first tab that would not fully fit ends the render
+// (all subsequent tabs are dropped, including the divider that would
+// precede them). Whether a tab fits is decided by:
+//
+//   needed_i = (i > 0 ? 1 : 0)     // preceding divider
+//            + 1                    // leading space
+//            + w_i                  // title display width
+//            + 1                    // trailing space
+//
+//   fit_ok   = (cur_x + needed_i) <= xe
+//
+// where w_i = span_display_width(title_i) -- the M2-003 Width module's
+// UTF-8 grapheme-width approximation. This is the "use
+// span_display_width" clause in the issue text: display width, NOT byte
+// length, decides how many cells the tab needs. For ASCII titles
+// display_width == byte_len so the two agree; for CJK/emoji titles
+// display_width is smaller than byte_len (each 3- or 4-byte codepoint
+// counts as 2 cells rather than 3-4).
+//
+// Rationale for whole-tab drop over per-cell mid-title clipping: a
+// half-rendered "Title1" reading "Titl" at the right edge visually
+// implies a fifth tab exists (or the current one is cut). Dropping the
+// tab entirely leaves cur_x at a clean position with no dangling
+// bytes; the user sees "here are the tabs that fit, the rest are
+// off-screen" -- the Ratatui `.select()` scroll-into-view posture at
+// M2-010 will then re-center on the selected tab so it is always
+// visible. The alternative (per-cell truncation) fights that scroll
+// step for no additional information density.
+//
+// =============================================================================
+// RENDERING MODEL -- byte-per-cell FOR TITLES
+// =============================================================================
+//
+// The M1 shape (block.pdx §block_draw title arm) writes ONE title byte
+// per cell -- multi-byte UTF-8 sequences render as multiple garbled
+// cells. Tabs inherits this shape until M2-004 (Paragraph) lands a
+// proper codepoint-packing writer that all text widgets share. For
+// ASCII titles (the overwhelming majority of tab labels in practice
+// -- Ratatui's own gallery examples are ASCII) this discipline is
+// invisible; a UTF-8-labeled tab (e.g. "|E") will render as three cells
+// containing 0xC3, 0xA9 (rendered as latin-1 garbage) rather than one
+// cell containing '|E'.
+//
+// To keep the cell-count contract with the truncation policy (advance
+// cur_x by exactly needed_i cells per tab), the widget:
+//
+//   * writes min(w_i, byte_len_i) title-byte cells -- always writes
+//     w_i cells for the title span, either from title bytes or, if
+//     byte_len < w_i (impossible for well-formed UTF-8 where
+//     byte_len >= display_width, but defensive), padded with space
+//   * writes exactly w_i cells of title regardless of byte_len drift
+//
+// This keeps the trailing space and the following divider at their
+// planned x positions and matches what the fit check accounted for.
+//
+// =============================================================================
+// TABSVIEW@0.1 WIRE (semantic-pipe record)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic          u32 = 0x56424154 ("TABV" LE)
+//   [+ 4..+ 8)   record_len     u32 = 56 (fixed)
+//   [+ 8..+16)   rect_pack      u64 verbatim from TabsSpec+0
+//   [+16..+24)   tab_count      u64 verbatim from TabsSpec+16
+//   [+24..+32)   selected       u64 verbatim from TabsSpec+24
+//   [+32..+40)   divider        u64 verbatim from TabsSpec+32
+//   [+40..+48)   style_active   u64 verbatim from TabsSpec+40
+//   [+48..+56)   style_inactive u64 verbatim from TabsSpec+48
+//
+// record_len is fixed at 56 (a multiple of 8, already aligned). The
+// TITLE BYTES ARE NOT INCLUDED at v1 -- carrying variable-length
+// per-tab byte runs through the semantic-pipe wire would need a per-
+// tab length header + a pad step (see block_view_pack for the
+// pattern). The v1 record captures structural metadata (rect, index,
+// styling) sufficient for a downstream consumer to render an
+// abstraction (e.g. a semantic-pipe log entry "tabs at (x,y) w=w
+// selected=i"); a v2 revision (paideia-os/postui#TBD, tracked in
+// docs/design.md §5.5 backlog) will add the title-bytes payload with
+// a bumped record_len and a fresh schema hash.
+//
+// The magic 0x56424154 corresponds to ASCII bytes 'T' (0x54), 'A'
+// (0x41), 'B' (0x42), 'V' (0x56) laid little-endian: byte 0 = 'T',
+// byte 1 = 'A', byte 2 = 'B', byte 3 = 'V'. Reading the record's
+// first 4 bytes as UTF-8 shows the tag "TABV".
+//
+// The M2-009 registry glue (docs/design.md §2.3) computes the schema
+// hash as BLAKE3("TabsView@0.1") and wires this packer via
+// `semantic_pipe::send_record(app_pipe_fd, TABV_SCHEMA_HASH,
+// packed_bytes, tabs_view_pack(...))` alongside every other M2
+// widget's view packer.
+//
+// =============================================================================
+// ERROR BAND
+// =============================================================================
+//
+// TAB_ERR_BAND (0xFFFFEBCE) is the single v1 sentinel returned by
+// tabs_draw when a defensive invariant fails (e.g. a null titles_ptr
+// with tab_count > 0). At v1 no code path in tabs_draw ever returns
+// this -- the fit-check truncation is a normal-flow behavior, not an
+// error -- but the sentinel is exported so a future revision that
+// tightens validation has an established slot.
+//
+// The sentinel sits at the top of the M2 error band the design/
+// architecture.md §5.1 line 725 allocation reserves for the M2 widget
+// batch (0xFFFFEBC0..0xFFFFEBCF): Layout owns 0xFFFFEBC0..0xFFFFEBC4,
+// Width reserves 0xFFFFEBC5..0xFFFFEBC9, Text owns 0xFFFFEBCA..0xFFFFEBCE,
+// with 0xFFFFEBCF still uncommitted. Tabs claims 0xFFFFEBCE at the top
+// of Text's tail; Text at v1 uses only 0xFFFFEBCA (see text.pdx) so
+// the overlap is nominal only -- a future revision that expands Text's
+// occupancy will need to re-slice one band or the other, and the
+// authoritative allocation table at design/architecture.md §5.1 gets
+// bumped at that point. Tabs' single sentinel does not conflict with
+// any Text sentinel today.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Tabs`), matches file basename
+//     per manifest.pdxproj sources: entry.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - Every `cmp reg, imm` / `and reg, imm` uses imm <= 0x7FFFFFFF.
+//     Widest immediate in this module is 0xFFFF (Rect field mask);
+//     divider default 0x008294E2 fits imm32; TABV magic 0x56424154
+//     fits imm32; every shift count (8, 16, 32, 40, 48) is imm8.
+//     The one error sentinel (0xFFFFEBCE, > 0x7FFFFFFF) is `mov reg,
+//     imm64` (movabs) only -- never in a cmp/and.
+//   - No 2-op `imul reg, imm`. Every imul in this module is 2-op
+//     `imul reg, reg` -- the i * 24 stride uses `mov rcx, 24;
+//     imul rax, rcx` per the text.pdx precedent; the y * cols
+//     address math uses `imul rax, r12` (register-register).
+//   - No `and reg, imm64` (widest mask 0xFFFF, well within imm32).
+//   - Every mov_b load is preceded by `xor reg, reg` (paideia-as
+//     pitfall #1248 load-side zero-extension).
+//   - `pub let X : type = value` is single-line for every constant.
+//   - r11 discipline: no `lea` in this module; r11 is used only as a
+//     transient scratch that never crosses a `lea` boundary.
+//   - Reserved-label prefix `tab_` per docs/design.md fingerprint
+//     discipline (issue text calls out `tb_` clashes with table.pdx
+//     when M2-006 lands -- Tabs uses `tab_*` to preserve the
+//     namespace split).
+//   - SysV push/pop parity:
+//       * tabs_view_pack is a pure leaf (no push/pop, no nested
+//         call). Straight-line 8-byte moves.
+//       * tabs_draw pushes 5 callee-save regs (rbx/r12/r13/r14/r15
+//         = 40 bytes) plus sub rsp, 64 (8 stack slots); entry
+//         rsp%16 == 8, +40 == 48 (rsp%16 == 0), +64 == 112 (rsp%16
+//         == 0). Nested calls into span_display_width are 16-byte-
+//         aligned without any additional adjustment.
+//   - Effect row `!{mem}` on every function (both read/write memory).
+//   - Cross-module call convention: bare `call span_display_width`
+//     per the text.pdx / frame.pdx precedent -- paideia-as's flat
+//     symbol namespace resolves Text's exported symbols by name.
+
+module Tabs = structure {
+
+  // ==========================================================================
+  // Sizing constants (locked at M2-007 landing).
+  // ==========================================================================
+  pub let TABS_SPEC_BYTES : u64 = 56
+
+  // Field offsets. Named so a downstream reader can trace every
+  // displacement back to the wire-format block above without
+  // decoding raw numerals.
+  pub let TABS_OFF_RECT           : u64 = 0
+  pub let TABS_OFF_TITLES_PTR     : u64 = 8
+  pub let TABS_OFF_TAB_COUNT      : u64 = 16
+  pub let TABS_OFF_SELECTED       : u64 = 24
+  pub let TABS_OFF_DIVIDER        : u64 = 32
+  pub let TABS_OFF_STYLE_ACTIVE   : u64 = 40
+  pub let TABS_OFF_STYLE_INACTIVE : u64 = 48
+
+  // Default divider: U+2502 (BOX DRAWINGS LIGHT VERTICAL) encoded as
+  // three UTF-8 bytes 0xE2, 0x94, 0x82 laid out little-endian into
+  // the low 24 bits of a u32; byte 3 = 0 pad. 0x008294E2 = 8_557_282
+  // decimal, fits imm32 as a positive value.
+  pub let TABS_DIVIDER_DEFAULT : u64 = 0x008294E2
+
+  // ==========================================================================
+  // TabsView@0.1 semantic-pipe wire (docs/design.md §2.3).
+  // ==========================================================================
+  pub let TABV_MAGIC              : u64 = 0x56424154
+  pub let TABV_RECORD_LEN         : u64 = 56
+  pub let TABV_OFF_MAGIC          : u64 = 0
+  pub let TABV_OFF_RECORD_LEN     : u64 = 4
+  pub let TABV_OFF_RECT           : u64 = 8
+  pub let TABV_OFF_TAB_COUNT      : u64 = 16
+  pub let TABV_OFF_SELECTED       : u64 = 24
+  pub let TABV_OFF_DIVIDER        : u64 = 32
+  pub let TABV_OFF_STYLE_ACTIVE   : u64 = 40
+  pub let TABV_OFF_STYLE_INACTIVE : u64 = 48
+
+  // Schema name string (14 bytes including trailing NUL) -- the
+  // authoritative source the M2-009 registry glue's BLAKE3 hash is
+  // computed against. Keeping the string here (rather than at the
+  // registry) ensures the packer and the hash computation never
+  // drift byte-for-byte.
+  pub let TABV_SCHEMA_NAME     : [u8; 13] = "TabsView@0.1\0"
+  pub let TABV_SCHEMA_NAME_LEN : u64 = 12
+
+  // ==========================================================================
+  // Error sentinel (postui error band, 0xFFFFEB80+).
+  // Anchored per design/architecture.md §5.1 M2 slice at 0xFFFFEBCE.
+  // > 0x7FFFFFFF -- movabs required for `mov reg, imm`; never in
+  // cmp/and.
+  // ==========================================================================
+  pub let TAB_ERR_BAND : u64 = 0xFFFFEBCE
+
+  // ==========================================================================
+  // tabs_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature (spec_ptr, buf_ptr, rows, cols)
+  // -- widget_kind.pdx's WK_TABS dispatch (at M2-008) shifts its own
+  // args down one slot before calling this. `rows` is not read by
+  // the body (the widget's Rect.y already carries the row index);
+  // kept for signature uniformity with every other widget_draw
+  // variant so the dispatch's arg-shuffle is the same shape for
+  // every arm.
+  //
+  // Draw sequence (see DRAW FORMAT and TRUNCATION POLICY in header):
+  //   1. Extract (bx, by, bw) from the packed rect; xe = bx + bw.
+  //   2. Precompute style_inactive's word0-or / word1 templates
+  //      (used for every divider write) onto stack.
+  //   3. Loop over tabs i = 0..tab_count:
+  //        a. Load span_slot = titles_ptr + i * 24; save on stack.
+  //        b. Call w = span_display_width(span_slot); save on stack.
+  //        c. Compute needed = (i > 0 ? 1 : 0) + 1 + w + 1.
+  //        d. If cur_x + needed > xe: break (whole-tab drop).
+  //        e. Compute per-tab style templates (active if i ==
+  //           selected, else inactive) into cur_or / cur_w1 stack
+  //           slots.
+  //        f. If i > 0: draw divider cell at (cur_x, by) using the
+  //           inactive templates; cur_x += 1.
+  //        g. Draw leading space cell using per-tab templates;
+  //           cur_x += 1.
+  //        h. Draw min(w, byte_len) title-byte cells using per-tab
+  //           templates; if byte_len < w, pad the rest with space;
+  //           cur_x += w total.
+  //        i. Draw trailing space cell using per-tab templates;
+  //           cur_x += 1.
+  //   4. Return 0 (OK).
+  //
+  // Per-cell write shape (2 stores):
+  //   word0 = sym | style_or         -- 8-byte store at [dst + 0]
+  //   word1 = style_w1               -- 8-byte store at [dst + 8]
+  // where:
+  //   style_or = (style & 0x00FFFFFFFFFFFFFF) << 32
+  //              -- upper 32 bits carry fg[0..24) + bg.r
+  //   style_w1 = (style & 0x00FFFFFFFFFFFFFF) >> 32
+  //              -- low 24 bits carry bg.g + bg.b + mods; upper 40 zero
+  // The `& 0x00FFFFFFFFFFFFFF` (clear the pad byte) is done via
+  // shl 8; shr 8 once per tab when computing the templates, so
+  // per-cell writes are just two register-hosted words -- no per-
+  // cell masking.
+  //
+  // Register plan (5 callee-save pushes + sub rsp, 64):
+  //   rbx = buf_ptr        r12 = cols           r13 = spec_ptr
+  //   r14 = by (row)       r15 = xe (right edge exclusive)
+  //
+  //   Scratch (rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11) freely reused
+  //   between phase boundaries; per-cell dst compute uses rax.
+  //
+  // Stack scratch (64 bytes, 8 slots):
+  //   [rsp+ 0..8)   cur_x
+  //   [rsp+ 8..16)  i
+  //   [rsp+16..24)  cur_or       (current tab's style word0-or template)
+  //   [rsp+24..32)  cur_w1       (current tab's style word1 template)
+  //   [rsp+32..40)  inact_or     (style_inactive's style word0-or template)
+  //   [rsp+40..48)  inact_w1     (style_inactive's style word1 template)
+  //   [rsp+48..56)  w            (current tab's display width)
+  //   [rsp+56..64)  span_slot    (current tab's Span address)
+  //
+  // Alignment: entry rsp%16 == 8; +40 (5 pushes) == 48 (%16 == 0);
+  // +64 == 112 (%16 == 0). Nested span_display_width calls are
+  // 16-byte-aligned without any additional `sub rsp, 8`.
+  //
+  // Labels prefixed tab_ per docs fingerprint discipline (issue text
+  // notes tb_ clashes with the table widget landing at M2-006).
+  // ==========================================================================
+  pub let tabs_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-007 (postui#16): tabs_draw is the WK_TABS widget entry. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes) + sub rsp, 64 (8 stack slots); entry rsp%16 == 8, +40 = 48 (%16 == 0), +64 = 112 (%16 == 0), aligned for the nested span_display_width call without any additional `sub rsp, 8`. Constants cached: rbx = buf_ptr, r12 = cols, r13 = spec_ptr, r14 = by (rect.y), r15 = xe (rect.x + rect.w, exclusive). Phase 0 (init): extract packed Rect from [r13+0] into rax; bx into scratch and stored as cur_x on stack; by into r14; bw into scratch; xe = bx + bw into r15. Load tab_count from [r13+16]; if 0, jmp tab_done. Precompute style_inactive templates: load style from [r13+48]; mask pad byte via shl 8; shr 8; save (style << 32) at [rsp+32] (inact_or) and (style >> 32) at [rsp+40] (inact_w1). Zero i at [rsp+8]. Phase 1 (per-tab loop): tab_loop_top loads i from [rsp+8]; compares against [r13+16] (tab_count); jae tab_done. Compute span_slot = [r13+8] + i*24: mov rcx, [r13+8] (titles_ptr); mov rdx, 24; imul rax, rdx (2-op reg,reg per paideia-as pitfall); add rcx, rax; store rcx at [rsp+56]. Call span_display_width(span_slot): mov rdi, rcx; call span_display_width; store rax (w) at [rsp+48]. Reload i and compute needed = (i>0?1:0) + 1 + w + 1: mov rdx, rax (w); add rdx, 2; reload i from [rsp+8]; cmp; je skip; add rdx, 1. Reload cur_x from [rsp+0]; add rdx to it; cmp against r15 (xe); ja tab_done (whole-tab drop). Compute per-tab style templates: reload i, cmp against [r13+24] (selected); jne use_inactive; else use style_active from [r13+40]. Mask pad byte via shl 8; shr 8. Save (style << 32) at [rsp+16] (cur_or) and (style >> 32) at [rsp+24] (cur_w1). Reload cur_x into r8 for per-cell dst compute. Phase 2 (draw): if i > 0, draw divider cell at (cur_x, by) with inactive templates: compute dst = buf_ptr + (by*cols + cur_x)*16 via mov r14 into rax + imul rax, r12 (reg,reg) + add rax, r8 (cur_x) + shl rax, 4 + add rax, rbx; load divider from [r13+32] into rdx; if 0, mov rdx, 0x008294E2 (default U+2502 in UTF-8 LE, fits imm32); or rdx, [rsp+32] (inact_or); mov [rax+0], rdx (word0); mov rdx, [rsp+40] (inact_w1); mov [rax+8], rdx (word1); add r8, 1. Draw leading space cell at (cur_x, by) with per-tab templates: dst compute; mov rdx, 32; or rdx, [rsp+16] (cur_or); mov [rax+0], rdx; mov rdx, [rsp+24] (cur_w1); mov [rax+8], rdx; add r8, 1. Draw title bytes: recompute span_slot via mov rdx, [rsp+56]; load span_ptr = [rdx+0] into r9, byte_len = [rdx+8] into r10; load w = [rsp+48] into r11; compute cell_count = min(w, byte_len) via cmp r11, r10; jbe (r11 = w already smaller) tab_title_bound_ok; mov r11, r10 (use byte_len). Loop j from 0 to r11-1: dst compute; xor rdx, rdx; mov_b rdx, [r9+j+0]; or rdx, [rsp+16] (cur_or); mov [rax+0], rdx; mov rdx, [rsp+24] (cur_w1); mov [rax+8], rdx; add r8, 1; add j, 1. Pad remaining (w - byte_len) cells with space if byte_len < w: reload w and byte_len; loop pad from byte_len to w-1: dst compute; mov rdx, 32; or rdx, [rsp+16]; mov [rax+0], rdx; mov rdx, [rsp+24]; mov [rax+8], rdx; add r8, 1. Draw trailing space cell using per-tab templates (same shape as leading space). Save cur_x = r8 to [rsp+0]. Increment i at [rsp+8]. jmp tab_loop_top. tab_done: xor rax, rax (return 0=OK); add rsp, 64; 5-pop; ret. Every immediate (0xFFFF, 0, 1, 2, 24, 32, 40, 48, 56, 0x008294E2 default divider) fits imm32; every shift count (4, 8, 16, 32) is imm8. No `test`, no 2-op `imul reg, imm` (only reg-reg imul), no `and reg, imm64`. Every mov_b load is preceded by `xor reg, reg` (paideia-as pitfall #1248 zero-extension). No `lea` anywhere in this body -- r11 LEA-scratch discipline is a no-op. Effect `!{mem}` (cell stores + spec field loads + title-byte loads + transitive span_display_width memory reads). Labels prefixed tab_ per docs fingerprint discipline (tab_done / tab_loop_top / tab_no_div_add / tab_use_inactive / tab_style_prepared / tab_no_div / tab_div_have / tab_title_bound_ok / tab_title_loop / tab_title_done / tab_pad_loop / tab_pad_done).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 64;
+
+        // ---- Prologue: cache args in callee-save --------------------------
+        mov rbx, rsi;                     // rbx = buf_ptr
+        mov r12, rcx;                     // r12 = cols
+        mov r13, rdi;                     // r13 = spec_ptr
+
+        // ---- Extract rect fields --------------------------------------------
+        mov rax, [r13 + 0];               // packed rect
+
+        // bx -> cur_x (stack)
+        mov rcx, rax;
+        and rcx, 0xFFFF;
+        mov [rsp + 0], rcx;               // cur_x = bx
+
+        // by -> r14
+        mov r14, rax;
+        shr r14, 16;
+        and r14, 0xFFFF;
+
+        // bw -> rdx (scratch); xe = bx + bw -> r15
+        mov rdx, rax;
+        shr rdx, 32;
+        and rdx, 0xFFFF;
+        mov r15, rcx;
+        add r15, rdx;                     // r15 = xe
+
+        // ---- Precompute style_inactive templates (for divider cells) ------
+        mov rax, [r13 + 48];              // style_inactive
+        shl rax, 8;
+        shr rax, 8;                       // clear pad byte
+        mov r9, rax;
+        shl r9, 32;
+        mov [rsp + 32], r9;               // inact_or = style << 32
+        mov r9, rax;
+        shr r9, 32;
+        mov [rsp + 40], r9;               // inact_w1 = style >> 32
+
+        // ---- Zero i ---------------------------------------------------------
+        xor rax, rax;
+        mov [rsp + 8], rax;
+
+        // ---- Guard: tab_count == 0 -> nothing to draw -----------------------
+        mov rax, [r13 + 16];
+        cmp rax, 0;
+        je tab_done;
+
+      // =====================================================================
+      // Phase 1: per-tab loop
+      // =====================================================================
+      tab_loop_top:
+        // Check i < tab_count
+        mov rax, [rsp + 8];
+        mov rdx, [r13 + 16];
+        cmp rax, rdx;
+        jae tab_done;
+
+        // Compute span_slot = titles_ptr + i * 24
+        mov rcx, [r13 + 8];               // titles_ptr
+        mov rdx, 24;
+        imul rax, rdx;                    // rax = i * 24  (2-op reg,reg)
+        add rcx, rax;                     // rcx = span_slot
+        mov [rsp + 56], rcx;              // save span_slot
+
+        // Call span_display_width(span_slot) -> w in rax
+        mov rdi, rcx;
+        call span_display_width;
+        mov [rsp + 48], rax;              // save w
+
+        // Compute needed = (i > 0 ? 1 : 0) + 1 + w + 1
+        mov rdx, rax;                     // rdx = w
+        add rdx, 2;                       // + leading + trailing space
+        mov rax, [rsp + 8];               // reload i
+        cmp rax, 0;
+        je tab_no_div_add;
+        add rdx, 1;                       // + preceding divider
+      tab_no_div_add:
+        // rdx = needed
+
+        // Fit check: cur_x + needed <= xe?
+        mov rcx, [rsp + 0];               // cur_x
+        add rdx, rcx;                     // rdx = cur_x + needed
+        cmp rdx, r15;
+        ja tab_done;                      // whole-tab drop
+
+        // Compute per-tab style (i == selected ? active : inactive)
+        mov rax, [rsp + 8];               // i
+        mov rdx, [r13 + 24];              // selected
+        cmp rax, rdx;
+        jne tab_use_inactive;
+        mov rax, [r13 + 40];              // style_active
+        jmp tab_style_prepared;
+      tab_use_inactive:
+        mov rax, [r13 + 48];              // style_inactive
+      tab_style_prepared:
+        // Normalize style: clear pad byte (bits 56..64)
+        shl rax, 8;
+        shr rax, 8;
+        // cur_or = style << 32
+        mov r9, rax;
+        shl r9, 32;
+        mov [rsp + 16], r9;
+        // cur_w1 = style >> 32
+        mov r9, rax;
+        shr r9, 32;
+        mov [rsp + 24], r9;
+
+        // Reload cur_x into r8 for per-cell dst arithmetic
+        mov r8, [rsp + 0];
+
+        // ---- Divider cell (only if i > 0) ---------------------------------
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        je tab_no_div;
+
+        // dst = buf_ptr + (by * cols + cur_x) * 16
+        mov rax, r14;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Load divider from spec; default 0x008294E2 (U+2502) if 0
+        mov rdx, [r13 + 32];
+        cmp rdx, 0;
+        jne tab_div_have;
+        mov rdx, 0x008294E2;
+      tab_div_have:
+        // word0 = divider_sym | inact_or
+        mov r11, [rsp + 32];              // inact_or
+        or  rdx, r11;
+        mov [rax + 0], rdx;
+        // word1 = inact_w1
+        mov r11, [rsp + 40];
+        mov [rax + 8], r11;
+
+        add r8, 1;                        // cur_x += 1
+
+      tab_no_div:
+        // ---- Leading space cell -------------------------------------------
+        mov rax, r14;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        mov rdx, 32;                      // ' '
+        mov r11, [rsp + 16];              // cur_or
+        or  rdx, r11;
+        mov [rax + 0], rdx;
+        mov r11, [rsp + 24];              // cur_w1
+        mov [rax + 8], r11;
+        add r8, 1;
+
+        // ---- Title bytes --------------------------------------------------
+        // Load span_ptr, span_byte_len, w
+        mov rdx, [rsp + 56];              // span_slot
+        mov r9,  [rdx + 0];               // span_ptr
+        mov r10, [rdx + 8];               // span_byte_len
+        mov r11, [rsp + 48];              // w
+
+        // cell_count = min(w, byte_len)  -> r11
+        cmp r11, r10;
+        jbe tab_title_bound_ok;
+        mov r11, r10;
+      tab_title_bound_ok:
+        // r11 = number of title-byte cells to write
+
+        xor rdx, rdx;                     // j = 0
+      tab_title_loop:
+        cmp rdx, r11;
+        jae tab_title_done;
+
+        // dst = buf_ptr + (by * cols + cur_x) * 16
+        mov rax, r14;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        // Load one title byte into rcx (zero-extended)
+        xor rcx, rcx;
+        mov_b rcx, [r9 + rdx + 0];
+
+        // word0 = byte_sym | cur_or (via r10 scratch; clobbers byte_len)
+        mov r10, [rsp + 16];              // cur_or
+        or  rcx, r10;
+        mov [rax + 0], rcx;
+        // word1 = cur_w1
+        mov r10, [rsp + 24];              // cur_w1
+        mov [rax + 8], r10;
+
+        add r8, 1;
+        add rdx, 1;
+        jmp tab_title_loop;
+      tab_title_done:
+
+        // ---- Pad remaining (w - byte_len) cells with space if byte_len < w
+        // (Defensive: for well-formed UTF-8, byte_len >= w so this loop is
+        // a no-op; a caller with byte_len < w would leave a hole in the
+        // tab's reserved width otherwise.)
+        // Reload byte_len (r10 was clobbered by cur_or/cur_w1 loads above).
+        mov rcx, [rsp + 56];              // span_slot
+        mov r10, [rcx + 8];               // byte_len
+        mov r11, [rsp + 48];              // w
+        cmp r10, r11;
+        jae tab_pad_done;
+        // pad counter r10 walks from byte_len to w-1
+      tab_pad_loop:
+        cmp r10, r11;
+        jae tab_pad_done;
+
+        mov rax, r14;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        mov rdx, 32;                      // ' '
+        mov r9, [rsp + 16];               // cur_or (r9=span_ptr no longer needed)
+        or  rdx, r9;
+        mov [rax + 0], rdx;
+        mov r9, [rsp + 24];               // cur_w1
+        mov [rax + 8], r9;
+
+        add r8, 1;
+        add r10, 1;
+        jmp tab_pad_loop;
+      tab_pad_done:
+
+        // ---- Trailing space cell ------------------------------------------
+        mov rax, r14;
+        imul rax, r12;
+        add rax, r8;
+        shl rax, 4;
+        add rax, rbx;
+
+        mov rdx, 32;
+        mov r9, [rsp + 16];               // cur_or
+        or  rdx, r9;
+        mov [rax + 0], rdx;
+        mov r9, [rsp + 24];               // cur_w1
+        mov [rax + 8], r9;
+        add r8, 1;
+
+        // Save cur_x back to stack
+        mov [rsp + 0], r8;
+
+        // i++
+        mov rax, [rsp + 8];
+        add rax, 1;
+        mov [rsp + 8], rax;
+
+        jmp tab_loop_top;
+
+      // =====================================================================
+      // Epilogue
+      // =====================================================================
+      tab_done:
+        xor rax, rax;
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tabs_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a TabsView@0.1 record into 56 bytes at [dst..dst+56).
+  // record_len is fixed at 56 (already 8-byte aligned; no pad step
+  // needed). Returns 56.
+  //
+  // The v1 record captures structural metadata only (magic, len,
+  // rect, tab_count, selected, divider, styles); the per-tab title
+  // bytes are NOT carried at v1 -- a variable-length payload would
+  // need a per-tab length header + a pad step and is deferred to a
+  // v2 revision (see module header TABSVIEW WIRE).
+  //
+  // Register plan: rdi = spec_ptr (read-only), rsi = dst (write-
+  // only), rax = scratch/return. Pure leaf: no callee-save touched,
+  // no push/pop, no nested call. Effect `!{mem}` (reads through
+  // rdi, writes through rsi).
+  //
+  // No labels needed (straight-line).
+  // ==========================================================================
+  pub let tabs_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui.M2-007 (postui#16): tabs_view_pack lays a fixed-56-byte TabsView@0.1 record at [rsi..rsi+56). Straight-line, no branches, no nested call, no push/pop. Phase 1 (magic + record_len as one 8-byte word): mov rax, 0x0000003800000038 would combine both u32 fields but forfeits readability. Instead write each field separately: mov rax, 0x56424154 (TABV magic; fits imm32 since 0x56424154 < 0x80000000 so paideia-as emits the 5-byte mov r32, imm32 form); mov_d [rsi+0], rax. mov rax, 56; mov_d [rsi+4], rax (record_len fixed = 56). Phase 2 (scalar fields, 6 x 8-byte copies): rect at [rsi+8] = [rdi+0]; tab_count at [rsi+16] = [rdi+16]; selected at [rsi+24] = [rdi+24]; divider at [rsi+32] = [rdi+32]; style_active at [rsi+40] = [rdi+40]; style_inactive at [rsi+48] = [rdi+48]. Each pair is `mov rax, [rdi+off]; mov [rsi+off], rax`. Phase 3 (return): mov rax, 56; ret. Every immediate (0, 4, 8, 16, 24, 32, 40, 48, 56, 0x56424154 magic) fits imm32. No `test`, no `imul`, no `and reg, imm`. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (7 field loads + 8 field stores). No labels (straight-line).",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x56424154;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] ---------------------------------
+        mov rax, 56;
+        mov_d [rsi + 4], rax;
+
+        // ---- rect at [rsi + 8] ---------------------------------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- tab_count at [rsi + 16] ---------------------------------------
+        mov rax, [rdi + 16];
+        mov [rsi + 16], rax;
+
+        // ---- selected at [rsi + 24] ----------------------------------------
+        mov rax, [rdi + 24];
+        mov [rsi + 24], rax;
+
+        // ---- divider at [rsi + 32] -----------------------------------------
+        mov rax, [rdi + 32];
+        mov [rsi + 32], rax;
+
+        // ---- style_active at [rsi + 40] ------------------------------------
+        mov rax, [rdi + 40];
+        mov [rsi + 40], rax;
+
+        // ---- style_inactive at [rsi + 48] ----------------------------------
+        mov rax, [rdi + 48];
+        mov [rsi + 48], rax;
+
+        // ---- return record_len = 56 ----------------------------------------
+        mov rax, 56;
+        ret;
+      }
+    }
+
+}
