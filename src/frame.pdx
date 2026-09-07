@@ -1,20 +1,44 @@
-// src/frame.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/frame.pdx -- postui.M1-005 (paideia-os/postui#5)
 //
-// Frame module: placeholder for the Frame / Terminal driver loop
-// landing at M1-005.
+// Frame module: Terminal driver + Frame render loop.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.2 rendering pipeline, §2.5 input handling, §2.7
+//        runtime loop)
+// =============================================================================
+//
+// The M1-005 landing turns the M1-001 scaffold (which only seeded the
+// state-ordinal + input-path-discriminator constants) into a real driver
+// layer over the postui.M1-004 KIND_TUI_CANVAS client wrappers.
+//
+// The module ships two logical sub-surfaces inside one paideia-as module,
+// prefixed for readability:
+//
+//   * Terminal::* -- one-shot setup + observation of the terminal-state
+//     singleton (_terminal_state). Named terminal_init /
+//     frame_state / frame_rows / frame_cols / frame_canvas_cap /
+//     frame_tty_id / frame_input_path.
+//   * Frame::* -- per-tick render entry points + the driver loop.
+//     Named frame_init / frame_render / frame_run / frame_next_event.
+//
+// Both surfaces share the same _terminal_state singleton -- this is the
+// same pattern kernel/core/fs/vnode_pool.pdx uses for its _vnode_pool /
+// _vnode_bitmap pair (docs/design.md §2.7 does not call for a separate
+// Terminal module; treating the two entry-point groups as one module keeps
+// the postui M1 ten-module cap intact per manifest.pdxproj:sources:).
 //
 // docs/design.md §2.2 defines the rendering pipeline:
 //
 //   Application state
-//         → Widget tree (a Vec<WidgetKind> built fresh each tick)
-//         → Frame::render(widget, area)  — user-side dispatch
-//         → Buffer  — back-region cell writes via mapped pointer
-//         → cap_invoke(canvas_cap, TUI_OP_PRESENT, 0)
-//         → kernel diff → ANSI → TTY_OP_WRITE → physical sink
+//         -> Widget tree (a Vec<WidgetKind> built fresh each tick)
+//         -> Frame::render(widget, area)  -- user-side dispatch
+//         -> Buffer  -- back-region cell writes via mapped pointer
+//         -> cap_invoke(canvas_cap, TUI_OP_PRESENT, 0)
+//         -> kernel diff -> ANSI -> TTY_OP_WRITE -> physical sink
 //
 // docs/design.md §2.7 defines the input dispatch (runtime loop):
 //
-//   Terminal::init()  → probe KIND_TTY raw-mode; else sys_read(0)
+//   Terminal::init()  -> probe KIND_TTY raw-mode; else sys_read(0)
 //                        fallback (§2.5)
 //   loop:
 //     event = next_event()
@@ -23,26 +47,714 @@
 //     for (widget, area) in frame: widget_draw(widget, area, buf)
 //     cap_invoke(canvas_cap, TUI_OP_PRESENT, 0)
 //
-// M1-005 lands the Frame::render + Terminal::init + Terminal::next_event
-// bodies. M1-001 seeds the runtime-state ordinal constants downstream
-// modules can key against without waiting for the M1-005 body.
+// The M1-005 landing implements every step except the ESC-sequence
+// parser + Event enum (deferred to M4-005 per docs/design.md §5.1) --
+// frame_next_event is a raw sys_read(0) wrapper; consumers at M1-005 read
+// raw bytes and defer parsing.
+//
+// =============================================================================
+// _TERMINAL_STATE LAYOUT (64 bytes, one L1D cache line)
+// =============================================================================
+//
+//   [+0]   state         (u64)   FRAME_STATE_* ordinal
+//   [+8]   input_path    (u64)   FRAME_INPUT_* discriminator
+//   [+16]  canvas_cap    (u64)   the KIND_TUI_CANVAS cap slot terminal_init
+//                                 recorded; every frame_render pulls this
+//                                 to argue TCC_OP_PRESENT
+//   [+24]  rows          (u64)   cached tcc_query_rows return
+//   [+32]  cols          (u64)   cached tcc_query_cols return
+//   [+40]  draw_cb       (u64)   frame_init-registered nullary callback:
+//                                 fn () -> u64. Zero pre-frame_init;
+//                                 frame_render null-guards.
+//   [+48]  tty_id        (u64)   cached tcc_query_tty_id return; the
+//                                 primary-path probe result
+//   [+56]  reserved      (u64)   zero; future use (SIGWINCH counter,
+//                                 present-count stat)
+//
+// 64 bytes / 8 words, @align(64) so every load/store is single-line and
+// concurrent readers on other cores never see a partial word (postui is
+// single-threaded at v1 but the cache-line discipline matches the kernel
+// singleton pattern -- see vnode_pool.pdx / _vnode_bitmap alignment
+// justification).
+//
+// =============================================================================
+// INPUT PATH POSTURE (§2.5)
+// =============================================================================
+//
+// Design says: probe KIND_TTY raw-mode via TTY_OP_SET_RAW; on refusal
+// fall back to sys_read(0). At paideia-os HEAD, TTY_OP_SET_RAW is not yet
+// landed (paideia-os #1986 / R66v2.POS-001 tracks it); postui.M4-007
+// switches to the primary path once #1986 stabilizes.
+//
+// At M1-005 the implementation is:
+//   1. tcc_query_tty_id(canvas_cap) confirms a live TTY is BOUND to the
+//      canvas (the cap_handler_tui_canvas mint gate already validated
+//      this via tty_tail_valid, so this call is a probe-to-confirm plus
+//      a cache-into-state -- it should always succeed for a legitimately
+//      minted canvas).
+//   2. input_path is ALWAYS set to FRAME_INPUT_SYS_READ_FALLBACK at
+//      M1-005. The KIND_TTY primary path is a M4-007 tracked follow-up.
+//   3. frame_next_event issues a raw sys_read(0, buf, len) syscall.
+//
+// This is honestly-scoped: the input-path discriminator is written as if
+// the probe took the branching decision (M4-007's landing only has to
+// swap the constant), and frame_next_event's body can grow a state
+// dispatch on [_terminal_state + FRAME_OFF_INPUT_PATH] without changing
+// its signature.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Frame`), matches file basename.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - Every mov_b byte-load is preceded by xor of the destination (none
+//     needed in this module -- all loads/stores are qword through
+//     _terminal_state offsets).
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF): 0, 1, 2,
+//     4096. The error sentinels (0xFFFFEB8x band) and the frame_run
+//     forever-sentinel (0xFFFFFFFFFFFFFFFF) are ONLY used in mov reg,
+//     imm form -- legal for mov (paideia-as emits movabs 10-byte form
+//     for imm > 0x7FFFFFFF), NOT for cmp/and. See block.pdx
+//     block_spec_init line 321 for the same pattern (`mov rax,
+//     0x00FFFFFF00000020`).
+//   - No 2-op `imul reg, imm` (paideia-as pitfall). No imul used at all
+//     in this module -- Frame has no multiplicative arithmetic.
+//   - `not reg` is NOT encoded by paideia-as (see madt.pdx G2, and the
+//     vnode_pool.pdx §33 note); the frame_run forever-sentinel check
+//     uses cmp against an imm64-loaded staged register (mov + cmp
+//     reg,reg) rather than a bit-invert trick.
+//   - r11 is scratch (paideia-as conformance) throughout the module. No
+//     r11 use anywhere in this module; every function keeps r11 free.
+//   - Cross-module calls (call tcc_query_tty_id, call tcc_query_rows,
+//     call tcc_query_cols, call tcc_present) rely on paideia-as's flat
+//     ELF symbol namespace -- the same pattern kernel/core/cap/
+//     cap_handler_tui_canvas.pdx uses when it `call tty_row_id`s across
+//     the KIND_TTY module boundary.
+//   - Reserved labels: none (labels are prefixed tm_ / fr_ per
+//     docs/design.md fingerprint discipline; `loop` and `if` are
+//     paideia-as reserved and are NOT used bare).
+//   - SysV stack alignment: every function that issues a nested call
+//     pushes an ODD number of 8-byte callee-save registers so
+//     `rsp % 16 == 0` at the callsite -- 5-push (terminal_init) matches
+//     block_draw's discipline; 3-push (frame_init, frame_run) is the
+//     minimal aligned span; 1-push (frame_render) is the minimal
+//     aligned span for a lower-arity body. Leaf accessors (frame_state
+//     etc.) push nothing.
+//   - Effect row `!{mem, sysreg} @{cap}` on every function that reaches
+//     TuiCanvasClient (transitively invokes cap_invoke); `!{mem}` on
+//     pure-load accessors; `!{mem, sysreg}` (no cap) on
+//     frame_next_event (sys_read is fd-based, not cap-based).
 
 module Frame = structure {
 
-  // Terminal-state ordinals. Terminal::init transitions
-  // UNINITIALIZED -> INITIALIZED; a fatal error path transitions
-  // to FAULTED and refuses every subsequent op. Ordinals are named
-  // rather than positional so a downstream trace / stat counter
-  // stays readable.
+  // ==========================================================================
+  // Terminal-state ordinals. terminal_init transitions
+  // UNINITIALIZED -> INITIALIZED on success, or -> FAULTED on any
+  // unrecoverable error, and every subsequent op checks the FAULTED
+  // state before touching the canvas. Ordinals are named rather than
+  // positional so a downstream trace / stat counter stays readable.
+  // ==========================================================================
   pub let FRAME_STATE_UNINITIALIZED : u64 = 0
   pub let FRAME_STATE_INITIALIZED   : u64 = 1
   pub let FRAME_STATE_FAULTED       : u64 = 2
 
-  // Input-path discriminator (docs/design.md §2.5). Terminal::init
-  // sets this to KIND_TTY once the raw-mode probe succeeds, or to
+  // ==========================================================================
+  // Input-path discriminator (docs/design.md §2.5). terminal_init sets
+  // this to KIND_TTY once the raw-mode probe succeeds, or to
   // SYS_READ_FALLBACK on refusal. M4-007 tracks removal of the
   // fallback once paideia-os #1986 lands and stabilizes.
+  //
+  // At M1-005 the KIND_TTY path is not yet reachable (paideia-os
+  // #1986 has not landed); terminal_init always records
+  // SYS_READ_FALLBACK. The M4-007 landing only swaps the constant
+  // stored here and adds the branching in frame_next_event.
+  // ==========================================================================
   pub let FRAME_INPUT_KIND_TTY          : u64 = 1
   pub let FRAME_INPUT_SYS_READ_FALLBACK : u64 = 2
+
+  // ==========================================================================
+  // _TERMINAL_STATE layout (64 bytes, exported for downstream tests
+  // and future observability tooling; every accessor below reads
+  // through these offsets rather than magic literals).
+  // ==========================================================================
+  pub let FRAME_STATE_BYTES : u64 = 64
+
+  pub let FRAME_OFF_STATE      : u64 = 0
+  pub let FRAME_OFF_INPUT_PATH : u64 = 8
+  pub let FRAME_OFF_CANVAS_CAP : u64 = 16
+  pub let FRAME_OFF_ROWS       : u64 = 24
+  pub let FRAME_OFF_COLS       : u64 = 32
+  pub let FRAME_OFF_DRAW_CB    : u64 = 40
+  pub let FRAME_OFF_TTY_ID     : u64 = 48
+  pub let FRAME_OFF_RESERVED   : u64 = 56
+
+  // ==========================================================================
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB80
+  // (the wave-scoped high-nibble discriminator every postui-side error
+  // shares -- disjoint from the kernel KIND_TUI_CANVAS band at
+  // 0xFFFFEB10..0xFFFFEB1F per src/lib.pdx). A consumer can shift a
+  // return by 8 and switch on the band to attribute a refusal.
+  //
+  // Every sentinel value is chosen so paideia-as can emit it in the
+  // `mov reg, imm` form -- values above 0x7FFFFFFF trigger the 10-byte
+  // movabs encoding (block.pdx §block_spec_init justification confirms
+  // paideia-as handles this via the same shape).
+  // ==========================================================================
+  pub let FRAME_ERR_NOT_INITIALIZED : u64 = 0xFFFFEB80
+  pub let FRAME_ERR_QUERY_ROWS      : u64 = 0xFFFFEB82
+  pub let FRAME_ERR_QUERY_COLS      : u64 = 0xFFFFEB83
+  pub let FRAME_ERR_QUERY_TTY_ID    : u64 = 0xFFFFEB84
+  pub let FRAME_ERR_PRESENT         : u64 = 0xFFFFEB86
+  pub let FRAME_ERR_NO_DRAW_CB      : u64 = 0xFFFFEB88
+
+  // ==========================================================================
+  // Sentinels for frame_run. FRAME_RUN_FOREVER = 0xFFFFFFFFFFFFFFFF
+  // signals "loop indefinitely" (a caller who wants a bounded loop
+  // passes a plain u64 iteration count). Chosen as u64 max so a
+  // legitimate iteration count (bounded by any real terminal's frame
+  // rate x lifetime) never collides.
+  // ==========================================================================
+  pub let FRAME_RUN_FOREVER : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // TUI dimension ceiling. Every canvas mint is bounded to
+  // TUI_DIM_MAX = 4096 per docs/design.md §2.1 (matches
+  // TTY_ROWS_MAX/TTY_COLS_MAX). terminal_init's query-result validation
+  // uses this to distinguish "legitimate rows/cols value" from a
+  // TCC_ERR_* sentinel (which is > 0xFFFFEB10, way above any
+  // plausible dimension).
+  // ==========================================================================
+  pub let FRAME_DIM_MAX : u64 = 4096
+
+  // ==========================================================================
+  // sys_read = row 0 of design/user/syscall-table.md (paideia-os).
+  // The fallback input path (§2.5) reads from FD 0 (stdin), the same
+  // fd shell's shell_read_line already binds to (design.md §2.5
+  // explicitly cites shell/src/shell.pdx as the fallback precedent).
+  // ==========================================================================
+  pub let FRAME_SYS_READ : u64 = 0
+  pub let FRAME_STDIN_FD : u64 = 0
+
+  // ==========================================================================
+  // _terminal_state singleton. 64 bytes, one L1D cache line.
+  //
+  // .bss zero-initializes at load time, so every field starts at 0 --
+  // state = FRAME_STATE_UNINITIALIZED, input_path = 0 (invalid, gated
+  // by state check), canvas_cap = 0, rows/cols = 0, draw_cb = 0
+  // (null-guarded), tty_id = 0. Every subsequent field-slot store by
+  // terminal_init / frame_init sets state to INITIALIZED strictly
+  // last, so a partial-init faultbail leaves state !=INITIALIZED and
+  // every downstream frame_render refuses.
+  // ==========================================================================
+  pub let mut _terminal_state : [u64; 8] = uninit @align(64)
+
+  // ==========================================================================
+  // terminal_init(canvas_cap) -> u64
+  //
+  // Probe the bound TTY via tcc_query_tty_id, then query canvas
+  // dimensions via tcc_query_rows / tcc_query_cols. Stamps every
+  // observed field into _terminal_state (tty_id, rows, cols,
+  // canvas_cap, input_path, state) and returns 0 on success.
+  //
+  // On any TCC refusal (query returns 0, or returns a value > 4096
+  // which is either a TCC_ERR_* sentinel or a garbage row), sets
+  // state = FAULTED and returns the corresponding FRAME_ERR_QUERY_*
+  // sentinel.
+  //
+  // Contract: NOT re-entrant. A caller that re-invokes terminal_init
+  // over an already-INITIALIZED state overwrites the singleton --
+  // this is the intended shape for a SIGWINCH-style re-probe after
+  // TUI_OP_RESIZE; a caller who wants "refuse if already init" gates
+  // on frame_state() == FRAME_STATE_UNINITIALIZED before calling.
+  //
+  // Register plan: rdi=canvas_cap. 5-push (rbx, r12, r13, r14, r15) =
+  // 40 bytes; SysV entry rsp%16==8, +40==48 -> rsp%16==0 aligned for
+  // every nested tcc_query_* call. Matches block_draw's alignment
+  // discipline.
+  //   rbx = canvas_cap        r12 = state_ptr
+  //   r13 = free (reserved for future extension)
+  //   r14 = free              r15 = free
+  //
+  // Labels prefixed `tm_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let terminal_init : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "postui.M1-005 (#5): terminal_init probes the bound TTY via tcc_query_tty_id, queries rows/cols via tcc_query_rows/tcc_query_cols, and stamps _terminal_state (state=INITIALIZED on OK; state=FAULTED + FRAME_ERR_QUERY_* return on refusal). 5-push callee-save prologue (rbx=canvas_cap, r12=state_ptr, r13/r14/r15 reserved) = 40 B -> rsp%16==0 (SysV entry rsp%16==8, +40 aligns). Every nested call sees the aligned stack. Phase 1 (tty_id probe): mov rdi, rbx; call tcc_query_tty_id; store rax at [r12+FRAME_OFF_TTY_ID=48]. A legitimately minted canvas always returns a positive tty_id (the mint gate at cap_handler_tui_canvas validates tty_slot via tty_tail_valid, and tuih_op_qttyid forwards to tty_row_id which returns non-zero for a live row). rax==0 is treated as a probe refusal -> jmp tm_init_fault_ttyid. TCC_ERR_* sentinels (band 0xFFFFEB1x, well above FRAME_DIM_MAX=4096) also fall through to the rows/cols validation below where they are trapped. Phase 2 (query rows): mov rdi, rbx; call tcc_query_rows; cmp rax, 0; je tm_init_fault_rows (probe refusal); cmp rax, 4096; ja tm_init_fault_rows (TCC_ERR_* sentinel or garbage). On OK store rax at [r12+FRAME_OFF_ROWS=24]. Phase 3 (query cols): identical shape, storing at [r12+FRAME_OFF_COLS=32]. Phase 4 (commit): store canvas_cap at [r12+FRAME_OFF_CANVAS_CAP=16]; store FRAME_INPUT_SYS_READ_FALLBACK=2 at [r12+FRAME_OFF_INPUT_PATH=8] (per §2.5 the fallback is the only landed path at M1-005; M4-007 switches to KIND_TTY once paideia-os #1986 lands); store FRAME_STATE_INITIALIZED=1 at [r12+FRAME_OFF_STATE=0] STRICTLY LAST so a mid-init failure never leaves the state slot at INITIALIZED. Return xor rax, rax (0=OK). 5-pop epilogue in reverse push order. Fault paths: store FRAME_STATE_FAULTED=2 at [r12+0]; mov rax, FRAME_ERR_*; 5-pop; ret. Every immediate in cmp/and fits imm32 (0, 4096); every error sentinel and every state ordinal is loaded via mov reg, imm (imm >= 0xFFFFEB80 forces paideia-as to emit the 10-byte movabs form -- legal for mov, NOT for cmp/and -- same pattern block_spec_init already uses). No `test`. No `imul`. Cross-module calls (tcc_query_tty_id/rows/cols) are all SysV leafs per tui_canvas_client.pdx wrappers so no additional stack pad needed. Labels prefixed tm_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = canvas_cap
+        lea r12, [rip + _terminal_state];    // r12 = state_ptr
+
+        // ---- Phase 1: probe tty_id --------------------------------------
+        mov rdi, rbx;
+        call tcc_query_tty_id;
+        mov [r12 + 48], rax;
+        cmp rax, 0;
+        je tm_init_fault_ttyid;
+
+        // ---- Phase 2: query rows ----------------------------------------
+        mov rdi, rbx;
+        call tcc_query_rows;
+        cmp rax, 0;
+        je tm_init_fault_rows;
+        cmp rax, 4096;
+        ja tm_init_fault_rows;
+        mov [r12 + 24], rax;
+
+        // ---- Phase 3: query cols ----------------------------------------
+        mov rdi, rbx;
+        call tcc_query_cols;
+        cmp rax, 0;
+        je tm_init_fault_cols;
+        cmp rax, 4096;
+        ja tm_init_fault_cols;
+        mov [r12 + 32], rax;
+
+        // ---- Phase 4: commit --------------------------------------------
+        mov [r12 + 16], rbx;                 // canvas_cap
+        mov rax, 2;
+        mov [r12 + 8], rax;                  // input_path = SYS_READ_FALLBACK
+        mov rax, 1;
+        mov [r12 + 0], rax;                  // state = INITIALIZED (LAST)
+
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tm_init_fault_ttyid:
+        mov rax, 2;
+        mov [r12 + 0], rax;                  // state = FAULTED
+        mov rax, 0xFFFFEB84;                 // FRAME_ERR_QUERY_TTY_ID
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tm_init_fault_rows:
+        mov rax, 2;
+        mov [r12 + 0], rax;                  // state = FAULTED
+        mov rax, 0xFFFFEB82;                 // FRAME_ERR_QUERY_ROWS
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tm_init_fault_cols:
+        mov rax, 2;
+        mov [r12 + 0], rax;                  // state = FAULTED
+        mov rax, 0xFFFFEB83;                 // FRAME_ERR_QUERY_COLS
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_init(canvas_cap, draw_cb) -> u64
+  //
+  // Composite: delegates the TTY probe + dimension queries to
+  // terminal_init, then registers `draw_cb` as the per-tick draw
+  // callback frame_render will invoke.
+  //
+  // The draw callback is a nullary function pointer: `fn () -> u64`.
+  // At each tick frame_render loads it from _terminal_state, indirect-
+  // calls it, and IGNORES its return -- a partial back buffer is
+  // still worth presenting (kernel-side diff decides what actually
+  // ships to the TTY). Callers that need to abort on cb failure can
+  // fault their own state and return their own error from a
+  // subsequent tick.
+  //
+  // Rationale for nullary: the callback closes over the app's own
+  // state (its buffer mapping, widget list, tick-driven redraw logic)
+  // via its own module globals -- postui does not dictate the
+  // callback's interior. This mirrors how kernel cap handlers reach
+  // their state (each holds a dedicated .bss slab; the dispatch
+  // argument is just the (rights, target_ptr, op_arg) triple).
+  //
+  // Register plan: rdi=canvas_cap, rsi=draw_cb. 3-push (rbx, r12, r13)
+  // = 24 B -> rsp%16==0 aligned (SysV entry rsp%16==8, +24 aligns).
+  //   rbx = canvas_cap (survives the terminal_init call as an SysV
+  //         callee-save)
+  //   r12 = draw_cb (same posture)
+  //   r13 = state_ptr (loaded lazily on the OK-path)
+  //
+  // Labels prefixed `fr_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let frame_init : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (canvas_cap: u64) (draw_cb: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "postui.M1-005 (#5): frame_init delegates the TTY probe + dimension queries to terminal_init, then stamps draw_cb into _terminal_state on success. 3-push callee-save prologue (rbx=canvas_cap, r12=draw_cb, r13=state_ptr) = 24 B -> rsp%16==0 (SysV entry rsp%16==8, +24 aligns). Every nested call (terminal_init) sees the aligned stack. rbx/r12 are SysV callee-save so they survive terminal_init's execution without needing local spill. Body: mov rdi, rbx; call terminal_init. cmp rax, 0; jne fr_init_done: any non-zero terminal_init return means state is already FAULTED and the error sentinel is already in rax -- forward verbatim. On OK: lea r13, [rip + _terminal_state]; mov [r13+FRAME_OFF_DRAW_CB=40], r12; xor rax, rax (0=OK). Epilogue: 3-pop in reverse push order; ret. Every immediate fits imm32 (0, 40). No test. No imul. Cross-module call convention: terminal_init is a same-module call (SysV leaf-shape from frame_init's callframe) so no additional stack pad needed. Labels prefixed fr_ per fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rbx = canvas_cap
+        mov r12, rsi;                        // r12 = draw_cb
+
+        // ---- Delegate to terminal_init ----------------------------------
+        mov rdi, rbx;
+        call terminal_init;
+
+        cmp rax, 0;
+        jne fr_init_done;                    // fault: forward rax verbatim
+
+        // ---- Register draw_cb -------------------------------------------
+        lea r13, [rip + _terminal_state];
+        mov [r13 + 40], r12;
+
+        xor rax, rax;
+
+      fr_init_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_render() -> u64
+  //
+  // One tick: check state == INITIALIZED, invoke draw_cb via the
+  // stored fn pointer, then issue TCC_OP_PRESENT via tcc_present. The
+  // draw callback's return is IGNORED -- a partially-filled back
+  // buffer is still worth flushing to keep the visible screen up to
+  // date with whatever the callback managed.
+  //
+  // Returns 0 on success. On state != INITIALIZED (either UNINIT --
+  // frame_init not called -- or FAULTED -- previous fatal error),
+  // returns FRAME_ERR_NOT_INITIALIZED without touching state. On a
+  // null draw_cb (frame_init was not called even though terminal_init
+  // was), returns FRAME_ERR_NO_DRAW_CB. On a tcc_present refusal,
+  // marks state FAULTED and returns FRAME_ERR_PRESENT so subsequent
+  // ticks refuse fast rather than spinning.
+  //
+  // Register plan: no args. 1-push (rbx) = 8 B -> rsp%16==0 aligned
+  // (SysV entry rsp%16==8, +8 aligns). rbx = state_ptr (loaded once
+  // and referenced through the entire body, including fault paths).
+  //
+  // Labels prefixed `fr_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let frame_render : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "postui.M1-005 (#5): frame_render checks state == FRAME_STATE_INITIALIZED, calls draw_cb (indirect through a stored fn ptr), and issues tcc_present. 1-push (rbx=state_ptr) = 8 B -> rsp%16==0 (SysV entry rsp%16==8, +8 aligns). Every nested call (draw_cb, tcc_present) sees the aligned stack. Phase 1 (state gate): mov rax, [rbx+FRAME_OFF_STATE=0]; cmp rax, FRAME_STATE_INITIALIZED=1; jne fr_render_bad -> return FRAME_ERR_NOT_INITIALIZED without state mutation (state was UNINIT or already FAULTED, in either case the caller is bug-shaped and we do not want to silently re-fault). Phase 2 (draw_cb): mov rax, [rbx+FRAME_OFF_DRAW_CB=40]; cmp rax, 0; je fr_render_no_cb -> return FRAME_ERR_NO_DRAW_CB (terminal_init ran but frame_init did not -- a caller bug). call rax (indirect through register; call rax is paideia-as-supported per kernel/core/fs/vops.pdx precedent). rax now holds cb's return; IGNORED per contract. Phase 3 (present): mov rdi, [rbx+FRAME_OFF_CANVAS_CAP=16]; call tcc_present. rax is now the present return code (0 = OK, TCC_ERR_* on refusal). cmp rax, 0; jne fr_render_present_err -> mark FAULTED and return FRAME_ERR_PRESENT. On OK: xor rax, rax; pop rbx; ret. Every immediate fits imm32 (0, 1, 16, 40); error sentinels loaded via mov reg, imm (movabs form paideia-as auto-selects for imm > 0x7FFFFFFF). No test. No imul. No r11 use. Effect !{mem, sysreg} @{cap} -- transitively touches the KIND_TUI_CANVAS cap via tcc_present. Labels prefixed fr_ per fingerprint discipline.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _terminal_state];
+
+        // ---- Phase 1: state gate ----------------------------------------
+        mov rax, [rbx + 0];
+        cmp rax, 1;                          // FRAME_STATE_INITIALIZED
+        jne fr_render_bad;
+
+        // ---- Phase 2: draw_cb -------------------------------------------
+        mov rax, [rbx + 40];
+        cmp rax, 0;
+        je fr_render_no_cb;
+        call rax;
+        // rax = cb's return; ignore per contract.
+
+        // ---- Phase 3: present -------------------------------------------
+        mov rdi, [rbx + 16];                 // canvas_cap
+        call tcc_present;
+        cmp rax, 0;
+        jne fr_render_present_err;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      fr_render_bad:
+        mov rax, 0xFFFFEB80;                 // FRAME_ERR_NOT_INITIALIZED
+        pop rbx;
+        ret;
+
+      fr_render_no_cb:
+        mov rax, 0xFFFFEB88;                 // FRAME_ERR_NO_DRAW_CB
+        pop rbx;
+        ret;
+
+      fr_render_present_err:
+        mov rax, 2;
+        mov [rbx + 0], rax;                  // state = FAULTED
+        mov rax, 0xFFFFEB86;                 // FRAME_ERR_PRESENT
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_run(iterations) -> u64
+  //
+  // Main driver loop: invoke frame_render `iterations` times, or
+  // forever if iterations == FRAME_RUN_FOREVER (0xFFFFFFFFFFFFFFFF).
+  // Returns 0 on natural loop exit (bounded case, iterations reached
+  // 0); forwards the first non-zero frame_render return on abort.
+  //
+  // Note: this landing does NOT call frame_next_event. Input
+  // handling (event enum + ESC parser) lands at M4-005 per
+  // docs/design.md §5.1. The loop is a pure render-driver at M1-005;
+  // the input path wires in later by re-shaping the loop body.
+  //
+  // Rationale for FRAME_RUN_FOREVER as the sentinel rather than
+  // e.g. iterations==0-means-forever: iterations==0 has a clean
+  // "no-op" semantics (loop body never executes, return 0
+  // immediately) that a caller may want (e.g. a driver toggling a
+  // frame-count-off gate). Using u64-max avoids the ambiguity.
+  //
+  // Register plan: rdi=iterations. 3-push (rbx, r12, r13) = 24 B ->
+  // rsp%16==0 aligned.
+  //   rbx = countdown (decrements each tick in the bounded case)
+  //   r12 = is_forever flag (0 = bounded, 1 = forever)
+  //   r13 = FRAME_RUN_FOREVER sentinel (staged via movabs so the
+  //         cmp is reg-reg -- imm64 in cmp is NOT paideia-as-safe)
+  //
+  // Labels prefixed `fr_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+  pub let frame_run : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (iterations: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "postui.M1-005 (#5): frame_run is the render driver loop. 3-push (rbx=countdown, r12=is_forever flag, r13=FRAME_RUN_FOREVER sentinel) = 24 B -> rsp%16==0 (SysV entry rsp%16==8, +24 aligns). Every nested call (frame_render) sees the aligned stack. Prologue: rbx = iterations (rdi); r13 = 0xFFFFFFFFFFFFFFFF via `mov r13, 0xFFFFFFFFFFFFFFFF` (imm64 -> movabs 10-byte form; paideia-as accepts imm64 in `mov reg, imm` per kernel/core/fs/fd_table.pdx precedent `mov rax, 0xFFFFFFFFFFFFFFFF`); r12 = 0; cmp rbx, r13 (reg-reg cmp is imm-safe); jne fr_run_not_forever; mov r12, 1. This computes is_forever without needing cmp reg, imm64 (which paideia-as forbids on that operand size) and without needing `not reg` (which paideia-as does not encode per madt.pdx §G2). Loop body fr_run_top: exit check: cmp r12, 0 (imm-safe); jne fr_run_do_tick (forever mode: skip the countdown-zero exit test); else cmp rbx, 0; je fr_run_done_ok (bounded mode, iterations reached 0). fr_run_do_tick: call frame_render (nullary); cmp rax, 0; jne fr_run_err (propagate the render error verbatim). Countdown decrement: cmp r12, 0; jne fr_run_top (forever mode: no decrement); sub rbx, 1; jmp fr_run_top. Exit paths: fr_run_done_ok: xor rax, rax; 3-pop; ret. fr_run_err: rax already holds frame_render's error return; 3-pop; ret. Every immediate in cmp/and fits imm32 (0, 1); the u64-max sentinel and any FRAME_ERR_* value stays in mov reg, imm form only (movabs 10-byte). No test. No imul. No r11 use. Labels prefixed fr_ per fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // countdown
+        mov r13, 0xFFFFFFFFFFFFFFFF;         // FRAME_RUN_FOREVER sentinel
+        xor r12, r12;
+        cmp rbx, r13;
+        jne fr_run_not_forever;
+        mov r12, 1;                          // is_forever = 1
+      fr_run_not_forever:
+
+      fr_run_top:
+        // Exit check: bounded AND countdown exhausted -> done.
+        cmp r12, 0;
+        jne fr_run_do_tick;                  // forever: skip zero-exit
+        cmp rbx, 0;
+        je fr_run_done_ok;
+
+      fr_run_do_tick:
+        call frame_render;
+        cmp rax, 0;
+        jne fr_run_err;                      // forward render error
+
+        // Countdown decrement (skip in forever mode).
+        cmp r12, 0;
+        jne fr_run_top;
+        sub rbx, 1;
+        jmp fr_run_top;
+
+      fr_run_done_ok:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fr_run_err:
+        // rax already holds frame_render's error return.
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_next_event(buf_ptr, buf_len) -> u64
+  //
+  // The sys_read(0) fallback input path (§2.5). At M1-005 this is a
+  // raw sys_read against fd 0 (stdin); the KIND_TTY primary path
+  // lands at M4-007 gated on paideia-os #1986 (TTY_OP_READ +
+  // raw-mode). The Event enum + CSI/SS3/OSC ESC-sequence parser
+  // lands at M4-005; consumers at M1-005 read raw bytes and defer
+  // parsing.
+  //
+  // Returns the raw sys_read result: bytes read (0 = EOF; per Linux
+  // read semantics), or -errno (a negative i64, appears as a value
+  // in the 0xFFFF...F800..F80 band when interpreted unsigned).
+  //
+  // NOT gated on state == INITIALIZED: an app may want to drain
+  // input before or after Frame is initialized (e.g. a probe on
+  // startup, or a final drain after teardown). Callers that need
+  // the state gate can check frame_state() themselves.
+  //
+  // Register plan: rdi=buf_ptr, rsi=buf_len. SYSCALL wants
+  // rdi=fd=0, rsi=buf, rdx=count. Two-move shuffle then zero rdi:
+  //   mov rdx, rsi   ; count -> SYSCALL arg2
+  //   mov rsi, rdi   ; buf   -> SYSCALL arg1
+  //   xor rdi, rdi   ; fd    -> SYSCALL arg0 (stdin = 0)
+  //   xor rax, rax   ; SYSNO_READ = 0
+  //   syscall; ret
+  //
+  // Leaf: no push/pop, no callee-save touched, no local frame.
+  // syscall clobbers rcx/r11 (both SysV caller-save, harmless).
+  // ==========================================================================
+  pub let frame_next_event : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf_ptr: u64) (buf_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_next_event is the sys_read(0) fallback input path (§2.5). SysV rdi=buf_ptr, rsi=buf_len. SYSCALL wants rdi=fd=0, rsi=buf, rdx=count. Three-instruction shuffle: (1) mov rdx, rsi (count to SYSCALL arg2); (2) mov rsi, rdi (buf to SYSCALL arg1); (3) xor rdi, rdi (fd=0). Then xor rax, rax (sys_read = row 0 of design/user/syscall-table.md, paideia-os); syscall; ret. Register plan verified: after step 1 rdi still holds buf (overwritten in step 2), rsi still holds count (already saved to rdx). rcx/r11 clobbered by SYSCALL are SysV caller-save (harmless). Leaf: no push/pop, no callee-save touched. Effect !{mem, sysreg} -- kernel writes into buf_ptr and executes a syscall. No cap needed (sys_read is a plain-fd op, not a cap-invoke). This wrapper is EXPLICITLY temporary per §2.5; M4-007 tracks removal once paideia-os #1986 lands the primary KIND_TTY raw-mode path.",
+      block: {
+        mov rdx, rsi;
+        mov rsi, rdi;
+        xor rdi, rdi;
+        xor rax, rax;
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_state() -> u64
+  //
+  // Return the current state ordinal (FRAME_STATE_*). Lets a
+  // downstream caller or a smoke test verify the driver state
+  // without needing to know the _terminal_state layout.
+  //
+  // Leaf: single qword load. Effect !{mem}.
+  // ==========================================================================
+  pub let frame_state : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_state returns [_terminal_state + FRAME_OFF_STATE=0]. Leaf: no push/pop, no callee-save touched, no nested call. lea rax, [rip + _terminal_state]; mov rax, [rax + 0]; ret. Effect !{mem} (single qword load).",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 0];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_input_path() -> u64
+  //
+  // Return the input-path discriminator (FRAME_INPUT_*) terminal_init
+  // recorded. Lets downstream code branch on the transport before
+  // calling frame_next_event (though at M1-005 the fallback is the
+  // only landed transport).
+  //
+  // Leaf. Effect !{mem}.
+  // ==========================================================================
+  pub let frame_input_path : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_input_path returns [_terminal_state + FRAME_OFF_INPUT_PATH=8]. Leaf: no push/pop, no callee-save touched, no nested call. lea rax, [rip + _terminal_state]; mov rax, [rax + 8]; ret. Effect !{mem} (single qword load).",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 8];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_rows() / frame_cols() -- cached dimension accessors.
+  //
+  // Return the rows/cols terminal_init cached from tcc_query_rows /
+  // tcc_query_cols. Lets a downstream widget draw code path (or a
+  // layout computation) read the canvas dimensions without issuing
+  // another cap_invoke.
+  //
+  // A caller that needs fresh dimensions after a TUI_OP_RESIZE
+  // should re-invoke terminal_init to re-probe; the singleton keeps
+  // the last-observed values.
+  //
+  // Leaf. Effect !{mem}.
+  // ==========================================================================
+  pub let frame_rows : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_rows returns [_terminal_state + FRAME_OFF_ROWS=24]. Leaf: no push/pop, no callee-save touched, no nested call. lea rax, [rip + _terminal_state]; mov rax, [rax + 24]; ret. Effect !{mem}.",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 24];
+        ret;
+      }
+    }
+
+  pub let frame_cols : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_cols returns [_terminal_state + FRAME_OFF_COLS=32]. Leaf.",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 32];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_canvas_cap() -- cached canvas cap accessor.
+  //
+  // Return the canvas cap slot terminal_init recorded. Lets a
+  // downstream caller re-invoke tcc_* wrappers (e.g. tcc_debug_print
+  // for a diagnostic trace, tcc_query_id for correlating a semantic
+  // record with the emitting canvas) without threading the cap
+  // through every call.
+  //
+  // Leaf. Effect !{mem}.
+  // ==========================================================================
+  pub let frame_canvas_cap : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_canvas_cap returns [_terminal_state + FRAME_OFF_CANVAS_CAP=16]. Leaf.",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 16];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // frame_tty_id() -- cached tty_id accessor.
+  //
+  // Return the tty_id terminal_init observed via tcc_query_tty_id.
+  // Lets a downstream caller correlate a canvas with its underlying
+  // TTY (e.g. for a debug print naming both ids).
+  //
+  // Leaf. Effect !{mem}.
+  // ==========================================================================
+  pub let frame_tty_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-005 (#5): frame_tty_id returns [_terminal_state + FRAME_OFF_TTY_ID=48]. Leaf.",
+      block: {
+        lea rax, [rip + _terminal_state];
+        mov rax, [rax + 48];
+        ret;
+      }
+    }
 
 }
