@@ -29,10 +29,10 @@
 // =============================================================================
 //
 //   1. Two error sentinels in the postui error band (0xFFFFEB80+):
-//        WK_ERR_UNIMPLEMENTED (0xFFFFEB90): the kind ordinal is in
+//        WK_ERR_UNIMPLEMENTED (0xFFFFEBB0): the kind ordinal is in
 //          [0, WK_COUNT) but no v1 widget body exists for it -- the
 //          14 non-Block kinds all fall here until their M2..M4 landings.
-//        WK_ERR_BAD_KIND (0xFFFFEB91): the kind ordinal is >= WK_COUNT.
+//        WK_ERR_BAD_KIND (0xFFFFEBB1): the kind ordinal is >= WK_COUNT.
 //          A well-formed caller never triggers this (WidgetKind is
 //          closed; the type-checker would reject a WK_* constant that
 //          did not exist), so this is a defensive gate against a
@@ -88,7 +88,7 @@
 //     basename per manifest.pdxproj sources: entry.
 //   - No `test` mnemonic; the one bounds check is `cmp reg, imm32`
 //     (WK_COUNT = 15 fits imm32 trivially).
-//   - Error sentinels 0xFFFFEB90 and 0xFFFFEB91 both exceed
+//   - Error sentinels 0xFFFFEBB0 and 0xFFFFEBB1 both exceed
 //     0x7FFFFFFF, so `mov rax, <sentinel>` is emitted by paideia-as as
 //     movabs (10-byte imm64 form) -- legal for mov, matches the
 //     cap_handler_tui_canvas.pdx `mov rax, 0xFFFFEB1A` idiom
@@ -164,8 +164,8 @@ module WidgetKind = structure {
   // attributes the return to postui vs. the kernel TCC band
   // (0xFFFFEB10..1F) or the KIND_SIG_KEY band (0xFFFFEB00..0F).
   // ==========================================================================
-  pub let WK_ERR_UNIMPLEMENTED : u64 = 0xFFFFEB90
-  pub let WK_ERR_BAD_KIND      : u64 = 0xFFFFEB91
+  pub let WK_ERR_UNIMPLEMENTED : u64 = 0xFFFFEBB0
+  pub let WK_ERR_BAD_KIND      : u64 = 0xFFFFEBB1
 
   // ==========================================================================
   // widget_draw(kind, spec_ptr, buf_ptr, rows, cols) -> u64
@@ -196,9 +196,9 @@ module WidgetKind = structure {
   //     via four mov reg,reg; `sub rsp, 8` to align rsp%16 from the
   //     entry-time 8 to the call-safe 0; `call block_draw` returns its
   //     u64 in rax verbatim; `add rsp, 8` restores; `ret`.
-  //   Unimplemented arm: `mov rax, 0xFFFFEB90` (paideia-as emits
+  //   Unimplemented arm: `mov rax, 0xFFFFEBB0` (paideia-as emits
   //     10-byte movabs since imm > 0x7FFFFFFF); `ret`.
-  //   Bad-kind arm: `mov rax, 0xFFFFEB91`; `ret`.
+  //   Bad-kind arm: `mov rax, 0xFFFFEBB1`; `ret`.
   //
   // Non-leaf (one nested call). Alignment: entry rsp%16==8; `sub rsp,
   // 8` -> 0 at every nested call site (only the WK_BLOCK arm has
@@ -217,7 +217,7 @@ module WidgetKind = structure {
     fn (kind: u64) (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
       effects: {mem},
       capabilities: {},
-      justification: "postui.M1-007 (postui#7): widget_draw is the compare-chain dispatch entry every Frame::draw call routes through -- the postui analogue of the kernel's cap_handler_tui_canvas / cap_handler_tty op dispatch, one-for-one on shape. Bounds check first (cmp rdi, 15; jae wk_wd_bad_kind) covers a hand-crafted or memory-corrupted kind ordinal at v1's max (WK_COUNT=15, imm32-safe). Then a single cmp/je for the one implemented ordinal (WK_BLOCK=0) routes to the WK_BLOCK arm; every other ordinal in [1, 15) falls through to the unimplemented sentinel. WK_BLOCK arm shifts the four widget-side args down one SysV slot (rsi->rdi spec_ptr, rdx->rsi buf_ptr, rcx->rdx rows, r8->rcx cols) via four mov reg,reg; sub rsp,8 aligns rsp%16 from entry-time 8 to 0 for the nested call; call block_draw (cross-module, resolved by the linker against block.pdx's pub let block_draw symbol) returns its u64 in rax which we pass through verbatim; add rsp,8 restores; ret. Unimplemented arm: mov rax, 0xFFFFEB90 (paideia-as emits movabs since imm > 0x7FFFFFFF -- same idiom as cap_handler_tui_canvas.pdx's `mov rax, 0xFFFFEB1A` for TUI_BAD_SLOT); ret. Bad-kind arm: mov rax, 0xFFFFEB91; ret. No callee-save touched (the four caller-save arg regs are dead across the return); no r11 preserved (paideia-as scratch); no `test` mnemonic; every immediate that participates in cmp/and (0, 15) fits imm32; the two sentinel movs go through mov reg, imm64 (movabs), legal for mov, not for cmp/and. Effect/capability row {mem}/{} covers block_draw's transitive shape verbatim (block_draw is also !{mem} @{}). Labels prefixed wk_ per docs fingerprint discipline (wk_wd_ for widget_draw arms).",
+      justification: "postui.M1-007 (postui#7): widget_draw is the compare-chain dispatch entry every Frame::draw call routes through -- the postui analogue of the kernel's cap_handler_tui_canvas / cap_handler_tty op dispatch, one-for-one on shape. Bounds check first (cmp rdi, 15; jae wk_wd_bad_kind) covers a hand-crafted or memory-corrupted kind ordinal at v1's max (WK_COUNT=15, imm32-safe). Then a single cmp/je for the one implemented ordinal (WK_BLOCK=0) routes to the WK_BLOCK arm; every other ordinal in [1, 15) falls through to the unimplemented sentinel. WK_BLOCK arm shifts the four widget-side args down one SysV slot (rsi->rdi spec_ptr, rdx->rsi buf_ptr, rcx->rdx rows, r8->rcx cols) via four mov reg,reg; sub rsp,8 aligns rsp%16 from entry-time 8 to 0 for the nested call; call block_draw (cross-module, resolved by the linker against block.pdx's pub let block_draw symbol) returns its u64 in rax which we pass through verbatim; add rsp,8 restores; ret. Unimplemented arm: mov rax, 0xFFFFEBB0 (paideia-as emits movabs since imm > 0x7FFFFFFF -- same idiom as cap_handler_tui_canvas.pdx's `mov rax, 0xFFFFEB1A` for TUI_BAD_SLOT); ret. Bad-kind arm: mov rax, 0xFFFFEBB1; ret. No callee-save touched (the four caller-save arg regs are dead across the return); no r11 preserved (paideia-as scratch); no `test` mnemonic; every immediate that participates in cmp/and (0, 15) fits imm32; the two sentinel movs go through mov reg, imm64 (movabs), legal for mov, not for cmp/and. Effect/capability row {mem}/{} covers block_draw's transitive shape verbatim (block_draw is also !{mem} @{}). Labels prefixed wk_ per docs fingerprint discipline (wk_wd_ for widget_draw arms).",
       block: {
         // ---- Bounds check: reject kind >= WK_COUNT ------------------------
         cmp rdi, 15;
@@ -228,7 +228,7 @@ module WidgetKind = structure {
         je  wk_wd_block;
 
         // ---- Fall-through: kind is in [1, 15), no v1 body -----------------
-        mov rax, 0xFFFFEB90;
+        mov rax, 0xFFFFEBB0;
         ret;
 
       wk_wd_block:
@@ -245,7 +245,7 @@ module WidgetKind = structure {
         ret;
 
       wk_wd_bad_kind:
-        mov rax, 0xFFFFEB91;
+        mov rax, 0xFFFFEBB1;
         ret;
       }
     }
