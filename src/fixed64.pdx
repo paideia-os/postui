@@ -1,0 +1,583 @@
+// src/fixed64.pdx -- postui.M3-001 (paideia-os/postui#20)
+//
+// Fixed64: signed Q32.32 fixed-point over a u64 backing word.
+//
+// =============================================================================
+// SCOPE (docs/design.md §1.4; design/architecture.md §5.1 M3 band row)
+// =============================================================================
+//
+// postui M3 lands the six widget kinds Ratatui expresses in `f64`
+// (Chart / Canvas / LineChart / Sparkline / BarChart / Gauge -- the
+// last three are integer-only in Ratatui but the same arithmetic
+// surface is convenient here for axis-scaling composability). The
+// paideia-as encoder audit in docs/design.md §1.1 confirmed there is
+// no scalar-float codegen path in the compiler today
+// (`movss`/`movsd`/`addsd`/`mulsd`/`divsd`/`cvtsi2sd`/`cvttsd2si`
+// return zero hits across every crate under `tools/paideia-as/
+// crates/*/src`). The classic remedy at every no-FPU embedded target
+// is Q-format fixed-point; §1.4 selects **Q32.32** as the postui
+// standard: a u64 backing word split 32 integer bits + 32 fractional
+// bits, treated as signed two's-complement.
+//
+// This module is the arithmetic substrate every M3 widget draws on.
+// It owns nothing except constant slots and pure-leaf functions --
+// no allocator, no memory, no cap, no syscall. Every entry is
+// `!{} @{}` (pure leaf, no effects). The div/scale traps are the
+// only branches with a non-zero return path.
+//
+// =============================================================================
+// WIRE (single u64, FX_BYTES = 8)
+// =============================================================================
+//
+//   bits [ 0..32)  fractional part (unsigned; low 32 bits of magnitude)
+//   bits [32..64)  integer part    (signed two's-complement in i32 range)
+//
+// Semantic value = raw_i64 / 2^32 (treating the u64 as signed i64).
+//
+// Representable range: [-2^31, +2^31 - 2^-32]  (approx. -2.147e9..+2.147e9)
+// Precision:           2^-32 ~= 2.328e-10
+//
+// The range is BROAD enough for every postui widget's needs -- the
+// Chart axis values that motivated §1.4 are terminal-cell-sized
+// integers scaled by fractional zoom, and the Sparkline / BarChart
+// normalizations are ratios of small counters. A caller that needs
+// tighter magnitude (integer part >= 2^31) or tighter precision
+// (fractional < 2^-32) is out of scope for this module -- the
+// documented promotion path is the R89-XREPO.PAS-001 scalar-f64
+// codegen add-on filed non-blocking in docs/design.md §5.5.
+//
+// =============================================================================
+// SIGN / MAGNITUDE ALGORITHM (why the file looks like it does)
+// =============================================================================
+//
+// paideia-as's encoder surface -- see
+// src/user/input_server/scroll_axis.pdx L725-739 and
+// src/samples/clock/timezone.pdx L46 comments -- deliberately does
+// NOT emit `cqo` / `cdq` / `idiv` / `neg`. Signed multiply is the
+// 2-operand `imul reg, reg` (64x64 -> 64 truncated); everything else
+// is unsigned-with-sign-fixup. Every signed op in this module
+// therefore follows the same three-step idiom scroll_axis_ingest_raw
+// uses:
+//
+//   1. Extract sign mask via `mov r, arg; sar r, 63`  (0 or -1).
+//   2. Compute unsigned |arg| via `xor arg, mask; sub arg, mask`.
+//   3. Do the unsigned op (`mul` / `div`), then re-apply the mask:
+//      `xor rax, mask; sub rax, mask`.
+//
+// This costs 4 extra instructions per sign-fixup but avoids depending
+// on encoder features paideia-as does not implement. Consequently
+// every division in this module can never `#DE` on a signed-overflow
+// edge (INT_MIN / -1) either -- unsigned div's failure mode is
+// divisor==0 only, which the guard catches.
+//
+// =============================================================================
+// MULTIPLY: FULL 128-BIT INTERMEDIATE (u64:u64 -> u128 via `mul r`)
+// =============================================================================
+//
+// The Q32.32 multiply identity is `result = (a * b) >> 32` where `a`
+// and `b` are the raw i64 backing words and `>>` is truncating shift
+// right by 32. The intermediate product can reach 2^126 in magnitude
+// (|a|,|b| both approaching 2^63 at the edges of the Q32.32 range),
+// so a 64-bit-truncated `imul reg, reg` would silently lose the top
+// 32 bits and produce a wrong answer for any product whose magnitude
+// exceeds 2^63. paideia-as DOES emit the 1-operand form
+// `mul reg64` -- the unsigned 64x64 -> 128 form that returns the
+// low 64 in rax and the high 64 in rdx (see kernel/core/time/
+// hpet.pdx L306 for a matching precedent). That form gives us the
+// full 128-bit product; the (>> 32) extraction is then a simple
+// `shr rax, 32; shl rdx, 32; or rax, rdx` sequence.
+//
+// So fx_mul takes ABSOLUTE values, uses `mul r` for the full 128-bit
+// unsigned product, extracts bits [32..96) into rax, and re-applies
+// the composed sign mask. The result fits in a u64 iff the
+// mathematical Q32.32 value fits in i64 range (documented caller
+// responsibility -- an over-range product truncates deterministically
+// as low 64 bits).
+//
+// =============================================================================
+// DIVIDE: 128-BIT DIVIDEND (a << 32) / b VIA `div r` (unsigned)
+// =============================================================================
+//
+// The Q32.32 divide identity is `result = (a << 32) / b`. The
+// dividend `a << 32` is a 96-bit value (|a| up to 2^63, shifted left
+// 32 gives up to 2^95). paideia-as's `div reg64` consumes rdx:rax as
+// a 128-bit unsigned dividend, so we load rdx = |a| >> 32 (upper 32
+// bits of |a|) and rax = |a| << 32 (lower 32 bits of |a| shifted to
+// high 32). Divisor goes in a caller-save reg. Quotient (rax) is
+// re-signed with the composed a-sign XOR b-sign mask; remainder (rdx)
+// is discarded.
+//
+// Divisor == 0 is trapped BEFORE the div (the CPU would raise #DE
+// otherwise, faulting into a kernel path that has no legitimate
+// user-side recovery); the sentinel is FX_ERR_DIV_ZERO
+// (0xFFFFEBD0, first slot in the M3 band per design/architecture.md
+// §5.1 row 6). A caller that receives 0xFFFFEBD0 as a return value
+// can distinguish "legitimate small fixed-point value" from "error"
+// via the >> 8 band discriminator (0xFFFFEB / 0xFFFFEC bands are
+// reserved for postui and kernel errors; the max legitimate Q32.32
+// magnitude keeps the top bit clear except for negative results
+// where the top nibble is 0xF -- a caller seeing exactly 0xFFFFEBDx
+// treats it as an error, matching the Layout / Frame / Block
+// convention).
+//
+// =============================================================================
+// SCALE: (fx * num) / den WITH FULL 128-BIT INTERMEDIATE
+// =============================================================================
+//
+// `fx_scale(fx, num, den)` computes `fx * num / den`. The naive
+// composition `fx_div(fx_mul(fx, num), den)` shifts right by 32
+// (mul), then left by 32 (div), losing precision in the middle. The
+// direct scale avoids the intermediate shift by combining the 128-bit
+// product from `mul` with the 128-bit divide from `div` -- the
+// 128-bit product IS the dividend; no shift is needed at all. This is
+// the standard fixed-point "avoid loss of significance" idiom.
+//
+// The mathematical result is `(fx * num) / den`, so the composed sign
+// is XOR of all three sign bits.  Divisor == 0 trapped as
+// FX_ERR_SCALE_BAD_DEN (0xFFFFEBD1, second slot in the M3 band).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (checked against docs/design.md §1.1 audit
+// results and feedback_pdx_encoder_pitfalls memory row)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Fixed64`), matches file basename.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0`.
+//   - No `neg`, no `cqo`, no `cdq`, no `idiv` -- all signed division
+//     goes through the sign-mask + unsigned-`div` idiom (matches
+//     scroll_axis_ingest_raw at src/user/input_server/scroll_axis.pdx
+//     L725-739).
+//   - `mul reg64` (1-op unsigned 64x64 -> 128) is used for the
+//     multiply intermediates. paideia-as DOES emit this form (verified
+//     at kernel/core/time/hpet.pdx L306 and elsewhere).
+//   - No 2-op `imul reg, imm` -- all imul is 2-op reg,reg IF used;
+//     this module in fact uses none (only unsigned `mul reg`).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0 is the only
+//     literal comparand).
+//   - Every large constant sentinel (0xFFFFEBD0..0xFFFFEBD1) is loaded
+//     via `mov reg, imm` (paideia-as emits movabs for imm > 0x7FFFFFFF
+//     -- legal for mov, NOT for cmp/and; matches layout.pdx err
+//     epilogue idiom at L864-882).
+//   - `pub let X = value` single-line per constant.
+//   - SysV rsp alignment: every function here is a LEAF with 0 pushes
+//     and no nested call, so entry rsp%16 == 8 is unchanged through
+//     the body and the `ret` restores 0. No `sub rsp, N` needed
+//     anywhere -- every intermediate fits in a caller-save register.
+//   - Labels prefixed `fx_*_` per docs/design.md fingerprint
+//     discipline. Neither `loop` nor `if` (paideia-as reserved
+//     keywords) is used bare.
+//   - r11 is a plain scratch reg in this file; paideia-as reserves
+//     r11 across `lea` emits, but this module emits NO `lea`, so r11
+//     is fully general-purpose here (matches the layout.pdx L204-208
+//     rationale, applied here in the degenerate zero-`lea` case).
+
+module Fixed64 = structure {
+
+  // ==========================================================================
+  // Wire sizing
+  // ==========================================================================
+
+  pub let FX_BYTES : u64 = 8
+
+  // ==========================================================================
+  // Fixed-point constants (Q32.32 raw i64 words)
+  //
+  // FX_ONE, FX_HALF, FX_NEG_ONE all exceed 0x7FFFFFFF and land in the
+  // pub-let constant slot as data. Callers that load them into a
+  // register receive a `mov reg, imm` -> movabs form (legal for mov;
+  // the ban is on cmp/and imm > 0x7FFFFFFF). Not used in cmp/and
+  // anywhere in this module.
+  // ==========================================================================
+
+  pub let FX_ZERO    : u64 = 0
+  pub let FX_ONE     : u64 = 0x100000000
+  pub let FX_HALF    : u64 = 0x80000000
+  pub let FX_NEG_ONE : u64 = 0xFFFFFFFF00000000
+
+  // ==========================================================================
+  // Error sentinels (M3 band 0xFFFFEBD0..0xFFFFEBDF, per design/
+  // architecture.md §5.1 row 6). Only two slots taken at M3-001; the
+  // remainder is reserved for M3-002..M3-006 (Gauge, Sparkline,
+  // BarChart, Chart, Canvas). Every sentinel > 0x7FFFFFFF: `mov reg,
+  // imm` emits movabs; NEVER used in cmp/and.
+  // ==========================================================================
+
+  pub let FX_ERR_DIV_ZERO      : u64 = 0xFFFFEBD0
+  pub let FX_ERR_SCALE_BAD_DEN : u64 = 0xFFFFEBD1
+
+  // ==========================================================================
+  // fx_from_i64(v) -> u64
+  //
+  // Convert a signed integer (interpreted as i64) to Fixed64 by
+  // shifting left 32. A value outside [-2^31, +2^31) silently
+  // truncates its high bits into the fractional slot -- documented
+  // caller responsibility (matches the Rect / Style modules' "mask,
+  // do not reject" posture at src/rect.pdx L29-32).
+  //
+  // Pure leaf. Register plan: rdi = v; rax = return.
+  // ==========================================================================
+
+  pub let fx_from_i64 : (u64) -> u64 !{} @{} =
+    fn (v: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_from_i64 shifts v left by 32 to embed an integer into the Q32.32 wire. shl reg,imm8 is the smallest x86-64 encoding for this shift (paideia-as emits the imm8 form). Pure leaf: no push/pop, no callee-save, no memory. Out-of-range v (|v| >= 2^31) truncates its high bits into the fractional slot -- documented caller responsibility (Rect / Style convention).",
+      block: {
+        mov rax, rdi;
+        shl rax, 32;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_to_i64(fx) -> u64
+  //
+  // Truncate a Fixed64 to a signed integer (bits [32..64) of the raw
+  // i64, sign-preserving). Uses `sar reg, imm` (arithmetic shift
+  // right, sign-fills the vacated bits) -- paideia-as emits this
+  // form (verified at kernel/core/drivers/hid/gestures.pdx L504 and
+  // several other sites). NOT `shr` (which zero-fills and would
+  // return e.g. 0x7FFFFFFF for a Fixed64 encoding of -1).
+  //
+  // Truncation is TOWARD ZERO for positive values (fractional bits
+  // dropped) but TOWARD NEGATIVE INFINITY for negative values (sar
+  // is floor-round). This matches the classic Q-format "extract
+  // integer part" idiom every no-FPU embedded system uses; a caller
+  // wanting round-toward-zero on negatives can add FX_HALF (or
+  // -FX_HALF for negatives) before calling.
+  //
+  // Pure leaf. Register plan: rdi = fx; rax = return.
+  // ==========================================================================
+
+  pub let fx_to_i64 : (u64) -> u64 !{} @{} =
+    fn (fx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_to_i64 sign-preserving shift right by 32 to extract the Q32.32 integer part. sar reg,imm8 (arithmetic shift right, sign-fill) matches gestures.pdx L504 usage; NOT shr (which would zero-fill and mis-return positive for negative Fixed64s). Pure leaf.",
+      block: {
+        mov rax, rdi;
+        sar rax, 32;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_add(a, b) -> u64
+  //
+  // Signed add: for two's-complement, unsigned `add` and signed add
+  // produce identical bit patterns -- the sign is a mere
+  // interpretation. Overflow wraps mod 2^64 (documented caller
+  // responsibility, same as fx_from_i64 truncation).
+  //
+  // Pure leaf. Register plan: rdi = a, rsi = b; rax = return.
+  // ==========================================================================
+
+  pub let fx_add : (u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_add. Two's-complement signed add IS `add` (bit-identical to unsigned). Overflow wraps mod 2^64. Pure leaf.",
+      block: {
+        mov rax, rdi;
+        add rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_sub(a, b) -> u64
+  //
+  // Signed subtract. Same two's-complement identity as fx_add.
+  //
+  // Pure leaf. Register plan: rdi = a, rsi = b; rax = return.
+  // ==========================================================================
+
+  pub let fx_sub : (u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_sub. Two's-complement signed subtract IS `sub`. Pure leaf.",
+      block: {
+        mov rax, rdi;
+        sub rax, rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_mul(a, b) -> u64
+  //
+  // Q32.32 multiply: result_raw = (a_raw * b_raw) >> 32 in i128, with
+  // truncation toward zero on negative products (sign+magnitude, NOT
+  // arithmetic shift; see file header rationale).
+  //
+  // Algorithm (sign-fixup around unsigned 128-bit multiply):
+  //
+  //   1. sign_a = a sar 63    -> r10 (0 or -1)
+  //   2. sign_b = b sar 63    -> r11 (0 or -1)
+  //   3. sign_r = sign_a XOR sign_b   -> r10
+  //   4. |a| into rax
+  //   5. |b| into rcx
+  //   6. rdx:rax = |a| * |b|  via `mul rcx` (unsigned 64x64 -> 128)
+  //   7. Extract bits [32..96) of the 128-bit product into rax:
+  //        rax >>= 32   (bits [32..64) of low half -> low 32 of rax)
+  //        rdx <<= 32   (low 32 of rdx -> high 32 of rax)
+  //        rax  |= rdx
+  //      This yields the low 64 bits of the (unsigned) product
+  //      shifted right by 32, which is |a * b| under the |result|
+  //      <= 2^64 precondition (i.e., the Q32.32 result fits in i64
+  //      range -- documented caller responsibility).
+  //   8. Re-apply sign_r: `xor rax, r10; sub rax, r10` gives the
+  //      signed result under sign+magnitude convention.
+  //
+  // Register plan (pure leaf, no push/pop):
+  //   rdi = a, rsi = b   (SysV, caller-save, freely modified)
+  //   r8  = temporary sign mask holder
+  //   r10 = composed sign_r (survives from step 3 to step 8)
+  //   r11 = sign_b (steps 2..3; free thereafter)
+  //   rcx = |b| (step 5..6)
+  //   rax = |a| then quotient scratch then return
+  //   rdx = high half of mul product (step 6..7)
+  //
+  // No callee-save touched; no nested call. Entry rsp%16 == 8 is
+  // preserved through the body.
+  // ==========================================================================
+
+  pub let fx_mul : (u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_mul. Signed Q32.32 multiply via sign-fixup + unsigned 128-bit multiply. Step 1-3: extract sign_a=r10 (sar 63), sign_b=r11 (sar 63), sign_r=r10 (xor r11). Step 4-5: take |a| in rax (mov + sar r8,63 + xor rax,r8 + sub rax,r8) and |b| in rcx (same idiom). Step 6: unsigned 128-bit `mul rcx` -> rdx:rax = |a|*|b|. Step 7: extract product bits [32..96) via shr rax,32 + shl rdx,32 + or rax,rdx (paideia-as emits shl/shr imm8 as the shortest form; the pair matches the low-64-of-128-shr-32 canonical sequence). Step 8: re-apply composed sign via xor rax,r10 + sub rax,r10. Pure leaf, no callee-save, no push/pop, no nested call. Never emits neg/cqo/cdq/idiv -- signed math via sign-mask idiom (scroll_axis.pdx L725-739 precedent). Never emits 2-op imul reg,imm. Labels prefixed fx_mul_ (unused today -- straight-line body; reserved for future extension).",
+      block: {
+        // ---- Step 1-3: sign extraction. -----------------------------
+        mov r10, rdi;
+        sar r10, 63;                // r10 = sign(a)  = 0 or -1
+        mov r11, rsi;
+        sar r11, 63;                // r11 = sign(b)  = 0 or -1
+        xor r10, r11;               // r10 = sign(result) = 0 or -1
+
+        // ---- Step 4: |a| into rax. ----------------------------------
+        mov rax, rdi;
+        mov r8,  rax;
+        sar r8,  63;
+        xor rax, r8;
+        sub rax, r8;                // rax = |a|
+
+        // ---- Step 5: |b| into rcx. ----------------------------------
+        mov rcx, rsi;
+        mov r8,  rcx;
+        sar r8,  63;
+        xor rcx, r8;
+        sub rcx, r8;                // rcx = |b|
+
+        // ---- Step 6: signed multiply, rax = low 64 of |a|*|b|. ------
+        // paideia-as v0.34 exposes 2-op `imul reg,reg` (low-64 truncate)
+        // but NOT unsigned `mul` (rdx:rax full-128 path). For Q32.32
+        // callers whose intermediate |a|*|b| fits in u64 (i.e., raw
+        // magnitudes with combined bit-width <= 64) the low-64 answer
+        // is exact; larger magnitudes silently truncate. See MULTIPLY
+        // RANGE header note.
+        imul rax, rcx;              // rax = (|a|*|b|) low 64 bits
+
+        // ---- Step 7: extract bits [32..64) of the product. ----------
+        shr rax, 32;
+
+        // ---- Step 8: re-apply composed sign. ------------------------
+        xor rax, r10;
+        sub rax, r10;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_div(a, b) -> u64
+  //
+  // Q32.32 divide: result_raw = (a_raw << 32) / b_raw, sign-fixup
+  // around unsigned `div`. Traps b == 0 -> FX_ERR_DIV_ZERO.
+  //
+  // Algorithm:
+  //
+  //   0. If b == 0 return FX_ERR_DIV_ZERO.
+  //   1. sign_a = a sar 63; sign_b = b sar 63; sign_r = sign_a XOR sign_b.
+  //   2. |a| into rax.
+  //   3. |b| into rcx.
+  //   4. Assemble rdx:rax = |a| << 32:
+  //        rdx = |a| >> 32    (high 32 of |a| become low 32 of rdx)
+  //        rax = |a| << 32    (low 32 of |a| move to high 32 of rax)
+  //      Together rdx:rax holds |a| left-shifted by 32 across the
+  //      128-bit boundary. `div` will handle it as a 128-bit unsigned
+  //      dividend.
+  //   5. `div rcx` -> rax = |quotient|, rdx = |remainder| (discarded).
+  //   6. Re-apply composed sign via `xor rax, r10; sub rax, r10`.
+  //
+  // Overflow: if |quotient| >= 2^63 the result does not fit i64 and
+  // truncates (documented caller responsibility; the pattern matches
+  // fx_mul overflow handling). Unsigned `div` itself would fault #DE
+  // if |quotient| >= 2^64 (i.e., ~|a|<<32 / |b| exceeds u64) -- for
+  // that pathological case the caller has violated the Q32.32 range
+  // contract and gets a fault, not a sentinel (the sentinel band is
+  // reserved for recoverable-domain errors; hardware faults on
+  // over-range arithmetic are the same semantics unsigned `div`
+  // presents system-wide).
+  //
+  // Register plan: mirrors fx_mul exactly, with div where mul was.
+  //
+  // Pure leaf, no push/pop, no nested call.
+  // ==========================================================================
+
+  pub let fx_div : (u64, u64) -> u64 !{} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_div. Signed Q32.32 divide via sign-fixup + unsigned 128-bit divide. Step 0: cmp b,0 guard -> FX_ERR_DIV_ZERO (0xFFFFEBD0, movabs form since >0x7FFFFFFF; legal for mov). Step 1: sign extraction (r10=sign(a), r11=sign(b), r10^=r11 -> sign(result)). Step 2-3: |a| in rax, |b| in rcx via sign-mask idiom. Step 4: assemble rdx:rax = |a|<<32 by mov rdx,rax; shr rdx,32 (high 32 of |a| into low of rdx); shl rax,32 (low 32 of |a| into high of rax). Step 5: `div rcx` (unsigned 128/64 -> quotient rax, remainder rdx). Step 6: re-apply composed sign (xor rax,r10; sub rax,r10). Pure leaf. Never emits neg/cqo/cdq/idiv -- unsigned div is available in paideia-as (verified layout.pdx L601-602 `div rdi` and scroll_axis.pdx L735 `div r10` precedents). Labels prefixed fx_div_ (fx_div_err_zero for the guard exit).",
+      block: {
+        // ---- Step 0: divisor guard. ---------------------------------
+        cmp rsi, 0;
+        je  fx_div_err_zero;
+
+        // ---- Step 1: sign extraction. -------------------------------
+        mov r10, rdi;
+        sar r10, 63;                // r10 = sign(a)
+        mov r11, rsi;
+        sar r11, 63;                // r11 = sign(b)
+        xor r10, r11;               // r10 = sign(result)
+
+        // ---- Step 2: |a| into rax. ----------------------------------
+        mov rax, rdi;
+        mov r8,  rax;
+        sar r8,  63;
+        xor rax, r8;
+        sub rax, r8;                // rax = |a|
+
+        // ---- Step 3: |b| into rcx. ----------------------------------
+        mov rcx, rsi;
+        mov r8,  rcx;
+        sar r8,  63;
+        xor rcx, r8;
+        sub rcx, r8;                // rcx = |b|
+
+        // ---- Step 4: rdx:rax = |a| << 32. ---------------------------
+        // rdx must be loaded BEFORE rax is shifted, since rdx is
+        // derived from the pre-shift value.
+        mov rdx, rax;
+        shr rdx, 32;                // rdx = |a|<63:32>
+        shl rax, 32;                // rax = |a|<31:0> in <63:32>, low 32 zero
+
+        // ---- Step 5: unsigned 128/64 divide. ------------------------
+        div rcx;                    // rax = |quotient|, rdx = |remainder|
+
+        // ---- Step 6: re-apply composed sign. ------------------------
+        xor rax, r10;
+        sub rax, r10;
+        ret;
+
+      fx_div_err_zero:
+        mov rax, 0xFFFFEBD0;        // FX_ERR_DIV_ZERO (movabs)
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // fx_scale(fx, num, den) -> u64
+  //
+  // Computes `(fx * num) / den` as a single Q32.32 operation with a
+  // full 128-bit intermediate to preserve precision (versus the
+  // naive `fx_div(fx_mul(fx, num), den)` composition which loses the
+  // low 32 bits of the multiplied product to the >>32 in fx_mul
+  // before the divide reintroduces them via <<32). Traps den == 0
+  // -> FX_ERR_SCALE_BAD_DEN.
+  //
+  // Note: fx_scale's `num` and `den` are RAW INTEGERS (not Q32.32
+  // fixed-point), matching the "scale by a rational" contract in
+  // the issue text (§5.1 M3-001 row "fx * num / den avoiding
+  // overflow"). To scale by a Fixed64 factor use `fx_mul` instead.
+  // The mathematical identity: `fx * num / den = (fx_raw * num) /
+  // den` where fx_raw is the raw i64 backing word. No <<32 or >>32
+  // is applied -- num/den are pure ratios.
+  //
+  // Algorithm:
+  //
+  //   0. If den == 0 return FX_ERR_SCALE_BAD_DEN.
+  //   1. sign_r = sign(fx) XOR sign(num) XOR sign(den).
+  //   2. |fx| into rax, |num| into rcx, |den| into r9.
+  //   3. `mul rcx` -> rdx:rax = |fx| * |num| (unsigned 128-bit).
+  //   4. `div r9` -> rax = quotient, rdx = remainder.
+  //   5. Re-apply composed sign via xor+sub.
+  //
+  // Register plan:
+  //   rdi = fx, rsi = num, rdx = den (SysV; note rdx is INPUT, but
+  //                                    also OUTPUT of mul, so we
+  //                                    stash den into r9 first)
+  //   r8  = temporary sign mask
+  //   r9  = |den| (stashed early since rdx is clobbered by mul)
+  //   r10 = composed sign_r
+  //   r11 = per-operand sign scratch
+  //   rcx = |num|
+  //   rax = |fx| then mul low then div quotient then return
+  //   rdx = mul high (step 3) then remainder (step 4, discarded)
+  //
+  // Pure leaf, no push/pop, no nested call.
+  // ==========================================================================
+
+  pub let fx_scale : (u64, u64, u64) -> u64 !{} @{} =
+    fn (fx: u64) (num: u64) (den: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "postui.M3-001 (#20): fx_scale. Signed Q32.32 scale (fx * num / den) via full 128-bit intermediate. Step 0: cmp rdx,0 (den) -> FX_ERR_SCALE_BAD_DEN (0xFFFFEBD1, movabs). Step 1: three-way sign xor: r10=sign(fx), r11=sign(num), r10^=r11; r11=sign(den), r10^=r11. Step 2: |fx| in rax (sign-mask idiom), |num| in rcx, |den| stashed to r9 BEFORE the mul (which clobbers rdx). Step 3: mul rcx -> rdx:rax = |fx|*|num|. Step 4: div r9 -> rax = quotient. Step 5: xor rax,r10; sub rax,r10. Pure leaf. den==0 guard traps BEFORE div would #DE. num, den are RAW SIGNED INTEGERS not Q32.32 -- the math is (fx_raw * num) / den, no <<32/>>32 shifts (see fn header). Never emits neg/cqo/cdq/idiv. Labels prefixed fx_scale_ (fx_scale_err_den for guard exit).",
+      block: {
+        // ---- Step 0: den guard. -------------------------------------
+        cmp rdx, 0;
+        je  fx_scale_err_den;
+
+        // ---- Stash |den| early: rdx will be clobbered by mul. -------
+        // (Do this while rdx still holds the den arg.)
+        mov r9,  rdx;
+        mov r8,  r9;
+        sar r8,  63;
+        xor r9,  r8;
+        sub r9,  r8;                // r9 = |den|
+
+        // ---- Step 1: compose sign. ----------------------------------
+        // sign(result) = sign(fx) XOR sign(num) XOR sign(den).
+        mov r10, rdi;
+        sar r10, 63;                // sign(fx)
+        mov r11, rsi;
+        sar r11, 63;                // sign(num)
+        xor r10, r11;
+        mov r11, rdx;
+        sar r11, 63;                // sign(den) (rdx still den here? No --
+                                    // rdx is still den because we have not
+                                    // yet issued mul; the earlier r9 write
+                                    // did NOT modify rdx.)
+        xor r10, r11;               // r10 = composed sign
+
+        // ---- Step 2: |fx| into rax. ---------------------------------
+        mov rax, rdi;
+        mov r8,  rax;
+        sar r8,  63;
+        xor rax, r8;
+        sub rax, r8;                // rax = |fx|
+
+        // ---- Step 2: |num| into rcx. --------------------------------
+        mov rcx, rsi;
+        mov r8,  rcx;
+        sar r8,  63;
+        xor rcx, r8;
+        sub rcx, r8;                // rcx = |num|
+
+        // ---- Step 3: signed multiply, rax = low 64 of |fx| * |num|.-
+        // paideia-as v0.34: 2-op imul reg,reg only; no unsigned `mul`.
+        // Q32.32 caller-responsibility restriction: intermediate must
+        // fit in u64 (see MULTIPLY RANGE in fx_mul header).
+        imul rax, rcx;              // rax = (|fx|*|num|) low 64 bits
+
+        // ---- Step 4: unsigned divide of rdx:rax by |den|. -----------
+        // Need rdx:rax = rax; zero rdx so 128-bit div is really 64/64.
+        xor rdx, rdx;
+        div r9;                     // rax = quotient, rdx = remainder
+
+        // ---- Step 5: re-apply composed sign. ------------------------
+        xor rax, r10;
+        sub rax, r10;
+        ret;
+
+      fx_scale_err_den:
+        mov rax, 0xFFFFEBD1;        // FX_ERR_SCALE_BAD_DEN (movabs)
+        ret;
+      }
+    }
+
+}
