@@ -1,22 +1,86 @@
-// src/cell.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/cell.pdx -- postui.M1-003 (paideia-os/postui#3)
 //
-// Cell module: placeholder for the 16-byte Cell wire format landing
-// at M1-003.
+// Cell: 16-byte packed wire format sitting in a Buffer region.
 //
-// docs/design.md §2.1 freezes the Cell wire format at 16 bytes:
+// =============================================================================
+// WIRE FORMAT (docs/design.md §2.1 Cell wire)
+// =============================================================================
 //
-//   [+0]  symbol   [4]u8   up to 4 UTF-8 bytes (one grapheme, §1.5
-//                          width-table approximation for v1)
-//   [+4]  fg       [3]u8   24-bit truecolor
-//   [+7]  bg       [3]u8   24-bit truecolor
-//   [+10] mods     u8      bitflags (see Style::STYLE_MOD_*)
-//   [+11] reserved [5]u8   zero; future 9th modifier / hyperlink id
+// A Cell is exactly 16 bytes on the wire, laid out at byte offsets:
 //
-// At M1-001 this module ships the layout constants only. The Cell
-// struct itself and the byte-level write/compare helpers land at
-// M1-003 (Buffer's own body drives their signature).
+//   [+0..+4)   symbol    u32   up to 4 UTF-8 bytes for one grapheme
+//                              (§1.5 width-table approximation for v1);
+//                              zero-padded if shorter
+//   [+4..+7)   fg        [3]u8 24-bit truecolor (r, g, b), Color-packed
+//   [+7..+10)  bg        [3]u8 24-bit truecolor (r, g, b), Color-packed
+//   [+10..+11) mods      u8    STYLE_MOD_* bitflags (see Style module)
+//   [+11..+16) reserved  [5]u8 zero on the wire; future 9th modifier or
+//                              hyperlink id can extend here without
+//                              breaking the 16-byte size
+//
+// This module lays a Cell out as TWO u64 words in little-endian memory,
+// because 16B does not fit in one x86_64 GPR and every Cell operation
+// naturally addresses memory (the back/front regions are memory-mapped
+// KIND_MEMORY pages, docs/design.md §2.1). Register-mode returning a
+// "packed Cell" was rejected in favor of pointer-based helpers -- the
+// same posture Buffer takes for its own back/front region APIs.
+//
+// The two words break as:
+//
+//   word0 = [dst + 0]  little-endian:
+//     bits [ 0..32)  symbol
+//     bits [32..40)  fg.r
+//     bits [40..48)  fg.g
+//     bits [48..56)  fg.b
+//     bits [56..64)  bg.r
+//
+//   word1 = [dst + 8]  little-endian:
+//     bits [ 0.. 8)  bg.g
+//     bits [ 8..16)  bg.b
+//     bits [16..24)  mods
+//     bits [24..64)  reserved (zero)
+//
+// Interoperability with Color (color.pdx): a Color returned from
+// color_from_rgb is `r | g<<8 | b<<16` in bits [0..24) of a u64. The
+// packing above places fg such that `(fg & 0xFFFFFF) << 32` slots
+// directly into word0 with fg.r landing at byte 4, fg.g at byte 5,
+// fg.b at byte 6 -- no per-channel repacking.
+//
+// Interoperability with Style (style.pdx): a Style is
+// `fg | bg<<24 | mods<<48` (bits [0..24) fg, [24..48) bg, [48..56) mods,
+// [56..64) pad=0). cell_set_style writes the fg/bg/mods span of a Cell
+// (bytes 4..11) as one 8-byte little-endian store; the Style's pad byte
+// (bit 56..64) lands at cell byte 11 (reserved), and its already-zero
+// invariant means the single-store shortcut preserves the reserved-zero
+// contract without a per-byte scan.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Cell`), matches file basename.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - Every mov_b byte-load is preceded by `xor rax, rax` (mov_b does
+//     not zero-extend on its own -- same discipline path.pdx uses).
+//   - All immediates fit imm32 (<= 0x7FFFFFFF): 0xFFFFFF (16777215),
+//     0xFFFF (65535), 0xFF (255), shift counts <= 56.
+//   - No 2-op `imul reg,imm` (paideia-as pitfall). No imul used at all
+//     in this module -- Cell has no multiplicative arithmetic.
+//   - No `test` on register-with-self; branch conditions use cmp reg,0.
+//   - Effect row `!{mem} @{}` wherever memory is touched (which is
+//     every accessor); pure register arithmetic is not present in this
+//     module (Cell is intrinsically pointer-shaped).
+//   - Labels prefixed `cell_eq_` per docs/design.md fingerprint
+//     discipline (only cell_equal needs branch labels).
 
 module Cell = structure {
+
+  // ==========================================================================
+  // Sizing / offset constants (locked at M1-001 scaffold; the M1-003
+  // helpers below index against these named offsets so a downstream
+  // reader can trace every displacement back to docs/design.md §2.1
+  // without reading raw numerals in the body).
+  // ==========================================================================
 
   // Total byte width of one Cell on the wire. Locked at 16 --
   // memory_slot sizing (Buffer, docs/design.md §2.1) computes
@@ -40,5 +104,328 @@ module Cell = structure {
   pub let CELL_LEN_BG       : u64 = 3
   pub let CELL_LEN_MODS     : u64 = 1
   pub let CELL_LEN_RESERVED : u64 = 5
+
+  // ==========================================================================
+  // cell_write(dst, sym, fg, bg, mods) -> ()
+  //
+  // Serialize the four Cell fields into 16 bytes at [dst .. dst+16).
+  // sym is a Unicode codepoint in low 32 bits (bytes stored little-
+  // endian at [dst+0..dst+4)); fg/bg are Color-packed truecolor
+  // triples (Color::color_from_rgb output shape) whose low 24 bits are
+  // laid at bytes [dst+4..dst+7) and [dst+7..dst+10) respectively;
+  // mods is the STYLE_MOD_* bitmask stored at [dst+10]. Bytes
+  // [dst+11..dst+16) (reserved) are explicitly zeroed by the word1
+  // composition below -- the reserved-zero contract is preserved even
+  // if the destination memory held garbage before the call.
+  //
+  // Strategy: build two u64 words, then two 8-byte stores. The wire's
+  // byte 7 (bg.r) straddles the 8-byte boundary, so word0 gets bg's
+  // low byte and word1 gets bg's other two bytes; a small cross-word
+  // pack is cheaper than 10+ individual byte stores.
+  //
+  // Register plan: rdi=dst, rsi=sym, rdx=fg, rcx=bg, r8=mods -- all
+  // caller-save args, freely mutated. rax = word accumulator, r9 =
+  // per-field scratch. No callee-save touched, no push/pop.
+  // ==========================================================================
+
+  pub let cell_write : (u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (sym: u64) (fg: u64) (bg: u64) (mods: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_write serializes (sym, fg, bg, mods) into a 16-byte Cell at [rdi]. Compose word0 = sym[0..32) | fg[0..24)<<32 | bg.r<<56 into rax; store `mov [rdi+0], rax`. Compose word1 = (bg>>8)&0xFFFF | mods<<16 into rax; store `mov [rdi+8], rax`. Sym truncated to 32 bits via shl 32; shr 32 (avoids an imm64 0xFFFFFFFF mask). Every partial value is masked before shifting so an out-of-range field (e.g. fg with junk in bits [24..64)) truncates cleanly rather than bleeding into an adjacent slot. Bytes [rdi+11..rdi+16) receive zero via the top-40 zero bits of word1 -- the reserved-zero invariant holds even if the destination memory was uninitialised. Immediates 0xFFFFFF, 0xFFFF, 0xFF, and shift counts 8/16/24/32/40/56 all fit imm32 (max shift count 56 < 64). No `test`, no `imul`, no callee-save touched, no push/pop. Effect `!{mem}` (two 8-byte stores). Labels: none (straight-line).",
+      block: {
+        // ---- word0 = sym[0..32) | fg<<32 | bg.r<<56 ------------------------
+        // Truncate sym to 32 bits (defensive; keeps a caller with junk in
+        // bits [32..64) from bleeding into fg).
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;
+
+        // fg's low 24 bits into bits [32..56).
+        mov r9,  rdx;
+        and r9,  0xFFFFFF;
+        shl r9,  32;
+        or  rax, r9;
+
+        // bg's low byte (bg.r) into bits [56..64).
+        mov r9,  rcx;
+        and r9,  0xFF;
+        shl r9,  56;
+        or  rax, r9;
+
+        mov [rdi + 0], rax;
+
+        // ---- word1 = (bg>>8)&0xFFFF | mods<<16 -----------------------------
+        // bg's bg.g/bg.b bytes into bits [0..16).
+        mov rax, rcx;
+        shr rax, 8;
+        and rax, 0xFFFF;
+
+        // mods into bits [16..24).
+        mov r9,  r8;
+        and r9,  0xFF;
+        shl r9,  16;
+        or  rax, r9;
+
+        // Bits [24..64) remain zero -> cell bytes [11..16) reserved-zero.
+        mov [rdi + 8], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_symbol(src) -> u64
+  //
+  // Return the Unicode codepoint stored in bytes [src+0..src+4), zero-
+  // extended to u64. Uses mov_d (32-bit load, auto-zero-extends the
+  // upper 32) -- same shape unlink.pdx uses when reading a 32-bit field
+  // from a 16-byte inode entry.
+  // ==========================================================================
+
+  pub let cell_symbol : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_symbol returns the u32 codepoint at [rdi+0]. `xor rax,rax; mov_d rax, [rdi+0]` -- x86_64 auto-zero-extends 32-bit ops, so the xor is defense-in-depth against a paideia-as encoder revision that ever elects a sign-extending form; matches the `xor r8,r8; mov_d r8, [r10]` convention already established in pdxfs_lite/write.pdx (R25-M2-005). Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 4-byte load).",
+      block: {
+        xor rax, rax;
+        mov_d rax, [rdi + 0];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_fg(src) -> u64 (Color-packed)
+  //
+  // Return fg as a Color-packed u64 (r | g<<8 | b<<16 in low 24 bits).
+  // Strategy: load 4 bytes from [src+4] (which includes bytes 4,5,6,7
+  // = fg.r, fg.g, fg.b, bg.r), then mask off byte 7 (bg.r) so only
+  // the fg triple survives.
+  // ==========================================================================
+
+  pub let cell_fg : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_fg returns Color-packed fg from bytes [rdi+4..rdi+7). `xor rax,rax; mov_d rax, [rdi+4]` loads 4 bytes (bytes 4,5,6,7 = fg.r|fg.g<<8|fg.b<<16|bg.r<<24) with defensive pre-zero (matches pdxfs_lite/write.pdx convention). Then `and rax, 0xFFFFFF` masks off byte 7 (bg.r) leaving fg's 3-byte triple in low 24 bits -- matches Color::color_from_rgb output shape exactly. 0xFFFFFF = 16777215 fits imm32. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 4-byte load).",
+      block: {
+        xor rax, rax;
+        mov_d rax, [rdi + 4];
+        and rax, 0xFFFFFF;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_bg(src) -> u64 (Color-packed)
+  //
+  // Return bg as a Color-packed u64. Same strategy as cell_fg with the
+  // load address advanced by 3 bytes: [src+7..src+11) covers bytes 7,
+  // 8, 9, 10 = bg.r, bg.g, bg.b, mods -- mask off byte 10 (mods) to
+  // leave bg's 3-byte triple.
+  // ==========================================================================
+
+  pub let cell_bg : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_bg returns Color-packed bg from bytes [rdi+7..rdi+10). `xor rax,rax; mov_d rax, [rdi+7]` loads bytes 7-10 (bg.r|bg.g<<8|bg.b<<16|mods<<24) with defensive pre-zero. Then `and rax, 0xFFFFFF` masks off byte 10 (mods) leaving bg's 3-byte triple in low 24 bits. The load reaches byte 10 which is a legitimate Cell field, still within the 16-byte allocation -- no OOB concern. 0xFFFFFF fits imm32. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 4-byte load).",
+      block: {
+        xor rax, rax;
+        mov_d rax, [rdi + 7];
+        and rax, 0xFFFFFF;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_mods(src) -> u64
+  //
+  // Return the mods byte at [src+10], zero-extended to u64. Uses the
+  // "xor rax,rax; mov_b rax, [ptr]" idiom manifest.pdxproj lists as
+  // conformance rule `byte-load-zero-then-mov_b` (mov_b does not
+  // zero-extend on its own on x86_64).
+  // ==========================================================================
+
+  pub let cell_mods : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_mods returns the u8 mods byte at [rdi+10] zero-extended to u64. Standard byte-load-zero-then-mov_b idiom (`xor rax,rax; mov_b rax,[rdi+10]`) since mov_b does not zero-extend on x86_64 -- same discipline vnode_pool.pdx uses for its every-byte-copy step. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 1-byte load).",
+      block: {
+        xor rax, rax;
+        mov_b rax, [rdi + 10];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_style(src) -> u64 (Style-packed)
+  //
+  // Return the fg/bg/mods triple as a packed Style word (Style module's
+  // format: fg[0..24) | bg[24..48) | mods[48..56) | pad[56..64)==0).
+  // A caller comparing "same visual attribute?" between two cells can
+  // do one cmp instead of three per-field extracts.
+  //
+  // Strategy: reuse the same three loads cell_fg/cell_bg/cell_mods
+  // would emit, but into three scratch registers, then shift-and-OR
+  // into the Style-packed layout. Byte 11 (reserved) is intentionally
+  // ignored -- the pad byte of the returned Style stays zero regardless
+  // of what garbage byte 11 might hold.
+  //
+  // Register plan: rdi=src, rax=accumulator/return, r8=bg scratch. No
+  // callee-save touched, no push/pop.
+  // ==========================================================================
+
+  pub let cell_style : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_style returns the fg/bg/mods triple as a Style-packed u64 (Style module wire: fg[0..24) | bg[24..48) | mods[48..56) | pad[56..64)==0). Load fg via xor rax + mov_d [rdi+4] + and 0xFFFFFF into rax (low 24 bits). Load bg via xor r8 + mov_d [rdi+7] + and 0xFFFFFF + shl 24 into r8, OR into rax. Load mods via xor r8/mov_b [rdi+10]/shl 48, OR into rax. Every mov_d/mov_b load is preceded by xor of the destination (defense-in-depth for zero-extension, matches pdxfs_lite/write.pdx convention). Pad byte is untouched (implicitly zero, never OR'd in) so the Style contract holds. 0xFFFFFF fits imm32; shift counts 24, 48 fit imm8. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (three loads: two 4-byte + one 1-byte).",
+      block: {
+        // fg -> rax bits [0..24)
+        xor rax, rax;
+        mov_d rax, [rdi + 4];
+        and rax, 0xFFFFFF;
+
+        // bg -> rax bits [24..48)
+        xor r8, r8;
+        mov_d r8, [rdi + 7];
+        and r8, 0xFFFFFF;
+        shl r8, 24;
+        or  rax, r8;
+
+        // mods -> rax bits [48..56)
+        xor r8, r8;
+        mov_b r8, [rdi + 10];
+        shl r8, 48;
+        or  rax, r8;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_set_symbol(dst, sym) -> ()
+  //
+  // Overwrite bytes [dst+0..dst+4) with sym's low 32 bits; fg/bg/mods/
+  // reserved untouched. Uses mov_d (32-bit store) so the neighbouring
+  // fg slot at byte 4 is not clobbered -- a bare 64-bit `mov [rdi], rsi`
+  // would zap fg/bg/mods/half-of-reserved along with the symbol.
+  // ==========================================================================
+
+  pub let cell_set_symbol : (u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (sym: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_set_symbol writes sym's low 32 bits into bytes [rdi+0..rdi+4). Single mov_d [rdi+0], rsi -- the sized store writes exactly 4 bytes, leaving fg/bg/mods at bytes 4..11 and reserved at bytes 11..16 untouched. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 4-byte store).",
+      block: {
+        mov_d [rdi + 0], rsi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_set_style(dst, style) -> ()
+  //
+  // Overwrite bytes [dst+4..dst+11) (fg + bg + mods) from a Style-packed
+  // u64; symbol at [dst+0..dst+4) and reserved at [dst+11..dst+16)
+  // untouched.
+  //
+  // Shortcut: Style's own wire layout (fg[0..24) | bg[24..48) |
+  // mods[48..56) | pad[56..64)) matches, byte-for-byte, the Cell's
+  // bytes 4..12 in little-endian memory. So the entire 7-byte
+  // fg-through-mods span can be written as ONE 8-byte little-endian
+  // store at [dst+4] -- the 8th byte is Style's pad, which is zero
+  // by Style construction, landing at cell byte 11 (reserved), which
+  // must be zero. The two invariants align exactly, letting one
+  // store replace what would otherwise be seven byte-writes.
+  //
+  // Defense in depth: even though style_new masks pad to zero, a
+  // caller with a hand-crafted u64 could set bits [56..64); the
+  // `shl 8; shr 8` pair below zeros them so the reserved byte's
+  // zero invariant is never violated at the pointer level.
+  // ==========================================================================
+
+  pub let cell_set_style : (u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (style: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_set_style writes a Style word into bytes [rdi+4..rdi+11) (fg 4..7, bg 7..10, mods 10..11) plus one zero byte at reserved slot 11. Style's wire (fg[0..24) | bg[24..48) | mods[48..56) | pad[56..64)) maps bit-for-bit to Cell bytes 4..12 in little-endian, so a single `mov [rdi+4], rax` suffices after zeroing the pad byte defensively via shl 8 / shr 8 (guarantees byte 11 lands as zero even if a caller hand-crafted a Style with junk in bits [56..64)). Bytes 12..15 (still reserved) are not touched by this write -- they retain whatever the surrounding writer (cell_write) already zeroed them to. Immediates: shift counts 8 fit imm8. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (one 8-byte store).",
+      block: {
+        mov rax, rsi;
+        shl rax, 8;
+        shr rax, 8;
+        mov [rdi + 4], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_copy(dst, src) -> ()
+  //
+  // Copy 16 bytes from src to dst. Two 8-byte loads + two 8-byte stores;
+  // no per-byte loop -- Cell is a fixed 16-byte record, always aligned
+  // as a Buffer index times 16, so a scalar two-qword copy is both
+  // simplest and fastest for the typical single-cell copy case
+  // (buffer_set's inner op).
+  // ==========================================================================
+
+  pub let cell_copy : (u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (src: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_copy moves 16 bytes from [rsi] to [rdi] as two 8-byte load/store pairs. rax is the transit register. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (two loads + two stores).",
+      block: {
+        mov rax, [rsi + 0];
+        mov [rdi + 0], rax;
+        mov rax, [rsi + 8];
+        mov [rdi + 8], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // cell_equal(a, b) -> u64
+  //
+  // Return 1 if the 16 bytes at [a] equal the 16 bytes at [b], else 0.
+  // Used by the kernel-side (postui#4+) diff step to decide whether a
+  // back-buffer cell differs from the last-emitted front-buffer cell;
+  // a cheap dirty-check without unpacking either cell into fields.
+  //
+  // Reserved bytes are compared verbatim -- if a caller broke the
+  // reserved-zero invariant on one side but not the other, cell_equal
+  // will (correctly) report inequality.
+  //
+  // Register plan: rdi=a, rsi=b, rax=word-under-test/return, r8=b's
+  // word for the cmp. No callee-save touched, no push/pop. Labels
+  // prefixed `cell_eq_` per docs/design.md fingerprint discipline.
+  // ==========================================================================
+
+  pub let cell_equal : (u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): cell_equal compares 16 bytes at [rdi] and [rsi] as two u64 pairs. Load a's word0 into rax, b's word0 into r8, cmp -- jne cell_eq_no. Same for words at +8. Fall-through returns rax=1; cell_eq_no returns xor rax,rax=0. Reserved bytes participate in the compare, which is intentional (they should be zero on both sides and a caller that broke that invariant on one side deserves to see inequality). No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop. Immediates: 1 fits imm32. Effect `!{mem}` (four loads). Labels: cell_eq_no per docs fingerprint discipline.",
+      block: {
+        mov rax, [rdi + 0];
+        mov r8,  [rsi + 0];
+        cmp rax, r8;
+        jne cell_eq_no;
+
+        mov rax, [rdi + 8];
+        mov r8,  [rsi + 8];
+        cmp rax, r8;
+        jne cell_eq_no;
+
+        mov rax, 1;
+        ret;
+
+      cell_eq_no:
+        xor rax, rax;
+        ret;
+      }
+    }
 
 }

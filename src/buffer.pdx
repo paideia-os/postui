@@ -1,27 +1,92 @@
-// src/buffer.pdx -- postui.M1-001 scaffold (paideia-os/postui#1)
+// src/buffer.pdx -- postui.M1-003 (paideia-os/postui#3)
 //
-// Buffer module: placeholder for the back/front region layout landing
-// at M1-003.
+// Buffer: back/front region layout over a KIND_TUI_CANVAS memory_slot.
 //
-// docs/design.md §2.1 fixes the backing buffer as
+// =============================================================================
+// REGION LAYOUT (docs/design.md §2.1 Backing buffer)
+// =============================================================================
 //
-//   [0, N)     back buffer  — client-writable scratch
-//   [N, 2N)    front buffer — kernel-owned "last emitted" snapshot
+// A canvas's KIND_MEMORY parent slot is sized `2 * rows * cols *
+// CELL_BYTES` and mapped writable into the client's address space at
+// mint. The two regions live back-to-back:
 //
-// with N = rows * cols * CELL_BYTES. A 240x67 terminal costs
-// N = 257,280 bytes; two such regions ~500 KiB per canvas.
+//   [0, N)     back buffer  -- client-writable scratch; every widget's
+//                             draw() writes here every frame
+//   [N, 2N)    front buffer -- kernel-owned "last emitted" snapshot; a
+//                             client MAY read (e.g. for its own local
+//                             diff heuristics) but MUST NOT write --
+//                             the diff-and-emit path in cap_handler_
+//                             tui_canvas (TUI_OP_PRESENT, kernel-side)
+//                             is the sole authority that copies back
+//                             into front once a frame lands on the
+//                             underlying TTY.
 //
-// M1-003 will land the pointer-plus-stride helpers and the
-// buffer_write_cell / buffer_read_cell primitives. M1-001 only
-// captures the region-offset constants a downstream Frame / driver
-// path (M1-005) can key against without waiting for the M1-003 body.
+// where N = rows * cols * CELL_BYTES = rows * cols * 16. A 240x67 canvas
+// costs N = 257,280 bytes; two such regions ~500 KiB per canvas.
+//
+// Cells are stored row-major within each region: the cell at logical
+// (x=col, y=row) lives at byte offset
+//
+//     (y * cols + x) * CELL_BYTES
+//
+// from the region base. `x` and `y` are validated by the caller against
+// the same `cols` / `rows` bounds the mint gate stamped into the cap
+// row -- Buffer is a pointer-arithmetic layer, not a bounds enforcer.
+//
+// =============================================================================
+// WHY POINTER-BASED
+// =============================================================================
+//
+// Every Buffer helper takes and returns raw addresses because a Cell is
+// 16 bytes -- wider than a single GPR -- and the region always lives in
+// memory-mapped KIND_MEMORY pages, never in registers. The one-store-
+// per-cell hot path (buffer_clear, buffer_set) copies from a client-
+// provided source Cell pointer, letting the caller compose the source
+// once (via Cell::cell_write into a stack slot) and stamp it into many
+// buffer cells with only load/store traffic. This mirrors the
+// discipline docs/design.md §2.1 sets for the userspace half: user
+// space always writes full back-buffer cells; the kernel decides what
+// actually changed at PRESENT time.
+//
+// The immediate-mode diff-and-present shape (`buffer_diff_present`) is
+// intentionally NOT provided here. Per docs/design.md §2.1, the
+// back-vs-front diff and the resulting SGR/cursor emit path is
+// kernel-side (TUI_OP_PRESENT, op 0 of cap_handler_tui_canvas). A
+// user-space PRESENT trampoline is just `cap_invoke(canvas_cap,
+// TUI_OP_PRESENT, 0)` and lands with the rest of the client bindings
+// at postui#4 (src/tui_canvas_client.pdx).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Buffer`), matches file basename.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - All immediates fit imm32: 16 (CELL_BYTES), 5 (shift), 4 (shift).
+//   - 2-op `imul reg, reg` only (paideia-as pitfall: 2-op `imul reg,imm`
+//     is NOT used).
+//   - Effect row `!{}` on pure address arithmetic (buffer_at,
+//     buffer_at_front, buffer_region_bytes, buffer_bytes) -- these
+//     compute addresses without dereferencing them. `!{mem}` on
+//     buffer_set/buffer_clear which write through the returned pointer.
+//   - Labels prefixed `buf_` per docs/design.md fingerprint discipline
+//     (only buffer_clear needs branch labels).
 
 module Buffer = structure {
 
+  // ==========================================================================
   // Region ordinals inside the backing memory_slot. The mint gate
   // (docs/design.md §2.1 KIND_TUI_CANVAS mint) validates the total
   // slot byte-length is >= 2 * rows * cols * CELL_BYTES; the layout
   // below is what the kernel diff path (TUI_OP_PRESENT) walks.
+  //
+  // These ordinals are consumed by buffer_at_region-shape callers
+  // (none in postui#3 -- back is served by buffer_at, front by
+  // buffer_at_front). The ordinals stay exported so postui#4's cap
+  // client and future kernel-side selftests can name regions by
+  // ordinal rather than magic 0/1.
+  // ==========================================================================
+
   pub let BUFFER_REGION_BACK  : u64 = 0
   pub let BUFFER_REGION_FRONT : u64 = 1
 
@@ -30,5 +95,241 @@ module Buffer = structure {
   // wire and bump the postui version, not add a third region under
   // the same cap kind.
   pub let BUFFER_REGION_COUNT : u64 = 2
+
+  // Byte width of one Cell. Re-exported so a Buffer caller does not
+  // have to `import Cell` just to size its own scratch slot. Locked
+  // at 16 and matched to Cell::CELL_BYTES; a divergence between the
+  // two constants would corrupt the region layout, which is why
+  // both modules read the same numeric literal from docs/design.md
+  // §2.1 rather than one importing the other's value.
+  pub let BUFFER_CELL_BYTES : u64 = 16
+
+  // ==========================================================================
+  // buffer_region_bytes(rows, cols) -> u64
+  //
+  // Return the byte width of one region = rows * cols * CELL_BYTES.
+  // A caller sizing per-region math (e.g. computing the front region
+  // base without re-computing rows*cols) goes through this rather
+  // than re-inlining the multiply.
+  //
+  // Upper bound: RECT_DIM_MAX = 4096 in both directions (docs/design.md
+  // §2.1 TUI_DIM_MAX). 4096 * 4096 * 16 = 268_435_456 = 2^28 -- well
+  // within u64 range; overflow is not a concern within the sanctioned
+  // dimension envelope.
+  // ==========================================================================
+
+  pub let buffer_region_bytes : (u64, u64) -> u64 !{} @{} =
+    fn (rows: u64) (cols: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_region_bytes returns rows * cols * 16. rax = rows; imul rax, rsi (rows*cols); shl rax, 4 (*16). 2-op `imul reg, reg` (paideia-as-safe; 2-op `imul reg, imm` is the pitfall shape and is NOT used). Shift count 4 fits imm8. Pure leaf: no memory access, no callee-save touched, no push/pop. Effect `!{} @{}` (pure register arithmetic).",
+      block: {
+        mov rax, rdi;
+        imul rax, rsi;
+        shl rax, 4;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buffer_bytes(rows, cols) -> u64
+  //
+  // Return the total byte width of both regions = 2 * rows * cols *
+  // CELL_BYTES. This is exactly the size the KIND_TUI_CANVAS mint gate
+  // validates against the parent memory_slot (docs/design.md §2.1);
+  // client code that mints a canvas can call this to size the underlying
+  // KIND_MEMORY allocation.
+  // ==========================================================================
+
+  pub let buffer_bytes : (u64, u64) -> u64 !{} @{} =
+    fn (rows: u64) (cols: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_bytes returns 2 * rows * cols * 16. rax = rows; imul rax, rsi (rows*cols); shl rax, 5 (* 32 = * 2 * 16 folded into one shift). 2-op `imul reg, reg` only. Shift count 5 fits imm8. Pure leaf: no memory access, no callee-save touched, no push/pop. Effect `!{} @{}`.",
+      block: {
+        mov rax, rdi;
+        imul rax, rsi;
+        shl rax, 5;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buffer_at(buf_ptr, rows, cols, x, y) -> u64  (cell pointer)
+  //
+  // Return the address of the cell at (x, y) in the BACK region.
+  // Offset formula: buf_ptr + (y * cols + x) * 16.
+  //
+  // The `rows` argument is unused by this specific function -- the back
+  // region starts at buf_ptr + 0, so `rows` never enters the arithmetic.
+  // It is kept in the signature for API uniformity with buffer_at_front
+  // (which does need rows to skip past the back region) and with any
+  // future buffer_at_region variant. Passing an unused rows argument
+  // costs one register move at the call site and buys API symmetry
+  // between "back" and "front" address computation -- worth the cost.
+  //
+  // Bounds discipline: no bounds check here. Every producer of an
+  // (x, y) pair (Frame::draw, widget_draw dispatch) already clamps
+  // against the canvas's stamped rows/cols; adding another gate here
+  // would double-charge every cell write for no marginal safety.
+  //
+  // Register plan: rdi=buf_ptr, rsi=rows (unused), rdx=cols, rcx=x,
+  // r8=y. rax = offset accumulator / return. No callee-save touched,
+  // no push/pop.
+  // ==========================================================================
+
+  pub let buffer_at : (u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (buf_ptr: u64) (rows: u64) (cols: u64) (x: u64) (y: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_at returns buf_ptr + (y*cols + x)*16. rax = y (r8); imul rax, rdx (y*cols); add rax, rcx (+x); shl rax, 4 (*16); add rax, rdi (+buf_ptr). rows (rsi) is deliberately unused: back region starts at buf_ptr+0. 2-op `imul reg, reg` only (paideia-as-safe). Shift count 4 fits imm8. Pure leaf: no memory access (returns an address, never dereferences it), no callee-save touched, no push/pop. Effect `!{} @{}` (pure register arithmetic).",
+      block: {
+        mov rax, r8;
+        imul rax, rdx;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rdi;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buffer_at_front(buf_ptr, rows, cols, x, y) -> u64  (cell pointer)
+  //
+  // Return the address of the cell at (x, y) in the FRONT region.
+  // Offset formula: buf_ptr + rows*cols*16 + (y*cols + x)*16
+  //                = buf_ptr + N + (y*cols + x)*16
+  //
+  // N = one region's byte width, computed inline rather than via a
+  // call to buffer_region_bytes to avoid a needless call frame for
+  // what is a hot per-cell address computation (PRESENT-time scan
+  // walks every cell in a dirty row).
+  //
+  // Register plan: rdi=buf_ptr, rsi=rows, rdx=cols, rcx=x, r8=y.
+  // rax = front_base accumulator; r9 = per-cell offset scratch. No
+  // callee-save touched, no push/pop.
+  // ==========================================================================
+
+  pub let buffer_at_front : (u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (buf_ptr: u64) (rows: u64) (cols: u64) (x: u64) (y: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_at_front returns buf_ptr + rows*cols*16 + (y*cols + x)*16. Phase 1 (front region base): rax = rows (rsi); imul rax, rdx (rows*cols); shl rax, 4 (*16 = N); add rax, rdi (front_base). Phase 2 (per-cell offset): r9 = y (r8); imul r9, rdx (y*cols); add r9, rcx (+x); shl r9, 4 (*16). Phase 3: add rax, r9. 2-op `imul reg, reg` only. Shift count 4 fits imm8. Pure leaf: no memory access, no callee-save touched, no push/pop. Effect `!{} @{}`.",
+      block: {
+        // front_base = buf_ptr + rows * cols * 16
+        mov rax, rsi;
+        imul rax, rdx;
+        shl rax, 4;
+        add rax, rdi;
+
+        // per-cell offset = (y * cols + x) * 16
+        mov r9, r8;
+        imul r9, rdx;
+        add r9, rcx;
+        shl r9, 4;
+
+        add rax, r9;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buffer_set(buf_ptr, rows, cols, x, y, src_cell) -> ()
+  //
+  // Copy 16 bytes from [src_cell] into the BACK cell at (x, y). The
+  // caller is expected to have built a Cell in scratch (via
+  // Cell::cell_write into a stack slot) and passes its address as
+  // src_cell. rows is unused (back region starts at buf_ptr+0), kept
+  // for signature symmetry with buffer_at.
+  //
+  // Register plan: rdi=buf_ptr, rsi=rows (unused), rdx=cols, rcx=x,
+  // r8=y, r9=src_cell. rax = destination address; r10 = transit
+  // register for the two 8-byte copy pairs. No callee-save touched,
+  // no push/pop.
+  // ==========================================================================
+
+  pub let buffer_set : (u64, u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (buf_ptr: u64) (rows: u64) (cols: u64) (x: u64) (y: u64) (src_cell: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_set copies 16 bytes from [r9] to buf_ptr + (y*cols + x)*16 (back region cell at x,y). Phase 1 compute dst: rax = y (r8); imul rax, rdx (y*cols); add rax, rcx (+x); shl rax, 4 (*16); add rax, rdi (+buf_ptr). Phase 2 copy: two 8-byte load/store pairs through r10. 2-op `imul reg, reg` only. Shift count 4 fits imm8. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (two loads + two stores; the load-side reads through src_cell so the effect covers both sides).",
+      block: {
+        // dst = buf_ptr + (y*cols + x)*16
+        mov rax, r8;
+        imul rax, rdx;
+        add rax, rcx;
+        shl rax, 4;
+        add rax, rdi;
+
+        // copy 16 bytes from [r9] to [rax]
+        mov r10, [r9 + 0];
+        mov [rax + 0], r10;
+        mov r10, [r9 + 8];
+        mov [rax + 8], r10;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buffer_clear(buf_ptr, rows, cols, src_cell) -> ()
+  //
+  // Fill every cell of the BACK region with a copy of [src_cell]. Used
+  // by widgets that stamp a background (e.g. Clear widget, Block's
+  // padding fill) and by Frame::init to prime a fresh canvas with a
+  // reset-style whitespace cell before the first present.
+  //
+  // Implementation: load src_cell's two 8-byte words ONCE into r10/r11
+  // (bg-invariant across the loop), then stride the destination in
+  // 16-byte steps. N = rows*cols*16 is the total region byte width;
+  // r9 walks 0..N in step 16.
+  //
+  // Cost bound: worst case at RECT_DIM_MAX (4096x4096) is 16_777_216
+  // cell writes = 33_554_432 mov instructions. This is a boot-time
+  // path (Frame::init), a resize path (TUI_OP_RESIZE follow-up), or
+  // a widget clear -- never a per-frame hot loop for a typical app,
+  // which incrementally overwrites only the cells its widgets touch.
+  //
+  // Register plan: rdi=buf_ptr, rsi=rows, rdx=cols, rcx=src_cell.
+  // rax = free (unused, could carry a return sentinel if needed).
+  // r8 = N (loop bound). r9 = offset walker. r10 = src word0. r11 =
+  // src word1. No callee-save touched, no push/pop.
+  //
+  // Labels prefixed `buf_clr_` per docs/design.md fingerprint
+  // discipline.
+  // ==========================================================================
+
+  pub let buffer_clear : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (buf_ptr: u64) (rows: u64) (cols: u64) (src_cell: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M1-003 (#3): buffer_clear fills the back region (rows*cols cells) with a copy of [rcx]. Hoist src_cell's two 8-byte words into r10/r11 ONCE before the loop (invariant). Compute N = rows*cols*16 into r8 via `mov r8,rsi; imul r8,rdx; shl r8,4`. Loop: r9 walks 0..N in step 16; each iteration writes r10 to [rdi+r9+0] and r11 to [rdi+r9+8]. Terminate when r9 >= N via cmp/jae (no `test`, no `cmp reg,0` on the loop bound). 2-op `imul reg, reg` only. Every immediate (0, 8, 16, plus shift counts 4) fits imm32/imm8. Pure leaf: no callee-save touched, no push/pop. Effect `!{mem}` (two source loads plus 2*rows*cols stores). Labels: buf_clr_top / buf_clr_done per docs fingerprint discipline.",
+      block: {
+        // Hoist source cell out of memory (invariant across the loop).
+        mov r10, [rcx + 0];
+        mov r11, [rcx + 8];
+
+        // N = rows * cols * 16
+        mov r8, rsi;
+        imul r8, rdx;
+        shl r8, 4;
+
+        // r9 = 0 (byte offset walker)
+        xor r9, r9;
+
+      buf_clr_top:
+        cmp r9, r8;
+        jae buf_clr_done;
+
+        mov [rdi + r9 + 0], r10;
+        mov [rdi + r9 + 8], r11;
+
+        add r9, 16;
+        jmp buf_clr_top;
+
+      buf_clr_done:
+        ret;
+      }
+    }
 
 }
