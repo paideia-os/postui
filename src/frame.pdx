@@ -190,7 +190,7 @@ module Frame = structure {
   pub let FRAME_OFF_RESERVED   : u64 = 56
 
   // ==========================================================================
-  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB80
+  // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB90
   // (the wave-scoped high-nibble discriminator every postui-side error
   // shares -- disjoint from the kernel KIND_TUI_CANVAS band at
   // 0xFFFFEB10..0xFFFFEB1F per src/lib.pdx). A consumer can shift a
@@ -201,12 +201,12 @@ module Frame = structure {
   // movabs encoding (block.pdx §block_spec_init justification confirms
   // paideia-as handles this via the same shape).
   // ==========================================================================
-  pub let FRAME_ERR_NOT_INITIALIZED : u64 = 0xFFFFEB80
-  pub let FRAME_ERR_QUERY_ROWS      : u64 = 0xFFFFEB82
-  pub let FRAME_ERR_QUERY_COLS      : u64 = 0xFFFFEB83
-  pub let FRAME_ERR_QUERY_TTY_ID    : u64 = 0xFFFFEB84
-  pub let FRAME_ERR_PRESENT         : u64 = 0xFFFFEB86
-  pub let FRAME_ERR_NO_DRAW_CB      : u64 = 0xFFFFEB88
+  pub let FRAME_ERR_NOT_INITIALIZED : u64 = 0xFFFFEB90
+  pub let FRAME_ERR_QUERY_ROWS      : u64 = 0xFFFFEB92
+  pub let FRAME_ERR_QUERY_COLS      : u64 = 0xFFFFEB93
+  pub let FRAME_ERR_QUERY_TTY_ID    : u64 = 0xFFFFEB94
+  pub let FRAME_ERR_PRESENT         : u64 = 0xFFFFEB96
+  pub let FRAME_ERR_NO_DRAW_CB      : u64 = 0xFFFFEB98
 
   // ==========================================================================
   // Sentinels for frame_run. FRAME_RUN_FOREVER = 0xFFFFFFFFFFFFFFFF
@@ -282,7 +282,7 @@ module Frame = structure {
     fn (canvas_cap: u64) -> unsafe {
       effects: {mem, sysreg},
       capabilities: {cap},
-      justification: "postui.M1-005 (#5): terminal_init probes the bound TTY via tcc_query_tty_id, queries rows/cols via tcc_query_rows/tcc_query_cols, and stamps _terminal_state (state=INITIALIZED on OK; state=FAULTED + FRAME_ERR_QUERY_* return on refusal). 5-push callee-save prologue (rbx=canvas_cap, r12=state_ptr, r13/r14/r15 reserved) = 40 B -> rsp%16==0 (SysV entry rsp%16==8, +40 aligns). Every nested call sees the aligned stack. Phase 1 (tty_id probe): mov rdi, rbx; call tcc_query_tty_id; store rax at [r12+FRAME_OFF_TTY_ID=48]. A legitimately minted canvas always returns a positive tty_id (the mint gate at cap_handler_tui_canvas validates tty_slot via tty_tail_valid, and tuih_op_qttyid forwards to tty_row_id which returns non-zero for a live row). rax==0 is treated as a probe refusal -> jmp tm_init_fault_ttyid. TCC_ERR_* sentinels (band 0xFFFFEB1x, well above FRAME_DIM_MAX=4096) also fall through to the rows/cols validation below where they are trapped. Phase 2 (query rows): mov rdi, rbx; call tcc_query_rows; cmp rax, 0; je tm_init_fault_rows (probe refusal); cmp rax, 4096; ja tm_init_fault_rows (TCC_ERR_* sentinel or garbage). On OK store rax at [r12+FRAME_OFF_ROWS=24]. Phase 3 (query cols): identical shape, storing at [r12+FRAME_OFF_COLS=32]. Phase 4 (commit): store canvas_cap at [r12+FRAME_OFF_CANVAS_CAP=16]; store FRAME_INPUT_SYS_READ_FALLBACK=2 at [r12+FRAME_OFF_INPUT_PATH=8] (per §2.5 the fallback is the only landed path at M1-005; M4-007 switches to KIND_TTY once paideia-os #1986 lands); store FRAME_STATE_INITIALIZED=1 at [r12+FRAME_OFF_STATE=0] STRICTLY LAST so a mid-init failure never leaves the state slot at INITIALIZED. Return xor rax, rax (0=OK). 5-pop epilogue in reverse push order. Fault paths: store FRAME_STATE_FAULTED=2 at [r12+0]; mov rax, FRAME_ERR_*; 5-pop; ret. Every immediate in cmp/and fits imm32 (0, 4096); every error sentinel and every state ordinal is loaded via mov reg, imm (imm >= 0xFFFFEB80 forces paideia-as to emit the 10-byte movabs form -- legal for mov, NOT for cmp/and -- same pattern block_spec_init already uses). No `test`. No `imul`. Cross-module calls (tcc_query_tty_id/rows/cols) are all SysV leafs per tui_canvas_client.pdx wrappers so no additional stack pad needed. Labels prefixed tm_ per docs fingerprint discipline.",
+      justification: "postui.M1-005 (#5): terminal_init probes the bound TTY via tcc_query_tty_id, queries rows/cols via tcc_query_rows/tcc_query_cols, and stamps _terminal_state (state=INITIALIZED on OK; state=FAULTED + FRAME_ERR_QUERY_* return on refusal). 5-push callee-save prologue (rbx=canvas_cap, r12=state_ptr, r13/r14/r15 reserved) = 40 B -> rsp%16==0 (SysV entry rsp%16==8, +40 aligns). Every nested call sees the aligned stack. Phase 1 (tty_id probe): mov rdi, rbx; call tcc_query_tty_id; store rax at [r12+FRAME_OFF_TTY_ID=48]. A legitimately minted canvas always returns a positive tty_id (the mint gate at cap_handler_tui_canvas validates tty_slot via tty_tail_valid, and tuih_op_qttyid forwards to tty_row_id which returns non-zero for a live row). rax==0 is treated as a probe refusal -> jmp tm_init_fault_ttyid. TCC_ERR_* sentinels (band 0xFFFFEB1x, well above FRAME_DIM_MAX=4096) also fall through to the rows/cols validation below where they are trapped. Phase 2 (query rows): mov rdi, rbx; call tcc_query_rows; cmp rax, 0; je tm_init_fault_rows (probe refusal); cmp rax, 4096; ja tm_init_fault_rows (TCC_ERR_* sentinel or garbage). On OK store rax at [r12+FRAME_OFF_ROWS=24]. Phase 3 (query cols): identical shape, storing at [r12+FRAME_OFF_COLS=32]. Phase 4 (commit): store canvas_cap at [r12+FRAME_OFF_CANVAS_CAP=16]; store FRAME_INPUT_SYS_READ_FALLBACK=2 at [r12+FRAME_OFF_INPUT_PATH=8] (per §2.5 the fallback is the only landed path at M1-005; M4-007 switches to KIND_TTY once paideia-os #1986 lands); store FRAME_STATE_INITIALIZED=1 at [r12+FRAME_OFF_STATE=0] STRICTLY LAST so a mid-init failure never leaves the state slot at INITIALIZED. Return xor rax, rax (0=OK). 5-pop epilogue in reverse push order. Fault paths: store FRAME_STATE_FAULTED=2 at [r12+0]; mov rax, FRAME_ERR_*; 5-pop; ret. Every immediate in cmp/and fits imm32 (0, 4096); every error sentinel and every state ordinal is loaded via mov reg, imm (imm >= 0xFFFFEB90 forces paideia-as to emit the 10-byte movabs form -- legal for mov, NOT for cmp/and -- same pattern block_spec_init already uses). No `test`. No `imul`. Cross-module calls (tcc_query_tty_id/rows/cols) are all SysV leafs per tui_canvas_client.pdx wrappers so no additional stack pad needed. Labels prefixed tm_ per docs fingerprint discipline.",
       block: {
         push rbx;
         push r12;
@@ -336,7 +336,7 @@ module Frame = structure {
       tm_init_fault_ttyid:
         mov rax, 2;
         mov [r12 + 0], rax;                  // state = FAULTED
-        mov rax, 0xFFFFEB84;                 // FRAME_ERR_QUERY_TTY_ID
+        mov rax, 0xFFFFEB94;                 // FRAME_ERR_QUERY_TTY_ID
         pop r15;
         pop r14;
         pop r13;
@@ -347,7 +347,7 @@ module Frame = structure {
       tm_init_fault_rows:
         mov rax, 2;
         mov [r12 + 0], rax;                  // state = FAULTED
-        mov rax, 0xFFFFEB82;                 // FRAME_ERR_QUERY_ROWS
+        mov rax, 0xFFFFEB92;                 // FRAME_ERR_QUERY_ROWS
         pop r15;
         pop r14;
         pop r13;
@@ -358,7 +358,7 @@ module Frame = structure {
       tm_init_fault_cols:
         mov rax, 2;
         mov [r12 + 0], rax;                  // state = FAULTED
-        mov rax, 0xFFFFEB83;                 // FRAME_ERR_QUERY_COLS
+        mov rax, 0xFFFFEB93;                 // FRAME_ERR_QUERY_COLS
         pop r15;
         pop r14;
         pop r13;
@@ -489,19 +489,19 @@ module Frame = structure {
         ret;
 
       fr_render_bad:
-        mov rax, 0xFFFFEB80;                 // FRAME_ERR_NOT_INITIALIZED
+        mov rax, 0xFFFFEB90;                 // FRAME_ERR_NOT_INITIALIZED
         pop rbx;
         ret;
 
       fr_render_no_cb:
-        mov rax, 0xFFFFEB88;                 // FRAME_ERR_NO_DRAW_CB
+        mov rax, 0xFFFFEB98;                 // FRAME_ERR_NO_DRAW_CB
         pop rbx;
         ret;
 
       fr_render_present_err:
         mov rax, 2;
         mov [rbx + 0], rax;                  // state = FAULTED
-        mov rax, 0xFFFFEB86;                 // FRAME_ERR_PRESENT
+        mov rax, 0xFFFFEB96;                 // FRAME_ERR_PRESENT
         pop rbx;
         ret;
       }
