@@ -1,0 +1,885 @@
+// src/widgets/table.pdx -- postui.M2-006 (paideia-os/postui#15)
+//
+// Table widget: column-constrained tabular rendering + row selection state.
+//
+// =============================================================================
+// SCOPE (docs/design.md §2.6 widget catalog Table; §5.1 M2-006)
+// =============================================================================
+//
+// Table is the first widget in the catalog that composes two subordinate
+// modules (Layout M2-001 for column widths + Text M2-002 for Span/Line
+// primitives) plus a stateful side-channel (TableState) whose selection
+// index survives across frames. It is the archetypal caller pattern for
+// Layout's Horizontal split (docs/design.md §1.3): a Table's per-column
+// widths are computed via layout_split(rect, Horizontal, constraints,
+// column_count, out_column_rects[]) at every frame, then each column
+// Rect is rendered as an independent, non-overlapping vertical strip.
+//
+// This module lands three data records + three constructor/accessor
+// leaves + two render-shape functions:
+//
+//   TableSpec    (80 B) : rect, rows_ptr, row_count, constraints_ptr,
+//                         column_count, header_ptr, state_ptr,
+//                         highlight_style, default_style, reserved(8).
+//   TableRow     (16 B) : cells_ptr, cell_count. Each cell is a Span
+//                         (Text::TEXT_SPAN_BYTES = 24 B); cells_ptr is
+//                         the base of an array of Spans (stride 24 B),
+//                         cell_count is the number of Spans in that
+//                         array.
+//   TableState   (24 B) : selected_row, offset, _reserved. Owned by the
+//                         caller and survives across frames.
+//
+//   table_state_init(slot, selected, offset)   -> ()
+//   table_state_selected(state_ptr)            -> u64
+//   table_state_offset(state_ptr)              -> u64
+//
+//   table_draw(spec_ptr, buf_ptr, rows, cols)  -> u64
+//   table_view_pack(spec_ptr, dst)             -> u64  (record_len)
+//
+// table_draw follows the widget_draw ABI shape (spec, buf, rows, cols)
+// -> u64 -- identical to block_draw so WidgetKind's M1-007 dispatch can
+// route WK_TABLE straight through with the standard four-mov shift the
+// WK_BLOCK arm already performs (see widget_kind.pdx wk_wd_block).
+//
+// =============================================================================
+// TABLESPEC WIRE (80 bytes, TABLE_SPEC_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   rect              u64 packed Rect (x/y/w/h per Rect wire)
+//   [+ 8..+16)   rows_ptr          u64 base of TableRow[row_count]
+//   [+16..+24)   row_count         u64 number of rows in rows_ptr[]
+//   [+24..+32)   constraints_ptr   u64 base of Layout Constraint[column_count]
+//                                       (each entry is one packed
+//                                        constraint u64 per layout.pdx wire)
+//   [+32..+40)   column_count      u64 number of columns (bounded by
+//                                       TABLE_MAX_COLUMNS = 32; see
+//                                       stack-allocation note below)
+//   [+40..+48)   header_ptr        u64 optional Line* for column headers
+//                                       (0 = no header row, saves one
+//                                        visible row of body space)
+//   [+48..+56)   state_ptr         u64 TableState* (24 B slot in caller
+//                                       memory; survives across frames)
+//   [+56..+64)   highlight_style   u64 packed Style for the selected row
+//                                       (overrides each cell's own span
+//                                        style; matches Ratatui's Table
+//                                        highlight semantic)
+//   [+64..+72)   default_style     u64 packed Style for the header row
+//                                       (each body span uses its own
+//                                        span.style unless selected;
+//                                        default_style is the header
+//                                        fallback and a documented
+//                                        anchor for a future revision
+//                                        that unifies non-styled body
+//                                        cells to a single visual)
+//   [+72..+80)   reserved          u64 zero on the wire; a future
+//                                       column-header-height field or
+//                                       row-height selector extends
+//                                       here without breaking the
+//                                       80-byte size.
+//
+// 80 bytes = 5 x 16-byte pairs; sits on a natural cache-line-friendly
+// boundary and leaves 8 bytes of headroom for the next-revision field
+// the WRAP notes above call out.
+//
+// =============================================================================
+// TABLEROW WIRE (16 bytes, TABLE_ROW_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   cells_ptr   base of Span[cell_count] (stride 24 bytes
+//                             per Text::TEXT_SPAN_BYTES)
+//   [+ 8..+16)   cell_count  number of Spans in cells_ptr[]
+//
+// A row with cell_count < spec.column_count renders only its populated
+// columns; the remaining columns retain whatever the buffer held before
+// the draw (typically the surrounding widget's fill). This matches
+// Ratatui's Table which never zero-pads short rows.
+//
+// Row height at v1 is a hard-coded 1 cell -- the task text explicitly
+// pins the row-height contract at this landing. A per-row row_height
+// field lands in the reserved slot of TABLESPEC when the tree widget's
+// (M4-002) variable-row-height posture demands it.
+//
+// =============================================================================
+// TABLESTATE WIRE (24 bytes, TABLE_STATE_BYTES)
+// =============================================================================
+//
+//   [+ 0..+ 8)   selected_row   absolute row index (0..row_count) of the
+//                                highlighted row; a value >= row_count
+//                                simply means no row is highlighted for
+//                                this frame (documented no-op semantic).
+//   [+ 8..+16)   offset         first row index rendered in the viewport;
+//                                the visible-rows window is
+//                                [offset .. min(offset + body_h, row_count)).
+//   [+16..+24)   _reserved      zero at v1; a future scroll-momentum
+//                                / last-input-time tick extends here.
+//
+// TableState is owned by the caller (typically a stack slot the
+// enclosing app declares once and keeps live for the whole session).
+// The caller mutates selected_row / offset in response to input; this
+// module does not itself scroll or select. table_draw reads the state
+// verbatim.
+//
+// =============================================================================
+// COLUMN-COUNT BOUND
+// =============================================================================
+//
+// TABLE_MAX_COLUMNS = 32. The bound stack-allocates the per-column Rect
+// scratch at 32 * 8 = 256 bytes -- one Rect u64 per column (layout_split
+// writes packed Rects), same shape Layout's own scratch uses. A caller
+// exceeding 32 columns hits TBL_ERR_BAND at the pre-call validation
+// gate; a real TUI dashboard rarely runs past 12 columns even for wide
+// terminals, and the alternative (dynamic sizing via a caller-provided
+// scratch pointer) would fossilize a resource-management contract at
+// M2-006 for a case no real caller has yet demanded.
+//
+// =============================================================================
+// TBVW@0.1 SEMANTIC-PIPE RECORD (fixed 40 bytes)
+// =============================================================================
+//
+//   [+ 0..+ 4)   magic          u32 = 0x57564254  ("TBVW" little-endian)
+//   [+ 4..+ 8)   record_len     u32 = 40 (fixed; no variable payload at v1)
+//   [+ 8..+16)   rect           u64 verbatim from TableSpec+0 (packed Rect)
+//   [+16..+20)   row_count      u32 (u64 spec field truncated to u32;
+//                                    a table with > 4G rows would already
+//                                    have failed every upstream sanity
+//                                    check)
+//   [+20..+24)   column_count   u32
+//   [+24..+28)   selected_row   u32 (read live from spec.state_ptr; a
+//                                    caller with a null state_ptr must
+//                                    NOT call the packer -- v1 does not
+//                                    null-check, mirroring block_view_pack)
+//   [+28..+32)   offset         u32
+//   [+32..+36)   has_header     u32 (0 or 1; the flag rather than the
+//                                    raw header_ptr keeps the wire
+//                                    address-space independent)
+//   [+36..+40)   pad            u32 zero on the wire
+//
+// record_len = TBVW_HEADER_BYTES = 40, no title payload, no post-header
+// rounding step. A future revision that adds a variable-length column-
+// header text tail would follow the block_view_pack rounding rule
+// ((header_bytes + tail + 7) & ~7 via shr/shl 3 rather than an imm64
+// mask) -- the packer's control flow already leaves room.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Table`), matches file basename
+//     src/widgets/table.pdx per manifest.pdxproj sources: entry.
+//   - No `test` mnemonic; every zero-check goes through cmp reg, 0.
+//   - Every mov_b byte-load is preceded by `xor reg, reg` (defensive
+//     zero-extension; mov_b does not zero-extend on x86_64).
+//   - All cmp/and immediates fit imm32: 0xFFFF, 0xFFFFFF, 32, 24, 16,
+//     8, shift counts <= 56. The one imm64 (0xFFFFEBCD sentinel) goes
+//     through `mov reg, imm64` (movabs, legal for mov); NEVER used in
+//     cmp/and.
+//   - No 2-op `imul reg, imm`. Every imul is 2-op `imul reg, reg` --
+//     the two multiplies (span stride 24, row stride 16, column-rect
+//     stride 8) all stage the stride through a scratch register first.
+//     For the row-stride multiply by 16 (TABLE_ROW_BYTES) and the
+//     column-rect stride multiply by 8, the shl-fold is preferred:
+//     `shl rax, 4` and `shl rax, 3` respectively.
+//   - Labels prefixed `tb_` (table body) or `tb_vp_` (view packer) per
+//     docs/design.md fingerprint discipline.
+//   - SysV push/pop parity: table_draw pushes 5 callee-save regs
+//     (rbx, r12, r13, r14, r15 = 40 bytes) then `sub rsp, 320` (20 x
+//     16 bytes = aligned). Entry rsp%16 == 8; after 40 + 320 = 360
+//     bytes, rsp%16 == 0 -- ready for the nested layout_split call.
+//     Stack layout below the callee-save regs:
+//       [rsp+  0..256)   column_rects[32]     (Rect u64 each)
+//       [rsp+256..264)   header_row_count     (0 or 1)
+//       [rsp+264..272)   current_y            (per-row cursor)
+//       [rsp+272..280)   rows_end             (absolute end row index)
+//       [rsp+280..288)   style_used           (row-level style choice)
+//       [rsp+288..296)   col_x                (per-column x anchor)
+//       [rsp+296..304)   bytes_ptr            (per-cell source bytes)
+//       [rsp+304..312)   byte_count           (min of span_len, col_w)
+//       [rsp+312..320)   pad
+//   - Cross-module calls: bare `call layout_split` (Layout module),
+//     resolved by the linker against layout.pdx's exported symbol.
+//   - `pub let X : type = value` is single-line for every constant.
+//   - r11 discipline: table_draw uses r11 as a per-iteration scratch
+//     register between memory operations. paideia-as reserves r11 for
+//     its own LEA emission -- so r11 MUST NOT hold state across a
+//     `lea`. There is NO `lea` inside table_draw's main loop; the
+//     column-rects base is `rsp` directly (no lea needed). One `lea`
+//     could sit in the layout_split call-marshalling if we chose it,
+//     but we use `mov r8, rsp` instead to keep r11 pristine.
+//
+// =============================================================================
+// ERROR BAND
+// =============================================================================
+//
+// TBL_ERR_BAND = 0xFFFFEBCD. Distinct from Layout (0xFFFFEBC0..0xFFFFEBC4)
+// and Text (0xFFFFEBCA). > 0x7FFFFFFF so `mov reg, imm` emits movabs;
+// NEVER used in cmp/and. table_draw returns TBL_ERR_BAND for column_count
+// > TABLE_MAX_COLUMNS; layout_split's own error sentinels are propagated
+// verbatim (a caller can discriminate table vs. layout failure via the
+// low byte of the returned sentinel).
+
+module Table = structure {
+
+  // ==========================================================================
+  // Sizing constants
+  // ==========================================================================
+  pub let TABLE_SPEC_BYTES   : u64 = 80
+  pub let TABLE_ROW_BYTES    : u64 = 16
+  pub let TABLE_STATE_BYTES  : u64 = 24
+  pub let TABLE_MAX_COLUMNS  : u64 = 32
+
+  // Span stride (mirrors Text::TEXT_SPAN_BYTES; re-exported to keep the
+  // per-cell address math local to this module's justification block).
+  pub let TABLE_SPAN_STRIDE  : u64 = 24
+
+  // ==========================================================================
+  // TableSpec field offsets
+  // ==========================================================================
+  pub let TABLE_OFF_RECT              : u64 = 0
+  pub let TABLE_OFF_ROWS_PTR          : u64 = 8
+  pub let TABLE_OFF_ROW_COUNT         : u64 = 16
+  pub let TABLE_OFF_CONSTRAINTS_PTR   : u64 = 24
+  pub let TABLE_OFF_COLUMN_COUNT      : u64 = 32
+  pub let TABLE_OFF_HEADER_PTR        : u64 = 40
+  pub let TABLE_OFF_STATE_PTR         : u64 = 48
+  pub let TABLE_OFF_HIGHLIGHT_STYLE   : u64 = 56
+  pub let TABLE_OFF_DEFAULT_STYLE     : u64 = 64
+  pub let TABLE_OFF_RESERVED          : u64 = 72
+
+  // ==========================================================================
+  // TableRow field offsets
+  // ==========================================================================
+  pub let TABLE_ROW_OFF_CELLS_PTR   : u64 = 0
+  pub let TABLE_ROW_OFF_CELL_COUNT  : u64 = 8
+
+  // ==========================================================================
+  // TableState field offsets
+  // ==========================================================================
+  pub let TABLE_STATE_OFF_SELECTED  : u64 = 0
+  pub let TABLE_STATE_OFF_OFFSET    : u64 = 8
+  pub let TABLE_STATE_OFF_RESERVED  : u64 = 16
+
+  // ==========================================================================
+  // TableView@0.1 semantic-pipe wire
+  // ==========================================================================
+  pub let TBVW_MAGIC             : u64 = 0x57564254
+  pub let TBVW_HEADER_BYTES      : u64 = 40
+  pub let TBVW_OFF_MAGIC         : u64 = 0
+  pub let TBVW_OFF_RECORD_LEN    : u64 = 4
+  pub let TBVW_OFF_RECT          : u64 = 8
+  pub let TBVW_OFF_ROW_COUNT     : u64 = 16
+  pub let TBVW_OFF_COLUMN_COUNT  : u64 = 20
+  pub let TBVW_OFF_SELECTED_ROW  : u64 = 24
+  pub let TBVW_OFF_OFFSET        : u64 = 28
+  pub let TBVW_OFF_HAS_HEADER    : u64 = 32
+  pub let TBVW_OFF_PAD           : u64 = 36
+
+  // Schema name (kept here as the authoritative string a future
+  // BLAKE3-based semantic-pipe schema-hash constant would be computed
+  // against; matches the block.pdx BLKV_SCHEMA_NAME pattern verbatim).
+  pub let TBVW_SCHEMA_NAME     : [u8; 14] = "TableView@0.1\0"
+  pub let TBVW_SCHEMA_NAME_LEN : u64 = 13
+
+  // ==========================================================================
+  // Error sentinel (postui error band; > 0x7FFFFFFF so movabs required
+  // for `mov reg, imm`, NEVER used in cmp/and).
+  // ==========================================================================
+  pub let TBL_ERR_BAND : u64 = 0xFFFFEBCD
+
+  // ==========================================================================
+  // table_state_init(slot_ptr, selected, offset) -> ()
+  //
+  // Serialize the three TableState fields into 24 bytes at [slot..+24).
+  // _reserved is explicitly zeroed so a caller re-init over dirty memory
+  // does not leave stale bytes visible to a future revision that adds a
+  // real interpretation to the slot.
+  //
+  // Register plan: rdi=slot, rsi=selected, rdx=offset. Pure leaf: no
+  // callee-save touched, no push/pop, no nested call. Effect `!{mem}`
+  // (three 8-byte stores).
+  // ==========================================================================
+  pub let table_state_init : (u64, u64, u64) -> () !{mem} @{} =
+    fn (slot: u64) (selected: u64) (offset: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-006 (postui#15): table_state_init writes 24 bytes of TableState into [rdi..rdi+24). Two 8-byte stores of caller-provided fields at offsets 0/8, plus one explicit zero at offset 16 to preserve the reserved-zero invariant against dirty memory. Pure leaf: no callee-save touched, no push/pop, no nested call. Every immediate offset (0, 8, 16) fits imm32 trivially. Effect `!{mem}` (three 8-byte stores).",
+      block: {
+        mov [rdi + 0], rsi;
+        mov [rdi + 8], rdx;
+        xor rax, rax;
+        mov [rdi + 16], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // table_state_selected(state_ptr) -> u64
+  // table_state_offset(state_ptr)   -> u64
+  //
+  // Field accessors. Each is a single 8-byte load from the fixed offset.
+  // Pure leafs.
+  // ==========================================================================
+  pub let table_state_selected : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-006 (postui#15): table_state_selected returns the u64 at [rdi+0]. Single 8-byte load. Pure leaf: no callee-save touched, no push/pop.",
+      block: {
+        mov rax, [rdi + 0];
+        ret;
+      }
+    }
+
+  pub let table_state_offset : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-006 (postui#15): table_state_offset returns the u64 at [rdi+8]. Single 8-byte load. Pure leaf: no callee-save touched, no push/pop.",
+      block: {
+        mov rax, [rdi + 8];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // table_draw(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Standard widget_draw signature -- postui.M1-007's WidgetKind
+  // dispatch keys against exactly this shape when routing WK_TABLE to
+  // this function. The `rows` argument is not read by this body (the
+  // back region starts at buf_ptr+0, matching the block_draw posture),
+  // kept for signature uniformity with every other widget_draw variant.
+  //
+  // Draw sequence:
+  //   1. Validate column_count <= TABLE_MAX_COLUMNS = 32.
+  //      Overflow -> TBL_ERR_BAND (movabs).
+  //   2. Call layout_split(spec.rect, Horizontal=0, constraints_ptr,
+  //      column_count, column_rects_stack) to fill 32 packed-Rect
+  //      slots. layout_split's error sentinels are propagated
+  //      verbatim (LAYOUT_ERR_* codes remain distinguishable from
+  //      TBL_ERR_BAND via the low byte).
+  //   3. Render header row (if header_ptr != 0): for each column c
+  //      with a matching header Span, walk the Span's byte run into
+  //      the column_rects[c] Rect at y = spec.rect.y using
+  //      spec.default_style.
+  //   4. Compute body window: visible_rows = min(row_count - offset,
+  //      rect.h - header_rows). state.offset >= row_count => 0.
+  //   5. For row_i in [offset, offset + visible_rows):
+  //        y = rect.y + header_rows + (row_i - offset)
+  //        style = highlight_style if row_i == state.selected_row
+  //                else span.style (per-cell)
+  //        For column c in [0, min(cell_count, column_count)):
+  //          walk cells[c].bytes into column_rects[c] at y,
+  //          clipping to min(cell.byte_len, column_rects[c].w).
+  //   6. Return 0 on success.
+  //
+  // Per-cell write shape (single ASCII byte per cell, matches
+  // block_draw's title-render posture):
+  //   word0 = byte | (style << 32)    ; sym byte in [0..8), style low
+  //                                   ; 32 bits (fg + bg.r) in [32..64)
+  //   word1 = (style >> 32) & 0xFFFFFF; bg.g + bg.b + mods; pad byte 11
+  //                                   ; and reserved [12..16) stay zero
+  // Two 8-byte stores per cell; the Style-to-Cell byte alignment maps
+  // one-for-one (see src/cell.pdx cell_set_style header for the derivation).
+  //
+  // Register plan:
+  //   Callee-save (survive whole body):
+  //     rbx = spec_ptr
+  //     r12 = buf_ptr
+  //     r13 = cols
+  //     r14 = column_count
+  //     r15 = state_ptr
+  //   Loop indices:
+  //     rcx = column index (column loop; preserved across the inner
+  //           byte-write loop by design -- inner loop uses rdi and
+  //           free scratch)
+  //     rdx = row index (body-row loop; preserved across the column
+  //           loop by pushing/popping is NOT possible without extra
+  //           stack, so the code reads rdx from stack when needed)
+  //     Actually rdx is always live across the column loop -- both
+  //     loops nest cleanly; the column loop does NOT clobber rdx.
+  //   Scratch (per-iteration): rax, rsi, rdi, r8, r9, r10, r11
+  //
+  //   Stack scratch (below column_rects at rsp+0..256):
+  //     [rsp+256..264)   header_row_count  (0 or 1)
+  //     [rsp+264..272)   current_y         (row cursor y; per row)
+  //     [rsp+272..280)   rows_end          (offset + visible_rows)
+  //     [rsp+280..288)   style_used        (row's chosen Style)
+  //     [rsp+288..296)   col_x             (per-column x anchor)
+  //     [rsp+296..304)   bytes_ptr         (per-cell source bytes)
+  //     [rsp+304..312)   byte_count        (per-cell effective byte count)
+  //     [rsp+312..320)   pad               (kept 16-aligned)
+  //
+  // Labels prefixed tb_ per docs fingerprint discipline. Phase suffixes:
+  //   tb_err_columns          column_count validation failure
+  //   tb_ret_layout_err       propagate layout_split error
+  //   tb_no_header            header_ptr == 0 skip
+  //   tb_hdr_span_ok          header span-count clamp OK
+  //   tb_hdr_col_top/next     header column loop
+  //   tb_hdr_bytes_ok         header byte-count clamp OK
+  //   tb_hdr_byte_top/next    header byte loop
+  //   tb_after_header         header phase done
+  //   tb_body_no              body-window empty skip
+  //   tb_body_row_top/next    body row loop
+  //   tb_body_col_top/next    body column loop
+  //   tb_body_bytes_ok        body byte-count clamp OK
+  //   tb_body_byte_top/next   body byte loop
+  //   tb_use_default_style    body row not selected
+  //   tb_style_done           body style choice done
+  //   tb_epilogue             success and error return path
+  // ==========================================================================
+  pub let table_draw : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-006 (postui#15): table_draw is the widget_draw entry for WK_TABLE. Push rbx/r12/r13/r14/r15 (5 pushes = 40 bytes; rsp entry %16==8, +40==0) then sub rsp, 320 (20 x 16 = aligned) -- 256 bytes for column_rects[32] at [rsp+0..256) plus 64 bytes of state scratch at [rsp+256..320). Stash spec_ptr in rbx, buf_ptr in r12, cols in rcx-arg->r13, column_count from [rbx+32] in r14, state_ptr from [rbx+48] in r15. Validate column_count: cmp r14, 0 / cmp r14, 32; ja tb_err_columns which sets rax=0xFFFFEBCD (movabs; imm > 0x7FFFFFFF; legal for mov, NOT for cmp/and) and jumps to tb_epilogue. Nested call to layout_split: rdi = spec.rect from [rbx+0], rsi = 0 (Horizontal), rdx = constraints_ptr from [rbx+24], rcx = column_count (r14), r8 = rsp (column_rects base -- NO lea needed, keeps r11 pristine for paideia-as's LEA-scratch discipline). rsp%16==0 at the call site (5-push + 320 sub -> 360 bytes below entry rsp==8 mod 16 -> 0 mod 16). Check rax != 0 => propagate via jne tb_epilogue (rax already carries the layout error). Header phase: read header_ptr from [rbx+40]; if 0, jump tb_after_header. Otherwise read header spans_ptr and span_count, clamp span_count to r14 (column_count), store base_y (from spec.rect >> 16 & 0xFFFF) into [rsp+264], store default_style (from [rbx+64]) into [rsp+280], store header_row_count=1 into [rsp+256]. Column loop rcx from 0 to min(header_span_count, column_count): compute span_ptr = spans_ptr + rcx*24 (stride via `mov r8, 24; imul rax, r8` -- 2-op reg,reg only, paideia-as-safe), extract col_x = column_rects[rcx] & 0xFFFF into [rsp+288] and col_w = (rect >> 32) & 0xFFFF, load bytes_ptr and byte_len from span at offsets 0/8, clamp byte_len to col_w, store to [rsp+296]/[rsp+304]. Byte loop rdi from 0 to byte_count: dst = buf_ptr + (current_y * cols + col_x + rdi) * 16 into rax via mov+imul r13+add+add+shl 4+add r12; load byte via xor rax,rax + mov_b rax, [bytes_ptr+rdi]; compose word0 = byte | (style_used << 32) and word1 = (style_used >> 32) & 0xFFFFFF; two 8-byte stores. After header, body phase: read state.selected from [r15+0] and state.offset from [r15+8]; compute base_y+header_rows into [rsp+264] cursor start; compute rect.h from spec.rect >> 48; compute available = rect.h - header_row_count with underflow guard; visible = min(row_count - offset, available) with offset >= row_count => 0; store offset+visible into [rsp+272] as rows_end. If offset >= rows_end, jump tb_after_body. Body row loop rdx from offset to rows_end: row_addr = rows_ptr + rdx * 16 via shl 4; load cells_ptr [row+0] and cell_count [row+8]; clamp cell_count to column_count. Determine style: if rdx == selected use highlight_style from [rbx+56] into [rsp+280], else fall into per-span style path (loaded inside the cell body). Column loop rcx from 0 to min(cell_count, column_count): same shape as header, but each iteration also reads span.style at [span_ptr+16] into [rsp+280] iff row is NOT selected. Byte loop shape identical to header. current_y at [rsp+264] increments by 1 after each row. Every immediate that reaches cmp/and (0, 1, 8, 16, 24, 32, 0xFF, 0xFFFF, 0xFFFFFF, shift counts 3/4/16/32/48/56) fits imm32/imm8. No `test` mnemonic anywhere. Every mov_b load is preceded by xor of the destination. Every imul is 2-op reg,reg. No `and reg, imm64`. No cross-loop `lea`. Effect `!{mem}` (reads through rbx/r15/rows_ptr/cells_ptr/bytes_ptr; writes through r12 for cells and through rsp for state scratch and the layout_split fill of column_rects[]). Labels prefixed tb_ per docs fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 320;
+
+        // ---- Prologue: cache args + spec fields ---------------------------
+        mov rbx, rdi;                        // rbx = spec_ptr
+        mov r12, rsi;                        // r12 = buf_ptr
+        mov r13, rcx;                        // r13 = cols
+        mov r14, [rbx + 32];                 // r14 = column_count
+        mov r15, [rbx + 48];                 // r15 = state_ptr
+
+        // ---- Validate column_count in (0, 32] -----------------------------
+        cmp r14, 0;
+        je  tb_err_columns;
+        cmp r14, 32;
+        ja  tb_err_columns;
+
+        // ---- Call layout_split(rect, 0, constraints, count, column_rects)
+        mov rdi, [rbx + 0];                  // parent = spec.rect
+        xor rsi, rsi;                        // direction = LAYOUT_HORIZONTAL
+        mov rdx, [rbx + 24];                 // constraints_ptr
+        mov rcx, r14;                        // count
+        mov r8,  rsp;                        // out_rects_ptr = &column_rects[0]
+        call layout_split;
+        cmp rax, 0;
+        jne tb_epilogue;                     // propagate layout error verbatim
+
+        // ---- Extract base_y = (spec.rect >> 16) & 0xFFFF into [rsp+264] ---
+        mov rax, [rbx + 0];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov [rsp + 264], rax;                // current_y = base_y
+
+        // ---- Header phase: header_ptr at [rbx + 40] -----------------------
+        mov r9, [rbx + 40];                  // r9 = header_ptr
+        cmp r9, 0;
+        je  tb_after_header;
+
+        // header is a Line: spans_ptr at [+0], span_count at [+8]
+        mov rsi, [r9 + 0];                   // rsi = header_spans_ptr
+        mov r8,  [r9 + 8];                   // r8  = header_span_count
+
+        // Clamp span_count to column_count (r14).
+        cmp r8, r14;
+        jbe tb_hdr_span_ok;
+        mov r8, r14;
+      tb_hdr_span_ok:
+
+        // Header row uses default_style (from [rbx + 64]).
+        mov rax, [rbx + 64];
+        mov [rsp + 280], rax;                // style_used
+
+        // Header column loop: rcx from 0 to r8.
+        xor rcx, rcx;
+      tb_hdr_col_top:
+        cmp rcx, r8;
+        jae tb_hdr_col_done;
+
+        // span_ptr = header_spans_ptr + rcx * 24
+        mov rax, rcx;
+        mov r10, 24;
+        imul rax, r10;
+        add rax, rsi;
+        mov r11, rax;                        // r11 = span_ptr
+
+        // col_x = column_rects[rcx] & 0xFFFF -> [rsp+288]
+        mov r9, rcx;
+        shl r9, 3;                           // rcx * 8
+        add r9, rsp;                         // &column_rects[rcx]
+        mov r10, [r9 + 0];                   // packed column rect
+        mov rax, r10;
+        and rax, 0xFFFF;
+        mov [rsp + 288], rax;                // col_x
+
+        // col_w = (rect >> 32) & 0xFFFF -> rax
+        shr r10, 32;
+        and r10, 0xFFFF;                     // col_w
+
+        // bytes_ptr = [span_ptr + 0]; byte_len = [span_ptr + 8]
+        mov r9, [r11 + 0];                   // bytes_ptr
+        mov [rsp + 296], r9;
+        mov rax, [r11 + 8];                  // byte_len
+
+        // Clamp byte_len to col_w (r10)
+        cmp rax, r10;
+        jbe tb_hdr_bytes_ok;
+        mov rax, r10;
+      tb_hdr_bytes_ok:
+        mov [rsp + 304], rax;                // byte_count
+
+        // If byte_count == 0, skip byte loop
+        cmp rax, 0;
+        je  tb_hdr_col_next;
+
+        // Header byte loop: rdi from 0 to byte_count
+        xor rdi, rdi;
+      tb_hdr_byte_top:
+        mov r10, [rsp + 304];                // byte_count
+        cmp rdi, r10;
+        jae tb_hdr_byte_done;
+
+        // dst = buf_ptr + (current_y * cols + col_x + rdi) * 16
+        mov rax, [rsp + 264];                // current_y
+        imul rax, r13;                       // y * cols  (2-op reg,reg)
+        mov r9, [rsp + 288];                 // col_x
+        add rax, r9;
+        add rax, rdi;                        // + j
+        shl rax, 4;                          // * 16
+        add rax, r12;                        // + buf_ptr
+
+        // Load byte
+        mov r9, [rsp + 296];                 // bytes_ptr
+        xor r10, r10;
+        mov_b r10, [r9 + rdi + 0];           // r10 = byte
+
+        // Compose word0 = byte | (style << 32)
+        mov r11, [rsp + 280];                // style_used
+        mov r9, r11;
+        shl r9, 32;
+        or  r10, r9;                         // r10 = word0
+        mov [rax + 0], r10;
+
+        // Compose word1 = (style >> 32) & 0xFFFFFF
+        shr r11, 32;
+        and r11, 0xFFFFFF;
+        mov [rax + 8], r11;
+
+        add rdi, 1;
+        jmp tb_hdr_byte_top;
+      tb_hdr_byte_done:
+
+      tb_hdr_col_next:
+        add rcx, 1;
+        jmp tb_hdr_col_top;
+      tb_hdr_col_done:
+
+        // header consumed one visible row
+        mov rax, 1;
+        mov [rsp + 256], rax;                // header_row_count = 1
+
+      tb_after_header:
+        // Fall-through: if no header, header_row_count stays whatever was
+        // there. Ensure it's zero when there is no header.
+        mov r9, [rbx + 40];
+        cmp r9, 0;
+        jne tb_hdr_have;
+        xor rax, rax;
+        mov [rsp + 256], rax;
+      tb_hdr_have:
+
+        // ---- Body phase: compute visible window ---------------------------
+        // rect.h = spec.rect >> 48
+        mov rax, [rbx + 0];
+        shr rax, 48;
+        mov r10, rax;                        // r10 = rect.h
+
+        // available_body_rows = rect.h - header_row_count
+        mov r11, [rsp + 256];                // header_row_count
+        cmp r10, r11;
+        jb  tb_body_no;                      // rect.h < header -> no body
+        sub r10, r11;                        // r10 = available
+        cmp r10, 0;
+        je  tb_body_no;
+
+        // state.offset at [r15+8]; state.selected at [r15+0]
+        mov r8, [r15 + 8];                   // r8 = offset
+        mov r9, [rbx + 16];                  // r9 = row_count
+        cmp r8, r9;
+        jae tb_body_no;                      // offset >= row_count -> no body
+
+        // remaining = row_count - offset
+        mov rax, r9;
+        sub rax, r8;                         // rax = remaining rows
+
+        // visible = min(available, remaining)
+        cmp rax, r10;
+        jbe tb_body_visok;
+        mov rax, r10;
+      tb_body_visok:
+        // rows_end = offset + visible
+        add rax, r8;
+        mov [rsp + 272], rax;                // rows_end
+
+        // current_y already = base_y from [rsp+264]. Add header_row_count.
+        mov rax, [rsp + 264];
+        add rax, r11;
+        mov [rsp + 264], rax;                // current_y = base_y + header_rows
+
+        // Body row loop: rdx from offset to rows_end
+        mov rdx, r8;                         // rdx = row_i (starts at offset)
+
+      tb_body_row_top:
+        mov rax, [rsp + 272];                // rows_end
+        cmp rdx, rax;
+        jae tb_after_body;
+
+        // Choose row style: highlight if selected else keep per-span.
+        // Stash a flag via style_used slot: on selected rows, style_used
+        // is the highlight; on non-selected rows, style_used is re-loaded
+        // per span (see column loop). To distinguish, we set style_used
+        // to highlight if selected, else clear it to 0 -- inside the
+        // column loop, style_used==0 triggers the per-span load path.
+        mov rax, [r15 + 0];                  // state.selected
+        cmp rax, rdx;
+        jne tb_use_per_span;
+        mov rax, [rbx + 56];                 // highlight_style
+        mov [rsp + 280], rax;
+        // Also stash a non-zero flag reserved for future use -- keep it
+        // implicit via style_used non-zero. A highlight_style of 0 is a
+        // degenerate caller pattern (all-zero Style = black bg) and
+        // would cause per-span loads even for a selected row; that is
+        // documented caller responsibility (calling styles pack every
+        // non-default combination as non-zero via style_new).
+        jmp tb_style_done;
+      tb_use_per_span:
+        xor rax, rax;
+        mov [rsp + 280], rax;                // 0 = sentinel: use span style
+      tb_style_done:
+
+        // row_addr = rows_ptr + rdx * 16
+        mov rax, rdx;
+        shl rax, 4;                          // * 16 (TABLE_ROW_BYTES)
+        mov r9, [rbx + 8];                   // rows_ptr
+        add rax, r9;
+        mov rsi, rax;                        // rsi = row_addr
+
+        // cells_ptr, cell_count
+        mov rdi, [rsi + 0];                  // rdi = cells_ptr
+        mov r8,  [rsi + 8];                  // r8  = cell_count
+
+        // Clamp cell_count to column_count (r14)
+        cmp r8, r14;
+        jbe tb_body_cellok;
+        mov r8, r14;
+      tb_body_cellok:
+
+        // Body column loop: rcx from 0 to r8
+        xor rcx, rcx;
+      tb_body_col_top:
+        cmp rcx, r8;
+        jae tb_body_col_done;
+
+        // span_ptr = cells_ptr + rcx * 24
+        mov rax, rcx;
+        mov r10, 24;
+        imul rax, r10;
+        add rax, rdi;
+        mov r11, rax;                        // r11 = span_ptr
+
+        // If style_used slot is 0, load span.style at [r11+16] into it
+        mov rax, [rsp + 280];
+        cmp rax, 0;
+        jne tb_body_style_kept;
+        mov rax, [r11 + 16];                 // span.style
+        mov [rsp + 280], rax;
+      tb_body_style_kept:
+
+        // col_x = column_rects[rcx] & 0xFFFF -> [rsp+288]
+        mov r9, rcx;
+        shl r9, 3;
+        add r9, rsp;
+        mov r10, [r9 + 0];                   // packed rect
+        mov rax, r10;
+        and rax, 0xFFFF;
+        mov [rsp + 288], rax;
+
+        // col_w = (rect >> 32) & 0xFFFF
+        shr r10, 32;
+        and r10, 0xFFFF;                     // col_w
+
+        // bytes_ptr, byte_len
+        mov r9, [r11 + 0];
+        mov [rsp + 296], r9;
+        mov rax, [r11 + 8];
+
+        // Clamp byte_len to col_w
+        cmp rax, r10;
+        jbe tb_body_bytes_ok;
+        mov rax, r10;
+      tb_body_bytes_ok:
+        mov [rsp + 304], rax;
+
+        // Skip if 0
+        cmp rax, 0;
+        je  tb_body_col_next;
+
+        // Body byte loop: rdi (temporarily repurposed from cells_ptr;
+        // we saved cells_ptr to nowhere -- but we still need it for the
+        // next column iteration). rdi = cells_ptr must be preserved
+        // across the byte loop. Use r11 as byte-loop counter instead.
+        // Actually r11 is span_ptr and could be recomputed. To be safe,
+        // let's save cells_ptr to a stack slot before repurposing rdi.
+
+        // Save cells_ptr and cell_count to stack for reload after byte loop.
+        mov [rsp + 312], rdi;                // stash cells_ptr temporarily
+
+        xor rdi, rdi;                        // rdi = j (byte counter)
+      tb_body_byte_top:
+        mov r10, [rsp + 304];
+        cmp rdi, r10;
+        jae tb_body_byte_done;
+
+        // dst = buf_ptr + (current_y * cols + col_x + j) * 16
+        mov rax, [rsp + 264];
+        imul rax, r13;
+        mov r9, [rsp + 288];
+        add rax, r9;
+        add rax, rdi;
+        shl rax, 4;
+        add rax, r12;
+
+        // Load byte
+        mov r9, [rsp + 296];
+        xor r10, r10;
+        mov_b r10, [r9 + rdi + 0];
+
+        // word0 = byte | (style << 32)
+        mov r11, [rsp + 280];
+        mov r9, r11;
+        shl r9, 32;
+        or  r10, r9;
+        mov [rax + 0], r10;
+
+        // word1 = (style >> 32) & 0xFFFFFF
+        shr r11, 32;
+        and r11, 0xFFFFFF;
+        mov [rax + 8], r11;
+
+        add rdi, 1;
+        jmp tb_body_byte_top;
+      tb_body_byte_done:
+
+        // Restore cells_ptr
+        mov rdi, [rsp + 312];
+
+      tb_body_col_next:
+        // On non-selected rows, clear style_used so the next column
+        // re-loads its own span.style.
+        mov rax, [r15 + 0];
+        cmp rax, rdx;
+        je  tb_body_no_clear;
+        xor rax, rax;
+        mov [rsp + 280], rax;
+      tb_body_no_clear:
+
+        add rcx, 1;
+        jmp tb_body_col_top;
+      tb_body_col_done:
+
+        // Advance y and row index
+        mov rax, [rsp + 264];
+        add rax, 1;
+        mov [rsp + 264], rax;
+
+        add rdx, 1;
+        jmp tb_body_row_top;
+
+      tb_body_no:
+      tb_after_body:
+        xor rax, rax;                        // success
+        jmp tb_epilogue;
+
+      tb_err_columns:
+        mov rax, 0xFFFFEBCD;                 // TBL_ERR_BAND (movabs)
+        // fallthrough
+
+      tb_epilogue:
+        add rsp, 320;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // table_view_pack(spec_ptr, dst) -> u64 (record_len)
+  //
+  // Pack a TableView@0.1 semantic-pipe record into [dst..dst+40). No
+  // variable-length payload at v1 -- record_len = TBVW_HEADER_BYTES = 40.
+  //
+  // Actual semantic_pipe::send_record call is deferred to
+  // postui.M2-009 (see block_view_pack for the pattern). This packer is
+  // the wire-format authority so the M2-009 registry glue only needs:
+  //   - the schema name string TBVW_SCHEMA_NAME (for BLAKE3 hashing)
+  //   - table_view_pack (for the byte payload)
+  //
+  // Register plan: rdi=spec_ptr (read-only), rsi=dst (write-only until
+  // return), rax=scratch/return, r8/r9/r10 = field transit. Pure leaf:
+  // no callee-save touched, no push/pop, no nested call. Effect `!{mem}`.
+  // Labels prefixed tb_vp_ per docs fingerprint discipline.
+  // ==========================================================================
+  pub let table_view_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "postui.M2-006 (postui#15): table_view_pack lays a TableView@0.1 record at [rsi..rsi+40). Header phase writes the fixed scalar fields in one straight-line sequence: `mov rax, 0x57564254; mov_d [rsi+0], rax` stamps the 'TBVW' magic (0x57564254 = 1_465_270_868 < 0x7FFFFFFF, so paideia-as emits the 5-byte mov r32, imm32 form, not the 10-byte movabs). record_len = 40 stored at [rsi+4] as u32. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+8] (BlockView-style: TableSpec and TableView share the identical Rect wire). row_count from [rdi+16] and column_count from [rdi+32] each truncate to u32 (mov_d store; a table with > 4G rows would already have failed every upstream sanity check). state fields read live from spec.state_ptr at [rdi+48]: selected from [state+0] to [rsi+24], offset from [state+8] to [rsi+28] -- callers with a null state_ptr must NOT call this packer (v1 does not null-check, mirroring block_view_pack). has_header = (header_ptr != 0) ? 1 : 0 computed via cmp/jne; stored at [rsi+32]. Pad zero at [rsi+36]. No shr/shl round-up needed (fixed 40 bytes; already 8-aligned). Every immediate (0, 1, 4, 8, 16, 24, 28, 32, 36, 40, 48, 56, 64, 0x57564254) fits imm32. No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` (reads through rdi and rdi's state_ptr indirection; writes through rsi). Labels prefixed tb_vp_ per docs fingerprint discipline.",
+      block: {
+        // ---- magic (u32) at [rsi + 0] --------------------------------------
+        mov rax, 0x57564254;
+        mov_d [rsi + 0], rax;
+
+        // ---- record_len (u32) at [rsi + 4] = 40 ----------------------------
+        mov rax, 40;
+        mov_d [rsi + 4], rax;
+
+        // ---- packed rect (8 bytes) at [rsi + 8] verbatim -------------------
+        mov rax, [rdi + 0];
+        mov [rsi + 8], rax;
+
+        // ---- row_count (u32) at [rsi + 16] ---------------------------------
+        mov rax, [rdi + 16];
+        mov_d [rsi + 16], rax;
+
+        // ---- column_count (u32) at [rsi + 20] ------------------------------
+        mov rax, [rdi + 32];
+        mov_d [rsi + 20], rax;
+
+        // ---- state fields (need spec.state_ptr) ----------------------------
+        mov r8, [rdi + 48];                  // state_ptr
+        mov rax, [r8 + 0];                   // selected
+        mov_d [rsi + 24], rax;
+        mov rax, [r8 + 8];                   // offset
+        mov_d [rsi + 28], rax;
+
+        // ---- has_header flag (0/1) at [rsi + 32] ---------------------------
+        mov r9, [rdi + 40];                  // header_ptr
+        xor rax, rax;
+        cmp r9, 0;
+        je  tb_vp_no_hdr;
+        mov rax, 1;
+      tb_vp_no_hdr:
+        mov_d [rsi + 32], rax;
+
+        // ---- pad (u32) at [rsi + 36] = 0 -----------------------------------
+        xor rax, rax;
+        mov_d [rsi + 36], rax;
+
+        // ---- return record_len ---------------------------------------------
+        mov rax, 40;
+        ret;
+      }
+    }
+
+}
