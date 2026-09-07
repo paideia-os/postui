@@ -1,0 +1,309 @@
+.pdxdoc-version 1
+.tool           postui
+.kind           library
+.version        1.0.0
+.author         paideia-os-team
+.wave           postui-v1
+.toolchain      paideia-as v0.34+
+.license        MIT
+.summary        Ratatui-parity TUI widget library for paideia-os
+                — stack-of-widgets over a Buffer, flushed to a
+                KIND_TUI_CANVAS cap, with every draw() also
+                emitting a frozen-schema semantic-pipe record.
+
+.section NAME
+postui — Ratatui-parity TUI widget library for paideia-os.
+
+.section OVERVIEW
+postui is the paideia-os TUI widget library. Every `.pdx` ring-3
+tool that draws a multi-pane interactive screen (`postui-top`,
+`postui-hex`, `postui-dmesg`, plus every future TUI app the org
+ships) links against postui rather than hand-rolling ANSI. The
+model is Ratatui's immediate-mode substrate re-expressed in
+`.pdx`'s primitives (closed enums + `match` dispatch, no
+generics, no trait objects): the caller stacks `WidgetKind`
+values against `Rect` slots each frame, `widget_draw` writes
+cells into a `Buffer`, `Frame::present` diffs against the front
+buffer, and the changed cells flush through a `KIND_TUI_CANVAS`
+capability to `KIND_TTY`. Every `draw()` call does one more
+thing: it emits a frozen-schema `*View@0.1` semantic-pipe record
+alongside the cells, so a scraper or agent subscribes to what
+the widget is showing without parsing the terminal stream.
+
+.section MODULES
+Every source file lands one module. All modules follow paideia-as
+conformance (PascalCase basename, `cmp reg, imm32`, r11 scratch,
+`xor rax, rax; mov_b rax, [ptr]` byte loads, SysV push/pop parity).
+
+  Lib                  Library-identity constants
+                       (POSTUI_VERSION_{MAJOR,MINOR,PATCH},
+                       POSTUI_ERR_BAND_BASE, POSTUI_OK). No I/O,
+                       no bodies — the anchor every consumer
+                       compile-time checks against.
+  Rect                 4×u16 geometry (x, y, rows, cols) — the
+                       area passed to every draw call and every
+                       layout split.
+  Style               Style aggregate (fg Color, bg Color,
+                       modifier bitset: bold/italic/underline/
+                       inverse/…). Every Cell carries one.
+  Color                24-bit truecolor triplet (r, g, b). No
+                       palette / indexed / xterm-256 modes at
+                       v1; the KIND_TUI_CANVAS wire is truecolor
+                       throughout.
+  Cell                 16-byte wire-format cell (glyph +
+                       Style + width class). Buffer is a
+                       row-major array of these.
+  Buffer               Back/front region layout, dirty-rectangle
+                       accounting, cell-by-cell diff feeding
+                       TCC_OP_PRESENT.
+  TuiCanvasClient      KIND_TUI_CANVAS wrappers: mint, present,
+                       query_rows/cols/id/tty_id, resize, clear,
+                       debug_print. Kernel band 0xFFFFEB10..1F.
+  Frame                Per-frame driver: bind canvas cap, expose
+                       the back buffer to widget_draw, flush
+                       through TCC_OP_PRESENT at frame close.
+  Block                Border + title + padding container
+                       (plain/rounded/double/thick borders); the
+                       one widget every other widget nests
+                       inside for chrome.
+  WidgetKind           Closed enum of every widget (WK_BLOCK=0 …
+                       WK_CLEAR=14, WK_COUNT=15) + `widget_draw`
+                       op-dispatch. Adding a widget = adding one
+                       ordinal + one branch, no trait plumbing.
+  Layout               Integer-only constraint splitter:
+                       Length/Percentage/Ratio/Min/Max/Fill,
+                       largest-remainder (Hamilton) apportionment,
+                       clamp-and-redistribute, totally
+                       deterministic (§2.4 of the design).
+  Text                 Span (styled UTF-8 run) + Line (span list)
+                       + Text (line list) + wrap/trunc helpers.
+                       The unit every text-bearing widget consumes.
+  Width                UTF-8 byte scan + East-Asian-Width table
+                       for column-width calculation. Stdlib
+                       routine, not a compiler gap.
+  SemanticRegistry     Per-widget schema-hash constants
+                       (SEMANTIC_SCHEMA_{BLKV,PGVW,LSVW,TBVW,
+                       TABV,SBVW,…}) + `semantic_send` /
+                       `semantic_binding_init` /
+                       `semantic_binding_dispatch`. The
+                       libpdx-semantic-pipe Send/Binding glue.
+  Padding              Rect inset utility (uniform + per-edge),
+                       used by Block chrome and by widgets that
+                       reserve internal margins.
+  Fixed64              Q32.32 signed fixed-point (paideia-as-
+                       native, no float codegen). The
+                       coordinate/scale type for Chart axes
+                       and Canvas shapes.
+  Terminal             Input dispatcher: KIND_TTY raw-mode
+                       primary path (once `#1986` /
+                       R66v2.POS-001 lands), sys_read(0)
+                       fallback (removed at postui.M4-007).
+  Event                Closed enum: Key(u32) / Resize(u16, u16) /
+                       Mouse{x,y,button,mods} / Paste([u8; N]).
+  EscParser            CSI/SS3/OSC ESC-sequence state machine;
+                       accumulates parameter bytes across
+                       partial reads and hands Event to Terminal.
+  Widgets/*            One module per widget in the catalog
+                       below (src/widgets/<name>.pdx).
+
+.section WIDGET_CATALOG
+Fifteen widgets ship at v1. Every widget's `draw()` writes cells
+into the current Buffer AND calls `<w>_view_pack` to lay a
+`<Name>View@0.1` semantic record into caller-provided memory;
+`semantic_send(SEMANTIC_SCHEMA_<TAG>, rec, len)` routes it to
+the app's subscriber pipe.
+
+  Block          Border + title + padding container.
+                 → BlockView@0.1        (title text, border kind)
+  Paragraph      Wrapped + styled text block with scroll offset.
+                 → ParagraphView@0.1    (wrapped line count, scroll)
+  List           Selectable scrolling list + ListState cursor.
+                 → ListView@0.1         (item_count, selected_index,
+                                        viewport_offset, null-sep labels)
+  Table          Column-aligned selectable rows + TableState.
+                 → TableView@0.1        (row count, column headers,
+                                        selected row)
+  Tabs           Horizontal tab bar with a selected index.
+                 → TabsView@0.1         (labels, selected_index)
+  Scrollbar      Track + thumb position indicator.
+                 → ScrollbarView@0.1    (position, content_length)
+  Gauge          Percentage-fill bar (Gauge + LineGauge share).
+                 → GaugeView@0.1        (ratio numerator, denominator)
+  Sparkline      Inline mini bar-history over a sample window.
+                 → SparklineView@0.1    (sample window, min, max)
+  BarChart       Labeled vertical bars with tick marks.
+                 → BarChartView@0.1     (labels, values)
+  Chart          Axis + dataset line/scatter plot (Fixed64
+                 scaling, no float).
+                 → ChartView@0.1        (axis bounds as Fixed64,
+                                        dataset point count)
+  Canvas         Arbitrary Fixed64-coordinate shape drawing
+                 (Bresenham line/rect/circle, braille grid).
+                 → CanvasView@0.1       (bounding box, shape count)
+  TextInput      Editable single-line/multi-line field with a
+                 cursor (TextInput + TextArea share).
+                 → TextInputView@0.1    (buffer text, cursor offset)
+  Tree           Recursive expand/collapse hierarchical list.
+                 → TreeView@0.1         (visible node count,
+                                        expanded-path set)
+  Calendar       Integer-date month grid with day markers.
+                 → CalendarView@0.1     (year, month, marked days)
+  Clear          Blank a Rect region (modal-overlay prep).
+                 → (no view — no visible state to report)
+
+`Layout` is not a drawn widget and emits no view record; it is
+the constraint splitter every consumer calls before assembling
+its widget stack.
+
+.section SEMANTIC_PIPE
+postui extends pillar 4 (semantically-queryable terminal) to
+every screen a TUI app renders. The contract is a two-line
+addition inside each widget's `draw()`:
+
+    <w>_view_pack(spec, state, rec_ptr, rec_cap)
+    SemanticRegistry::semantic_send(
+      SEMANTIC_SCHEMA_<TAG>, rec_ptr, rec_len)
+
+`SEMANTIC_SCHEMA_<TAG>` is a compile-time `u64` constant per
+widget-view schema (currently the four-byte MAGIC in the view
+header — BLKV / PGVW / LSVW / TBVW / TABV / SBVW / …; the
+constant name is what call sites reference, so a later swap to
+a BLAKE3-hashed schema name changes no call site).
+
+Every record follows the shape command_record.pdx established
+for the shell: fixed header (`u32 magic + u32 record_len +
+fields`) + variable payload + zero-pad to an 8-byte boundary.
+Every widget's schema is frozen at `@0.1` for v1;
+libpdx-semantic-pipe's already-shipped 4-rule version-tolerance
+matrix governs what a later `@0.2` may change without breaking
+subscribers.
+
+Subscriber side (a scraper, an agent, another tool downstream):
+
+    let bind : [u64; 3] = uninit
+    SemanticRegistry::semantic_binding_init(
+      &bind, SEMANTIC_SCHEMA_LSVW, on_list_view)
+    // per incoming frame:
+    SemanticRegistry::semantic_binding_dispatch(
+      &bind, incoming_schema, rec_ptr, rec_len)
+
+The 24-byte Binding record is (schema u64, callback u64,
+reserved u64); dispatch is two qword loads, one compare, one
+tail-call — no allocator, no runtime registry lookup.
+
+At v1 `semantic_send` returns 0 (OK) as a stub; the kernel
+`sys_semantic_send` slot lands on the paideia-os side as a
+follow-up (tracked cross-repo). The call-site shape does not
+change when the syscall lights up.
+
+.section EXTENSION_POINTS
+Adding a widget (the "widget #16" recipe) is four edits, all
+localised:
+
+  1. WIDGETSPEC       Add `src/widgets/<name>.pdx`. Export a
+                      `<Name>Spec` struct (config the caller
+                      passes in) and, if stateful, a
+                      `<Name>State` struct (cursor / scroll /
+                      selection the caller carries across
+                      frames — mirrors Ratatui's own
+                      spec/state split).
+  2. DRAW             Export `<name>_draw(spec, state, area,
+                      buf) -> err`. Write cells into `buf`
+                      row-major; consult `Block` if the widget
+                      wants chrome; consult `Layout` if it
+                      splits its own area.
+  3. VIEW-PACK        Export `<name>_view_pack(spec, state,
+                      rec_ptr, rec_cap) -> rec_len` that lays a
+                      frozen `<Name>View@0.1` record: `u32
+                      magic + u32 record_len + fixed-scalar
+                      fields describing the widget's state +
+                      minimum variable payload (labels, values)
+                      + zero-pad to 8-byte`. Freeze the field
+                      order; version bumps are `@0.2`, never
+                      an in-place layout change.
+  4. REGISTER         Add `SEMANTIC_SCHEMA_<TAG>` (the view
+                      header's MAGIC as a `u64`) to
+                      `src/semantic_registry.pdx`. Add
+                      `WK_<NAME>` ordinal to
+                      `src/widget_kind.pdx`; add a branch to
+                      `widget_draw` that tail-calls
+                      `<name>_draw`; bump `WK_COUNT`.
+
+Register the source file in `manifest.pdxproj` under `sources:`
+and add a unit smoke under `tests/`. No other module recompiles
+except the ones you touched — the closed-enum dispatch cost of
+"third-party code cannot add a widget without recompiling
+postui" is an explicit trade, consistent with every closed
+`KIND_*` ordinal set in this org (kernel cap kinds, syscall
+numbers, audit event kinds).
+
+.section NON_GOALS
+postui v1 deliberately does not ship:
+
+  - Scalar float arithmetic in widget internals. Chart axes
+    and Canvas shapes use `Fixed64` (Q32.32) instead. Tracked
+    upstream (paideia-as R89-XREPO scalar f32/f64 codegen);
+    non-blocking for v1.
+  - A heap allocator. Every widget takes caller-owned buffers
+    (`Buffer` cells, view-record scratch, string tables). No
+    postui module calls `sys_brk` or `sys_mmap`.
+  - Dynamic linking or third-party widget plugins. postui is a
+    static library; `WidgetKind` is a closed enum. Adding a
+    widget requires an edit to `widget_kind.pdx` — see
+    EXTENSION_POINTS.
+  - A retained-mode scene graph. Immediate-mode redraw only:
+    the caller reassembles its widget stack every frame,
+    `Buffer` diffing keeps the wire cost proportional to what
+    changed, not to what is on screen. A retained-mode GUI
+    toolkit is the eventual G4+ Vello/compositor track
+    (paideia-os milestones `g1`–`g12`) and is out of scope
+    here — postui is terminal-only.
+  - Palette / indexed / xterm-256 colour modes. 24-bit
+    truecolor throughout. The KIND_TUI_CANVAS cell format is
+    truecolor; a terminal that cannot render truecolor is a
+    downstream conversion problem.
+  - Cassowary or any general linear-constraint solver. Layout
+    is a single-pass integer largest-remainder apportionment
+    with clamp-and-redistribute (design §2.4) — a total,
+    terminating, deterministic function that never reports
+    infeasibility.
+  - Grapheme-cluster segmentation (UAX #29). Column widths use
+    the East-Asian-Width table (UAX #11) via the `Width`
+    module; combining marks past v1 land alongside a stdlib
+    grapheme routine when one exists.
+  - GPU / framebuffer / Kitty-graphics rendering. Cells only,
+    KIND_TUI_CANVAS → KIND_TTY. Pixel-plane substrates are
+    the G4+ track's problem.
+
+.section REFERENCES
+  docs/design.md            Authoritative postui spec: §0
+                            setting, §1 feasibility, §2
+                            architecture (cap model, render
+                            pipeline, semantic-pipe integration,
+                            layout engine, input handling,
+                            widget catalog, runtime loop), §3
+                            reference apps (postui-top / -hex /
+                            -dmesg), §4 cross-repo dependency
+                            chain, §5 milestone + issue plan.
+  design/architecture.md    Repo-internal architecture: §1
+                            public surface, §2 per-module
+                            details (Lib/Rect/Style/Color/Cell/
+                            Buffer/TuiCanvasClient/Frame/Block/
+                            WidgetKind), §3 draw lifecycle, §4
+                            cross-repo contract (KIND_TUI_CANVAS,
+                            KIND_TTY, KIND_MEMORY, semantic-pipe
+                            schemas), §5 return codes, §6
+                            discipline invariants, §7 fail-code
+                            family table.
+  manifest.pdxproj          Source list, dependencies, compliance
+                            flags, test targets, release policy.
+  README.md                 Project synopsis + milestone rollup.
+  STATUS.md                 Wave status + cross-repo
+                            dependencies.
+
+.section VERSION
+postui 1.0.0 (M5-004, wave postui-v1). First tagged release.
+Requires paideia-as v0.34+ toolchain. Ships alongside three
+reference-app satellites (`postui-top`, `postui-hex`,
+`postui-dmesg`) each built against this library over the
+paideia-os R89 KIND_TUI_CANVAS substrate.
