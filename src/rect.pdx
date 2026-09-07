@@ -219,9 +219,11 @@ module Rect = structure {
   //   if rx < x or ry < y: return 0
   //   else: return rect_new(x, y, rx - x, ry - y)
   //
-  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  // Register plan (5 callee-save pushes = 16-byte rsp alignment kept):
   //   rbx = bx    r12 = by    r13 = bx+bw    r14 = by+bh
   //   r8  = ax    r9  = ay    r10 = ax+aw    r11 = ay+ah
+  //   r15 = unused (5th push aligns rsp; body makes no nested call today
+  //                 but the discipline mirrors src/kernel/core/acpi/madt.pdx)
   //   rax = extract scratch then final pack accumulator/return.
   // rdi = a, rsi = b (both caller-save; treated read-only in the body).
   // ==========================================================================
@@ -229,12 +231,13 @@ module Rect = structure {
   pub let rect_intersect : (u64, u64) -> u64 !{} @{} =
     fn (a: u64) (b: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "postui.M1-002 (#2): rect_intersect returns the axis-aligned intersection of two packed Rects. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Extract a into r8=ax, r9=ay, r10=ax+aw, r11=ay+ah (compute the right/bottom edges BEFORE clobbering the base coords). Extract b into rbx=bx, r12=by, r13=bx+bw, r14=by+bh. Compute x=max(r8,rbx) into r8 via cmp+cmov-shape branch. y=max(r9,r12) into r9. rx=min(r10,r13) into r10. ry=min(r11,r14) into r11. Empty test: rx < x or ry < y -> jump ri_empty. Otherwise sub r8 from r10 (w = rx - x), sub r9 from r11 (h = ry - y), mask/shift/OR pack into rax exactly as rect_new does (bit slots 0/16/32/48). Every cmp is cmp reg, reg; every imm is 16 (shift) or 32 (shift) or 48 (shift) or 0xFFFF (mask) -- all imm32-safe. Labels prefixed ri_ per docs fingerprint discipline.",
+      justification: "postui.M1-002 (#2): rect_intersect returns the axis-aligned intersection of two packed Rects. Push rbx/r12/r13/r14/r15 -- 5 SysV callee-save pushes = 40 bytes; entry rsp%16==8, +40==48, rsp%16==0. Four pushes would leave rsp%16==8, mis-aligned for any nested SysV call; the body makes no nested call today, but the 5-push shape matches madt.pdx precedent and hardens the function against future edits that add one. r15 is not read or written between prologue and epilogue. Extract a into r8=ax, r9=ay, r10=ax+aw, r11=ay+ah (compute the right/bottom edges BEFORE clobbering the base coords). Extract b into rbx=bx, r12=by, r13=bx+bw, r14=by+bh. Compute x=max(r8,rbx) into r8 via cmp+cmov-shape branch. y=max(r9,r12) into r9. rx=min(r10,r13) into r10. ry=min(r11,r14) into r11. Empty test: rx < x or ry < y -> jump ri_empty. Otherwise sub r8 from r10 (w = rx - x), sub r9 from r11 (h = ry - y), mask/shift/OR pack into rax exactly as rect_new does (bit slots 0/16/32/48). Every cmp is cmp reg, reg; every imm is 16 (shift) or 32 (shift) or 48 (shift) or 0xFFFF (mask) -- all imm32-safe. Labels prefixed ri_ per docs fingerprint discipline.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
+        push r15;
 
         // ---- Extract a -----------------------------------------------------
         // r8 = a.x
@@ -335,6 +338,7 @@ module Rect = structure {
         or  rax, r10;
         or  rax, r11;
 
+        pop r15;
         pop r14;
         pop r13;
         pop r12;
@@ -343,6 +347,7 @@ module Rect = structure {
 
       ri_empty:
         xor rax, rax;
+        pop r15;
         pop r14;
         pop r13;
         pop r12;

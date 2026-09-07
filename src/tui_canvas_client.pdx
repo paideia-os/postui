@@ -59,15 +59,32 @@ module TuiCanvasClient = structure {
   pub let TCC_R_TUI_ALL     : u64 = 0x63A
 
   // ==========================================================================
-  // Kernel-side failure band (docs/design.md §2.1 Failure taxonomy)
+  // Kernel-side failure band (mirrors kind_tui_canvas.pdx verbatim).
   //
-  // Disjoint from KIND_TTY's 0xFFFFEC30..0xFFFFEC3F band. postui's
-  // own userspace-side band (Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB00)
-  // is disjoint from both, so a return can be attributed to postui,
-  // KIND_TUI_CANVAS kernel, or KIND_TTY kernel by high-byte alone.
+  // The docs/design.md value (0xFFFFEC40..0xFFFFEC4F) collided with
+  // KIND_NVME_CONTROLLER's page; the real kernel landing moved to a
+  // verified-free page (see src/kernel/core/cap/kind_tui_canvas.pdx
+  // deviation (1)) at 0xFFFFEB10..0xFFFFEB1F. This mirror is the
+  // authoritative userspace-visible copy; every sentinel below is
+  // byte-for-byte identical to its TUI_* counterpart in
+  // kind_tui_canvas.pdx (lines 104-113). postui's own userspace-side
+  // band (Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB80) is disjoint from
+  // both this page and KIND_SIG_KEY's 0xFFFFEB00..0F, so a return
+  // can be attributed to postui, KIND_TUI_CANVAS kernel, or KIND_TTY
+  // kernel by inspection.
   // ==========================================================================
 
-  pub let TCC_ERR_BAND_BASE : u64 = 0xFFFFEC40
-  pub let TCC_ERR_BAND_TOP  : u64 = 0xFFFFEC4F
+  pub let TCC_ERR_BAND_BASE : u64 = 0xFFFFEB10
+  pub let TCC_ERR_BAND_TOP  : u64 = 0xFFFFEB1F
+
+  pub let TCC_OK                  : u64 = 0
+  pub let TCC_ERR_TAIL_ENOSPC     : u64 = 0xFFFFEB1F
+  pub let TCC_ERR_MINT_BAD_MEMORY : u64 = 0xFFFFEB1E
+  pub let TCC_ERR_MINT_BAD_TTY    : u64 = 0xFFFFEB1D
+  pub let TCC_ERR_MINT_BAD_DIMS   : u64 = 0xFFFFEB1C
+  pub let TCC_ERR_MINT_BAD_SIZE   : u64 = 0xFFFFEB1B
+  pub let TCC_ERR_BAD_SLOT        : u64 = 0xFFFFEB1A
+  pub let TCC_ERR_BAD_RIGHTS      : u64 = 0xFFFFEB19
+  pub let TCC_ERR_REVOKE_ALREADY  : u64 = 0xFFFFEB18
 
 }

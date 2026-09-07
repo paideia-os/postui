@@ -130,9 +130,11 @@ module Color = structure {
   // bq where each channel index is `c / 51`. The greyscale ramp
   // (232..255) is not used; the caller gets the closest cube cell only.
   //
-  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  // Register plan (5 callee-save pushes = 16-byte rsp alignment kept):
   //   rbx = r_idx      r12 = g_idx      r13 = saved b arg
   //   r14 = b_idx      r8  = 51 divisor and pack-scratch
+  //   r15 = unused (5th push aligns rsp; body makes no nested call today
+  //                 but the discipline mirrors madt.pdx precedent)
   //   rax = div dividend then accumulator/return
   //   rdx = div remainder (clobbered every iteration)
   // rdi/rsi/rdx = args (rdx is CLOBBERED by div so we save b to r13 first).
@@ -141,12 +143,13 @@ module Color = structure {
   pub let color_to_index : (u64, u64, u64) -> u64 !{} @{} =
     fn (r: u64) (g: u64) (b: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "postui.M1-002 (#2): color_to_index quantizes an (r,g,b) triple to the xterm 6x6x6 palette index. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Save b into r13 BEFORE the first `div r8` (div clobbers rdx which holds the b arg). For each channel: mask to 0xFF into rax, clear rdx via xor, load divisor 51 into r8, `div r8` (rax=quotient, rdx=remainder; same shape mkfs.pdxfs/src/format_record.pdx uses). Store rq/gq/bq in rbx/r12/r14. Then compose 36*rq + 6*gq + bq via two 2-op imul reg,reg (36 -> r8 then imul rax,r8; 6 -> r9 then imul r8,r9 where r8 holds gq); finally add 16 (imm32-safe). All immediates (0xFF, 51, 36, 6, 16) fit imm32. No test mnemonic; no compares. Effects `!{} @{}` -- pure register logic. Labels prefixed ci_ per docs fingerprint discipline (none needed here -- straight-line body).",
+      justification: "postui.M1-002 (#2): color_to_index quantizes an (r,g,b) triple to the xterm 6x6x6 palette index. Push rbx/r12/r13/r14/r15 -- 5 SysV callee-save pushes = 40 bytes; entry rsp%16==8, +40==48, rsp%16==0. Four pushes would leave rsp%16==8, mis-aligned for any nested SysV call; the body makes no nested call today (div is a register op, not a call), but the 5-push shape matches madt.pdx precedent and hardens the function against future edits that add one. r15 is not read or written between prologue and epilogue. Save b into r13 BEFORE the first `div r8` (div clobbers rdx which holds the b arg). For each channel: mask to 0xFF into rax, clear rdx via xor, load divisor 51 into r8, `div r8` (rax=quotient, rdx=remainder; same shape mkfs.pdxfs/src/format_record.pdx uses). Store rq/gq/bq in rbx/r12/r14. Then compose 36*rq + 6*gq + bq via two 2-op imul reg,reg (36 -> r8 then imul rax,r8; 6 -> r9 then imul r8,r9 where r8 holds gq); finally add 16 (imm32-safe). All immediates (0xFF, 51, 36, 6, 16) fit imm32. No test mnemonic; no compares. Effects `!{} @{}` -- pure register logic. Labels prefixed ci_ per docs fingerprint discipline (none needed here -- straight-line body).",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
+        push r15;
 
         // Save b BEFORE div clobbers rdx.
         mov r13, rdx;
@@ -188,6 +191,7 @@ module Color = structure {
         add rax, r14;
         add rax, 16;
 
+        pop r15;
         pop r14;
         pop r13;
         pop r12;
@@ -203,9 +207,11 @@ module Color = structure {
   // blend factor: t == 0 returns a, t == 256 returns b. Values above
   // 256 are clamped to 256 (saturate at b rather than wrap).
   //
-  // Register plan (4 callee-save pushes = 16-byte rsp alignment kept):
+  // Register plan (5 callee-save pushes = 16-byte rsp alignment kept):
   //   rbx = b.b         r12 = out.r      r13 = out.g
   //   r14 = 256 - t     r8/r9/r10/r11 = extract scratches
+  //   r15 = unused (5th push aligns rsp; body makes no nested call today
+  //                 but the discipline mirrors madt.pdx precedent)
   //   rax = channel accumulator / final pack / return
   // rdi = a, rsi = b, rdx = t (rdx is clamped but not clobbered by any
   // div in this function).
@@ -214,12 +220,13 @@ module Color = structure {
   pub let color_lerp : (u64, u64, u64) -> u64 !{} @{} =
     fn (a: u64) (b: u64) (t: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "postui.M1-002 (#2): color_lerp blends two 24-bit Colors by a 0..256 factor t. Push rbx/r12/r13/r14 (SysV callee-save, 4 pushes = 16-byte aligned rsp). Clamp t: if t > 256, mov rdx, 256 (imm 256 imm32-safe). Compute inv = 256 - t into r14 via `mov r14, 256; sub r14, rdx`. Extract a.r into rax (and 0xFF), a.g into r8 (shr 8, and 0xFF), a.b into r9 (shr 16, and 0xFF). Extract b.r into r10 (and 0xFF), b.g into r11 (shr 8, and 0xFF), b.b into rbx (shr 16, and 0xFF). Per channel: rax = (inv*a_c + t*b_c) via two 2-op imul reg,reg then add; `shr rax, 8` to divide by 256; `and rax, 0xFF` to clamp any high-bit slop. Store r/g into r12/r13; b lives in rax when we pack. Pack via shl 8/16 + OR into rax. Every imm (0xFF, 256, 8, 16, cl_t_ok label offset) fits imm32. Effects `!{} @{}` -- pure register logic. Labels prefixed cl_ per docs fingerprint discipline.",
+      justification: "postui.M1-002 (#2): color_lerp blends two 24-bit Colors by a 0..256 factor t. Push rbx/r12/r13/r14/r15 -- 5 SysV callee-save pushes = 40 bytes; entry rsp%16==8, +40==48, rsp%16==0. Four pushes would leave rsp%16==8, mis-aligned for any nested SysV call; the body makes no nested call today, but the 5-push shape matches madt.pdx precedent and hardens the function against future edits that add one. r15 is not read or written between prologue and epilogue. Clamp t: if t > 256, mov rdx, 256 (imm 256 imm32-safe). Compute inv = 256 - t into r14 via `mov r14, 256; sub r14, rdx`. Extract a.r into rax (and 0xFF), a.g into r8 (shr 8, and 0xFF), a.b into r9 (shr 16, and 0xFF). Extract b.r into r10 (and 0xFF), b.g into r11 (shr 8, and 0xFF), b.b into rbx (shr 16, and 0xFF). Per channel: rax = (inv*a_c + t*b_c) via two 2-op imul reg,reg then add; `shr rax, 8` to divide by 256; `and rax, 0xFF` to clamp any high-bit slop. Store r/g into r12/r13; b lives in rax when we pack. Pack via shl 8/16 + OR into rax. Every imm (0xFF, 256, 8, 16, cl_t_ok label offset) fits imm32. Effects `!{} @{}` -- pure register logic. Labels prefixed cl_ per docs fingerprint discipline.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
+        push r15;
 
         // Clamp t to [0..256].
         cmp rdx, 256;
@@ -286,6 +293,7 @@ module Color = structure {
         or  rax, r13;
         or  rax, r9;
 
+        pop r15;
         pop r14;
         pop r13;
         pop r12;

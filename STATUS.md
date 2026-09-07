@@ -1,7 +1,7 @@
 # postui — status
 
 **Wave:** postui v1 (Ratatui-parity TUI library)
-**Current milestone:** none landed — design phase complete, M1 not started
+**Current milestone:** M1 in progress — #1/#2/#3 landed on main, #4-#9 open
 **Version:** unreleased (pre-`0.1.0`)
 
 See `docs/design.md` for the full spec and `docs/design.md` §5 for the
@@ -12,7 +12,7 @@ satellites (`postui-top`, `postui-hex`, `postui-dmesg`).
 
 | Milestone | Scope | Status |
 |---|---|---|
-| M1 | Skeleton + cell buffer + minimal Block widget | open, not started |
+| M1 | Skeleton + cell buffer + minimal Block widget | in progress (#1 scaffold, #2 primitives, #3 Cell/Buffer landed; #4-#9 open) |
 | M2 | Layout + Paragraph/List/Table/Tabs | open, not started |
 | M3 | Charts + canvas (Fixed64 fixed-point) | open, not started |
 | M4 | Tree/calendar/textinput/input pipeline | open, not started |

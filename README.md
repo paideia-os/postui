@@ -8,10 +8,12 @@ diffing.
 
 ## Status
 
-**Design phase — M1 not yet landed.** See `docs/design.md` for the
-authoritative spec (feasibility assessment, cap architecture, semantic-pipe
-integration, layout engine, widget catalog, reference apps, and the full
-milestone/issue plan) and `STATUS.md` for the milestone rollup.
+**M1 in progress.** M1-001 (scaffold), M1-002 (rect/style/color primitives),
+and M1-003 (Cell/Buffer) have landed on main; M1-004 through M1-009 remain
+open. See `docs/design.md` for the authoritative spec (feasibility
+assessment, cap architecture, semantic-pipe integration, layout engine,
+widget catalog, reference apps, and the full milestone/issue plan) and
+`STATUS.md` for the milestone rollup.
 
 ## Why postui
 

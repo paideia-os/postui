@@ -14,13 +14,17 @@
 #   3. $HOME/Development/PaideiaOS/tools/paideia-as/target/release/paideia-as
 #   4. paideia-as on $PATH
 #
-# Requires paideia-as >= 0.21.0. Older releases predate module-basename-
-# PascalCase enforcement and other invariants postui sources rely on.
+# Requires paideia-as >= 0.34.0. postui's manifest pins that floor:
+# 0.34 is the first release that carries the full mnemonic surface
+# (2-op imul reg,reg, single-line pub let string literals, module-
+# basename PascalCase enforcement, and the tightened test-mnemonic
+# reservation) every postui source depends on. Older releases will
+# either mis-encode or refuse to parse this tree.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MIN_VERSION="0.21.0"
+MIN_VERSION="0.34.0"
 
 # --- help gate ---------------------------------------------------------
 for arg in "$@"; do
