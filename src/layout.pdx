@@ -162,14 +162,14 @@
 // or by splitting the region into two nested layouts.
 //
 // =============================================================================
-// ERROR BAND (0xFFFFEBA0..0xFFFFEBAF, disjoint from every other postui
+// ERROR BAND (0xFFFFEBC0..0xFFFFEBCF, disjoint from every other postui
 // band -- see design/architecture.md §5.1)
 // =============================================================================
 //
 // Anchored at Lib::POSTUI_ERR_BAND_BASE = 0xFFFFEB80. Layout owns the
 // third slice above the base (Frame at 0xFFFFEB90..9F, Layout at
 // 0xFFFFEBA0..AF -- the M1-006 Block widget's aspirational reservation
-// at design/architecture.md §5.1 for 0xFFFFEBA0..AF was never used --
+// at design/architecture.md §5.1 for 0xFFFFEBA0..AF is still held for Block --
 // Block's body at src/block.pdx returns 0 or 1 only; the band is
 // available). WidgetKind at 0xFFFFEBB0..BF (verified against
 // widget_kind.pdx WK_ERR_UNIMPLEMENTED / WK_ERR_BAD_KIND) is disjoint.
@@ -191,7 +191,7 @@
 //     fits imm32 as a positive value. The tag-shift constant (56, 48,
 //     28, 24) is imm8. The stack-frame offsets (up to 1056) fit imm32
 //     trivially.
-//   - Every error sentinel (0xFFFFEBA0..0xFFFFEBA4) is loaded via
+//   - Every error sentinel (0xFFFFEBC0..0xFFFFEBC4) is loaded via
 //     `mov reg, imm` (paideia-as emits movabs for imm > 0x7FFFFFFF --
 //     the same idiom cap_handler_tui_canvas.pdx uses for TUI_BAD_SLOT).
 //   - Constraint tag ordinals (1..6) and direction ordinals (0..1)
@@ -271,15 +271,15 @@ module Layout = structure {
 
   // ==========================================================================
   // Error sentinels. Anchored at Lib::POSTUI_ERR_BAND_BASE (0xFFFFEB80)
-  // + 0x20 offset = 0xFFFFEBA0, per design/architecture.md §5.1
-  // (Layout owns 0xFFFFEBA0..0xFFFFEBAF). Every sentinel > 0x7FFFFFFF,
+  // + 0x20 offset = 0xFFFFEBC0, per design/architecture.md §5.1
+  // (Layout owns 0xFFFFEBC0..0xFFFFEBCF). Every sentinel > 0x7FFFFFFF,
   // so `mov reg, imm` emits movabs; NEVER used in cmp/and.
   // ==========================================================================
-  pub let LAYOUT_ERR_ZERO_COUNT     : u64 = 0xFFFFEBA0
-  pub let LAYOUT_ERR_TOO_MANY       : u64 = 0xFFFFEBA1
-  pub let LAYOUT_ERR_BAD_TAG        : u64 = 0xFFFFEBA2
-  pub let LAYOUT_ERR_BAD_RATIO      : u64 = 0xFFFFEBA3
-  pub let LAYOUT_ERR_BAD_DIRECTION  : u64 = 0xFFFFEBA4
+  pub let LAYOUT_ERR_ZERO_COUNT     : u64 = 0xFFFFEBC0
+  pub let LAYOUT_ERR_TOO_MANY       : u64 = 0xFFFFEBC1
+  pub let LAYOUT_ERR_BAD_TAG        : u64 = 0xFFFFEBC2
+  pub let LAYOUT_ERR_BAD_RATIO      : u64 = 0xFFFFEBC3
+  pub let LAYOUT_ERR_BAD_DIRECTION  : u64 = 0xFFFFEBC4
 
   // ==========================================================================
   // layout_length(n) -> u64
@@ -512,7 +512,7 @@ module Layout = structure {
     fn (parent: u64) (direction: u64) (constraints_ptr: u64) (count: u64) (out_rects_ptr: u64) -> unsafe {
       effects: {mem},
       capabilities: {},
-      justification: "postui.M2-001 (postui#10): layout_split is the Hamilton-method integer apportionment engine. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes) + sub rsp, 1056 (66 x 16 = aligned); entry rsp%16 == 8, +1096 keeps rsp%16 == 0 -- ready for any nested call the body might grow (none today). Stack layout: [rsp+0..512) allocs[64], [rsp+512..1024) residuals[64], [rsp+1024..1032) saved parent, [rsp+1032..1040) saved direction, [rsp+1040..1048) saved out_rects_ptr, [rsp+1048..1056) pad. Register plan: rbx = constraints_ptr, r12 = allocs base, r13 = residuals base, r14 = count, r15 = total_axis then residual. Phase 0 (validation): reject count==0 (LAYOUT_ERR_ZERO_COUNT), count>64 (LAYOUT_ERR_TOO_MANY), direction>1 (LAYOUT_ERR_BAD_DIRECTION); each `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 64, 1); each `mov rax, imm` for the error sentinel emits movabs (imm > 0x7FFFFFFF, legal for mov). Phase 1 (base allocation, single pass): rcx walks byte offset 0..count*8 step 8; each iteration loads c = [rbx+rcx+0], extracts tag = c >> 56 (imm8 shift), dispatches via cmp/je chain on tags 1..6 (imm32-safe), computes base per kind (Length/Min/Max: base = c & 0xFFFFFF; Percentage: base = (r15*p)/100 via 2-op imul + xor rdx/div; Ratio: base = (r15*num)/den, trap den==0 as LAYOUT_ERR_BAD_RATIO; Fill: base = 0), stores base to [r12+rcx+0], accumulates sum_base in r10. Unknown tag falls through to LAYOUT_ERR_BAD_TAG. Phase 2: residual = max(0, total_axis - sum_base); stash in r15 (repurposed after total_axis is no longer needed). Phase 3 (largest-remainder apportionment): first pass sums Fill weights into r10 (sum_w); if r10 == 0 or r15 == 0 skip; second pass computes floor_i and remainder_i for each Fill (numerator = residual * w via 2-op imul rax,rdi; div via `xor rdx, rdx; div r10`; the result rax = floor and rdx = remainder ONLY if `mul` were used -- here 2-op imul truncates to 64 bits so we must clear rdx via xor before div. Actually 2-op imul does NOT touch rdx, so `mul rdi` would be needed to get the high half. Since our products fit u64 (u24 * u24 = u48), 2-op imul + xor rdx, rdx + div is safe: after 2-op imul the low 64 of the product is in rax; xor rdx clears the high half; div r10 gives quot=floor in rax and rem in rdx.). Store floor into allocs[i] (load-add-store: mov rdi, [r12+rcx+0]; add rdi, rax; mov [r12+rcx+0], rdi); store rem into residuals[i]; accumulate sum_floors in r8. Non-Fill constraints get residuals[i] = 0. Third pass (leftover distribution): leftover = residual - sum_floors; each iteration scans all Fill items to find the one with largest residual (tie-break lowest index via strict-greater compare + first-seen-wins), adds 1 to its alloc, zeros its residual, decrements leftover. Phase 4 (pack output rects): rsi walks running offset (adds alloc_i per iteration); r15 reloaded with parent, r10 reloaded with out_rects_ptr; each iteration extracts (x, y, w, h) per direction (horizontal: x = parent_x + offset, y = parent_y, w = alloc, h = parent_h; vertical: x = parent_x, y = parent_y + offset, w = parent_w, h = alloc), then packs into rax via and/shl/or (each mask 0xFFFF imm32-safe; each shift by 16/32/48 imm8-safe), stores rax to [r10+rcx+0]. Success: xor rax, rax; add rsp, 1056; 5-pop; ret. Every error path: mov rax, 0xFFFFEBAx (movabs); add rsp, 1056; 5-pop; ret via a shared epilogue. No `test` mnemonic. No 2-op `imul reg, imm` (all imul is 2-op reg,reg). No `and reg, imm64` (widest is 0xFFFFFF at 24 bits, imm32-safe). No cross-module or intra-module call. Labels prefixed ls_ per docs fingerprint discipline (ls_p1_/ls_p2_/ls_p3_/ls_p4_ per phase; ls_err_ for error arms; ls_epilogue for the shared return).",
+      justification: "postui.M2-001 (postui#10): layout_split is the Hamilton-method integer apportionment engine. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes) + sub rsp, 1056 (66 x 16 = aligned); entry rsp%16 == 8, +1096 keeps rsp%16 == 0 -- ready for any nested call the body might grow (none today). Stack layout: [rsp+0..512) allocs[64], [rsp+512..1024) residuals[64], [rsp+1024..1032) saved parent, [rsp+1032..1040) saved direction, [rsp+1040..1048) saved out_rects_ptr, [rsp+1048..1056) pad. Register plan: rbx = constraints_ptr, r12 = allocs base, r13 = residuals base, r14 = count, r15 = total_axis then residual. Phase 0 (validation): reject count==0 (LAYOUT_ERR_ZERO_COUNT), count>64 (LAYOUT_ERR_TOO_MANY), direction>1 (LAYOUT_ERR_BAD_DIRECTION); each `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 64, 1); each `mov rax, imm` for the error sentinel emits movabs (imm > 0x7FFFFFFF, legal for mov). Phase 1 (base allocation, single pass): rcx walks byte offset 0..count*8 step 8; each iteration loads c = [rbx+rcx+0], extracts tag = c >> 56 (imm8 shift), dispatches via cmp/je chain on tags 1..6 (imm32-safe), computes base per kind (Length/Min/Max: base = c & 0xFFFFFF; Percentage: base = (r15*p)/100 via 2-op imul + xor rdx/div; Ratio: base = (r15*num)/den, trap den==0 as LAYOUT_ERR_BAD_RATIO; Fill: base = 0), stores base to [r12+rcx+0], accumulates sum_base in r10. Unknown tag falls through to LAYOUT_ERR_BAD_TAG. Phase 2: residual = max(0, total_axis - sum_base); stash in r15 (repurposed after total_axis is no longer needed). Phase 3 (largest-remainder apportionment): first pass sums Fill weights into r10 (sum_w); if r10 == 0 or r15 == 0 skip; second pass computes floor_i and remainder_i for each Fill (numerator = residual * w via 2-op imul rax,rdi; div via `xor rdx, rdx; div r10`; the result rax = floor and rdx = remainder ONLY if `mul` were used -- here 2-op imul truncates to 64 bits so we must clear rdx via xor before div. Actually 2-op imul does NOT touch rdx, so `mul rdi` would be needed to get the high half. Since our products fit u64 (u24 * u24 = u48), 2-op imul + xor rdx, rdx + div is safe: after 2-op imul the low 64 of the product is in rax; xor rdx clears the high half; div r10 gives quot=floor in rax and rem in rdx.). Store floor into allocs[i] (load-add-store: mov rdi, [r12+rcx+0]; add rdi, rax; mov [r12+rcx+0], rdi); store rem into residuals[i]; accumulate sum_floors in r8. Non-Fill constraints get residuals[i] = 0. Third pass (leftover distribution): leftover = residual - sum_floors; each iteration scans all Fill items to find the one with largest residual (tie-break lowest index via strict-greater compare + first-seen-wins), adds 1 to its alloc, zeros its residual, decrements leftover. Phase 4 (pack output rects): rsi walks running offset (adds alloc_i per iteration); r15 reloaded with parent, r10 reloaded with out_rects_ptr; each iteration extracts (x, y, w, h) per direction (horizontal: x = parent_x + offset, y = parent_y, w = alloc, h = parent_h; vertical: x = parent_x, y = parent_y + offset, w = parent_w, h = alloc), then packs into rax via and/shl/or (each mask 0xFFFF imm32-safe; each shift by 16/32/48 imm8-safe), stores rax to [r10+rcx+0]. Success: xor rax, rax; add rsp, 1056; 5-pop; ret. Every error path: mov rax, 0xFFFFEBCx (movabs); add rsp, 1056; 5-pop; ret via a shared epilogue. No `test` mnemonic. No 2-op `imul reg, imm` (all imul is 2-op reg,reg). No `and reg, imm64` (widest is 0xFFFFFF at 24 bits, imm32-safe). No cross-module or intra-module call. Labels prefixed ls_ per docs fingerprint discipline (ls_p1_/ls_p2_/ls_p3_/ls_p4_ per phase; ls_err_ for error arms; ls_epilogue for the shared return).",
       block: {
         push rbx;
         push r12;
@@ -862,23 +862,23 @@ module Layout = structure {
         // (legal for mov, NOT for cmp/and).
         // =====================================================================
       ls_err_zero_count:
-        mov rax, 0xFFFFEBA0;
+        mov rax, 0xFFFFEBC0;
         jmp ls_epilogue;
 
       ls_err_too_many:
-        mov rax, 0xFFFFEBA1;
+        mov rax, 0xFFFFEBC1;
         jmp ls_epilogue;
 
       ls_err_bad_tag:
-        mov rax, 0xFFFFEBA2;
+        mov rax, 0xFFFFEBC2;
         jmp ls_epilogue;
 
       ls_err_bad_ratio:
-        mov rax, 0xFFFFEBA3;
+        mov rax, 0xFFFFEBC3;
         jmp ls_epilogue;
 
       ls_err_bad_direction:
-        mov rax, 0xFFFFEBA4;
+        mov rax, 0xFFFFEBC4;
         jmp ls_epilogue;
 
       ls_epilogue:
