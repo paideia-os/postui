@@ -403,10 +403,15 @@ module Width = structure {
         jb  sd_trunc;
 
         // cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+        // Validate b1 is a continuation byte (0x80..0xBF) before folding.
         and rdx, 0x1F;
         shl rdx, 6;
         xor r9, r9;
         mov_b r9, [rbx + r13 + 1];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         or  rdx, r9;
 
@@ -428,17 +433,26 @@ module Width = structure {
         jb  sd_trunc;
 
         // cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+        // Validate b1, b2 are continuation bytes (0x80..0xBF) before folding.
         and rdx, 0x0F;
         shl rdx, 12;
 
         xor r9, r9;
         mov_b r9, [rbx + r13 + 1];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         shl r9, 6;
         or  rdx, r9;
 
         xor r9, r9;
         mov_b r9, [rbx + r13 + 2];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         or  rdx, r9;
 
@@ -461,23 +475,36 @@ module Width = structure {
 
         // cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12)
         //    | ((b2 & 0x3F) << 6)  | (b3 & 0x3F)
+        // Validate b1, b2, b3 are continuation bytes (0x80..0xBF).
         and rdx, 0x07;
         shl rdx, 18;
 
         xor r9, r9;
         mov_b r9, [rbx + r13 + 1];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         shl r9, 12;
         or  rdx, r9;
 
         xor r9, r9;
         mov_b r9, [rbx + r13 + 2];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         shl r9, 6;
         or  rdx, r9;
 
         xor r9, r9;
         mov_b r9, [rbx + r13 + 3];
+        mov r8, r9;
+        and r8, 0xC0;
+        cmp r8, 0x80;
+        jne sd_trunc;
         and r9, 0x3F;
         or  rdx, r9;
 
