@@ -161,7 +161,7 @@ module Terminal = structure {
   // this constant and the literal must be kept in sync BY HAND at
   // the flip. See "THE FLIP" in the module header.
   // ==========================================================================
-  pub let TERMINAL_KIND_TTY_LIVE : u64 = 0
+  pub let TERMINAL_KIND_TTY_LIVE : u64 = 1
 
   // ==========================================================================
   // KIND_TTY op ordinals (defensive stubs pending paideia-os #1986).
@@ -174,7 +174,7 @@ module Terminal = structure {
   // next. Consumers MUST NOT flip TERMINAL_KIND_TTY_LIVE without
   // reconciling this against the landed value.
   // ==========================================================================
-  pub let TRM_TTY_OP_READ : u64 = 1
+  pub let TRM_TTY_OP_READ : u64 = 6
 
   // ==========================================================================
   // SC+ sysno mirrors. TRM_SYS_CAP_INVOKE = 4 mirrors
@@ -337,8 +337,8 @@ module Terminal = structure {
       justification: "postui.M4-007 (#33): terminal_read_input is the primary-path input dispatcher, source-flippable between KIND_TTY TTY_OP_READ (primary, post-paideia-os #1986) and sys_read(0) (fallback, today). Gate: `mov rax, 0` (the source-editable TERMINAL_KIND_TTY_LIVE literal; flip to 1 at the M4-007 primary-path enable) then `cmp rax, 0; je trm_read_fallback`. imm32-safe (0). Primary branch: lea rax, [rip + _terminal_tty_cap]; mov rax, [rax + 0] (load consumer-stashed KIND_TTY cap slot); cmp rax, 0; je trm_read_no_cap (defensive refusal on unset cap slot). Then the SysV->SYSCALL shuffle for sys_cap_invoke(slot, op, buf, len) -- SysV entry rdi=buf_ptr, rsi=buf_len, rax=cap_slot; SYSCALL wants rdi=slot, rsi=op_arg=TRM_TTY_OP_READ=1, rdx=buf, r10=len. Five-move shuffle, ORDER-CRITICAL, verified: (1) mov r10, rsi snapshots buf_len before step (4) overwrites rsi; (2) mov rdx, rdi snapshots buf_ptr before step (3) overwrites rdi; (3) mov rdi, rax puts cap_slot in SYSCALL arg0 (rdi's original buf_ptr already in rdx); (4) mov rsi, 1 puts TRM_TTY_OP_READ in SYSCALL arg1 (rsi's original buf_len already in r10); (5) mov rax, 4 puts TRM_SYS_CAP_INVOKE in SYSNO. Then syscall; ret. rcx/r11 clobbered by SYSCALL are SysV caller-save (harmless); r10 clobber is our own scratch (harmless). No-cap fault path (trm_read_no_cap): mov rax, 0xFFFFEBE7 (TRM_ERR_NO_TTY_CAP; > 0x7FFFFFFF forces paideia-as 10-byte movabs form -- legal for mov, NOT for cmp/and; same pattern frame.pdx uses for 0xFFFFEB9x sentinels); ret. Fallback branch (trm_read_fallback): verbatim shape frame_next_event ships (M1-005) -- mov rdx, rsi (count->arg2); mov rsi, rdi (buf->arg1); xor rdi, rdi (fd=0->arg0); xor rax, rax (SYSNO=TRM_SYSNO_READ=0); syscall; ret. Leaf: no push/pop, no callee-save touched, no nested call. Every immediate in cmp/and fits imm32 (0, 1). No `test`. No `imul`. No r11 use (r11 CPU-side clobber by SYSCALL is caller-save). Effect !{mem, sysreg} @{cap}: primary branch transitively invokes the KIND_TTY cap via sys_cap_invoke; fallback branch invokes sys_read (fits in {mem, sysreg} without cap effect). The union is the declared row -- once TERMINAL_KIND_TTY_LIVE flips to 1 the fallback branch becomes dead code but stays compiled per docs/design.md §2.5 removal-deferred clause. Labels prefixed trm_ per fingerprint discipline.",
       block: {
         // ---- Gate on TERMINAL_KIND_TTY_LIVE (source-editable) -----------
-        // Change the `0` on the next line to `1` at the M4-007 flip.
-        mov rax, 0;
+        // Flipped to 1 post-paideia-os#1986 landing (postui#44).
+        mov rax, 1;
         cmp rax, 0;
         je trm_read_fallback;
 
@@ -351,7 +351,7 @@ module Terminal = structure {
         mov r10, rsi;                        // SYSCALL arg3 = buf_len
         mov rdx, rdi;                        // SYSCALL arg2 = buf_ptr
         mov rdi, rax;                        // SYSCALL arg0 = cap_slot
-        mov rsi, 1;                          // SYSCALL arg1 = TRM_TTY_OP_READ
+        mov rsi, 6;                          // SYSCALL arg1 = TRM_TTY_OP_READ (kind_tty.pdx:214)
         mov rax, 4;                          // SYSNO = TRM_SYS_CAP_INVOKE
         syscall;
         ret;
