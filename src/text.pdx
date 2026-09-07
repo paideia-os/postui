@@ -126,9 +126,14 @@
 //                          byte of the (i+1)th visual line.
 // * `out_max`      -- capacity of that buffer.
 // * Returns: on success, the number of break points written (0..out_max).
-//             On buffer overflow, TEXT_ERR_BUF_TOO_SMALL. A caller can
-//             distinguish success from failure via
-//             `cmp rax, POSTUI_ERR_BAND_BASE` (0xFFFFEB80) -- every
+//             On buffer overflow, TEXT_ERR_BUF_TOO_SMALL. A caller
+//             distinguishes success from failure by staging
+//             POSTUI_ERR_BAND_BASE (0xFFFFEB80) into a scratch register
+//             via `mov` (paideia-as emits movabs for imm > 0x7FFFFFFF)
+//             and then `cmp rax, <scratch>; jae <is_error>` -- NEVER
+//             `cmp rax, 0xFFFFEB80` directly, which is illegal under
+//             this module's own imm32 discipline (every `cmp reg, imm`
+//             must use imm <= 0x7FFFFFFF; 0xFFFFEB80 does not). Every
 //             legitimate count is <= out_max which realistic callers
 //             cap at 4096 (TUI_DIM_MAX per docs/design.md §2.1), well
 //             below the sentinel band.
@@ -153,7 +158,20 @@
 //          b in [0xE0..0xF0)   -> 2     (3-byte lead, approximates wide)
 //          b in [0xF0..0xF8)   -> 2     (4-byte lead, astral approx wide)
 //          b >= 0xF8           -> 1     (invalid, U+FFFD replacement)
-//     2. If cur_col + w > max_width AND cur_col > 0 (overflow test):
+//     2. UTF-8 continuation byte (0x80..0xC0) SKIPS this step entirely
+//        (w == 0 always, and it is never a legal break boundary) and
+//        falls straight through to step 3/4. This is load-bearing:
+//        without it, a codepoint whose own width already exceeds
+//        max_width (the "single over-wide character alone on the
+//        line" case, let through by the cur_col > 0 guard below being
+//        false at the LEAD byte) leaves cur_col sitting above
+//        max_width, and re-running this test on the codepoint's own
+//        continuation byte(s) would find cur_col > 0 now true and
+//        emit a break at that continuation byte -- mid-codepoint.
+//        Every other width class (including b < 0x20 / b == 0x7F,
+//        which are complete one-byte codepoints and legal break
+//        points) DOES run this step.
+//     3. If cur_col + w > max_width AND cur_col > 0 (overflow test):
 //          if have_space:
 //            emit last_space_after_byte  (word break; skip the space)
 //            cur_col = word_width; have_space = 0
@@ -162,8 +180,8 @@
 //            cur_col = 0; word_width = 0
 //        (in either case: if count_written >= out_max ->
 //         return TEXT_ERR_BUF_TOO_SMALL)
-//     3. cur_col += w; word_width += w
-//     4. If b == 0x20 (ASCII space):
+//     4. cur_col += w; word_width += w
+//     5. If b == 0x20 (ASCII space):
 //          have_space = 1
 //          last_space_after_byte = off + 1
 //          word_width = 0
@@ -739,7 +757,9 @@ module Text = structure {
         cmp rax, 0x80;
         jb  bp_w_one;
         cmp rax, 0xC0;
-        jb  bp_w_zero;                   // continuation byte
+        jb  bp_w_cont;                   // continuation byte -- MUST NOT
+                                          // run the overflow check (see
+                                          // bp_w_cont below)
         cmp rax, 0xE0;
         jb  bp_w_one;                    // 2-byte lead
         cmp rax, 0xF0;
@@ -757,6 +777,41 @@ module Text = structure {
         jmp bp_after_w;
       bp_w_two:
         mov rdx, 2;
+        jmp bp_after_w;
+      bp_w_cont:
+        // BUGFIX (adversarial audit, M2-002 post-landing): a UTF-8
+        // continuation byte (0x80..0xBF) carries width 0 but is NOT
+        // interchangeable with the C0-control/DEL width-0 case above
+        // (bp_w_zero) -- those are complete one-byte codepoints and a
+        // break may legally land on them, whereas a continuation byte
+        // is mid-sequence and a break there would slice a multi-byte
+        // codepoint in half.
+        //
+        // The failure this fixes: when a single codepoint's display
+        // width alone exceeds max_width (e.g. a 3-byte CJK lead byte,
+        // width 2, with max_width == 1), the overflow test at
+        // bp_after_w is deliberately suppressed for that LEAD byte via
+        // the `cmp r8, 0` / `je bp_no_break` cur_col==0 guard (so a
+        // too-wide character is still placed rather than looping
+        // forever). That lets cur_col advance past max_width. If the
+        // following continuation byte(s) were routed through
+        // bp_w_zero -> bp_after_w like this arm used to, the overflow
+        // test would re-fire on THEM too -- but now cur_col > 0, so
+        // the cur_col==0 guard no longer suppresses it, and the code
+        // would emit a break whose byte offset is the continuation
+        // byte itself: a mid-codepoint break, corrupting any
+        // downstream re-slice of the byte stream.
+        //
+        // Fix: continuation bytes skip bp_after_w entirely and jump
+        // straight to bp_no_break with rdx=0. `add r8, 0` / `add r9, 0`
+        // are no-ops (cur_col/word_width are unaffected by a
+        // continuation byte, matching the intended semantics), and a
+        // continuation byte is never 0x20 so the space check below is
+        // also a safe no-op. This guarantees line_break_positions can
+        // only ever emit a break at a lead-byte offset or a
+        // post-space offset, never mid-codepoint.
+        xor rdx, rdx;
+        jmp bp_no_break;
 
       bp_after_w:
         // Overflow test: (cur_col + w > max_width) AND (cur_col > 0)?
