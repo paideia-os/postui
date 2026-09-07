@@ -202,7 +202,7 @@ module Block = structure {
   // ==========================================================================
   // BlockView@0.1 semantic-pipe wire (docs/design.md §2.3)
   // ==========================================================================
-  pub let BLKV_MAGIC           : u64 = 1447187522
+  pub let BLKV_MAGIC           : u64 = 1447775298
   pub let BLKV_HEADER_BYTES    : u64 = 24
   pub let BLKV_OFF_MAGIC       : u64 = 0
   pub let BLKV_OFF_RECORD_LEN  : u64 = 4
@@ -915,7 +915,7 @@ module Block = structure {
       justification: "postui.M1-006 (#6): block_view_pack lays a BlockView@0.1 record at [rsi..rsi+record_len). Header phase writes the four scalar fields in one straight-line sequence: `mov rax, 0x564B4C42` then mov_d [rsi+0], rax stamps the 'BLKV' magic (0x564B4C42 = 1_447_187_522 fits imm32 so paideia-as emits the compact 5-byte mov r32, imm32 form, not the 10-byte movabs). Border_kind widens u8 -> u32 via xor+mov_b+mov_d. The 8-byte packed Rect at [rdi+0] is copied verbatim to [rsi+12] in one qword store -- BlockSpec's rect and BlockView's rect_pack slot share the identical (x u16 | y u16 | w u16 | h u16) layout, so no per-field marshalling. Title_len (rdx) is loaded from [rdi+24] and its low 32 bits stored at [rsi+20] (a title longer than 4G would already have failed upstream). record_len = ((rdx + 24 + 7) >> 3) << 3 uses shr/shl 3 rather than `and reg, ~7` because ~7 = 0xFFFFFFFFFFFFFFF8 does not fit imm32. Title copy: if rdx > 0 AND title_ptr (r8, from [rdi+16]) is non-null, byte loop `xor rax, rax; mov_b rax, [r8+r9]; mov_b [rsi+r9+24], rax` walks r9 from 0..rdx. Pad loop: convert rdx to absolute pad start (add rdx, 24), then byte-store zeros until rdx >= rcx. Two guards -- title_len==0 and title_ptr==0 -- both jump straight to pad so the record header is always valid even for a hand-crafted spec with a null title. Every immediate (24, 7, 3, 4, 8, 12, 20, 0xFF, 0) fits imm32. No `test`, no `imul`. Pure leaf: no callee-save touched, no push/pop, no nested call. Effect `!{mem}` -- reads through rdi, writes through rsi. Labels prefixed bl_bv_ per docs fingerprint discipline.",
       block: {
         // ---- magic (u32) at [rsi + 0] --------------------------------------
-        mov rax, 1447187522;
+        mov rax, 1447775298;
         mov_d [rsi + 0], rax;
 
         // ---- border_kind (u32) at [rsi + 8] --------------------------------
