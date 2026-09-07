@@ -27,15 +27,15 @@
 //     values here does NOT change any call site (call sites reference
 //     the SEMANTIC_SCHEMA_<TAG> symbol, not the literal).
 //
-//   - semantic_send(schema, record_ptr, record_len) -> u64: a STUB.
-//     The kernel-side sys_semantic_send syscall does not exist yet
-//     (design/user/syscall-table.md high-water mark at this landing
-//     is sysno 517 sys_cwd_resolve; no semantic-pipe primitive is
-//     assigned a slot). Returns 0 (OK) so a widget's draw path can
-//     already invoke it without a runtime guard. Follow-up: file
-//     postui issue once paideia-os stands up the syscall (issue body
-//     staged in this landing's PR message so main only has to
-//     `gh issue create` it).
+//   - semantic_send(schema, record_ptr, record_len) -> u64: LIVE.
+//     Issues sys_semantic_send at sysno 115 (paideia-os#2350, commit
+//     71a15fb landed the kernel path in R90-XREPO; postui#42 flipped
+//     this body from the M2-009 stub). The three SysV arg registers
+//     (rdi=schema, rsi=record_ptr, rdx=record_len) map identically
+//     to the first three SYSCALL arg registers, so no register
+//     shuffle is needed -- the body is literally `mov rax, 115;
+//     syscall; ret`. Returns whatever the syscall returns (0 on
+//     success; per-syscall error sentinels otherwise).
 //
 //   - semantic_binding_init(binding_slot, schema, callback) -> u64:
 //     writes a 24-byte Binding record into caller-provided memory. This
@@ -79,8 +79,8 @@
 // expansion. Per issue #18 acceptance list, the semantic-pipe primitives
 // return the u64 status their underlying operation produces:
 //
-//   - semantic_send returns whatever the (future) syscall returns; at
-//     v1 the stub returns 0 (OK).
+//   - semantic_send returns whatever sys_semantic_send returns (0 on
+//     success; per-syscall error sentinels otherwise).
 //   - semantic_binding_init returns 0 on success. It cannot fail -- the
 //     three fields all write unconditionally to caller-provided memory
 //     and no runtime state is consulted. A future revision that
@@ -111,9 +111,9 @@
 //     semantic_binding_dispatch's miss/hit arms).
 //   - Effect row `!{mem}` on every function that touches memory
 //     (semantic_binding_init writes 3 qwords through rdi;
-//     semantic_binding_dispatch reads 2 qwords through rdi). The
-//     STUB semantic_send declares `!{}` -- no memory access, no
-//     syscall, no side effect until its body is filled in.
+//     semantic_binding_dispatch reads 2 qwords through rdi).
+//     semantic_send declares `!{sysreg}` -- the syscall entry is
+//     its only side effect; no callee-side memory access.
 //   - semantic_binding_dispatch's `call rax` invokes the caller's
 //     callback function pointer. Entry rsp%16 == 8 (SysV requires
 //     (rsp+8) % 16 == 0 at function entry); a `call` instruction
@@ -192,53 +192,55 @@ module SemanticRegistry = structure {
   // ==========================================================================
   // Stub-vs-real-body marker for semantic_send.
   //
-  // Flipped to 1 when the libpdx-semantic-pipe syscall lands and this
-  // module's semantic_send is rewritten to issue it. Kept as a public
-  // constant so a caller can log its telemetry with "sent" vs "stubbed"
-  // once the wiring is real. The 0 -> 1 flip is a WIRE-PRESERVING
-  // change: semantic_send's signature is unchanged; only its body body
-  // gains a syscall instruction.
+  // Set to 1 as of postui#42 -- sys_semantic_send landed at sysno 115
+  // (paideia-os#2350, commit 71a15fb), and this module's semantic_send
+  // now issues the syscall directly. Kept as a public constant so a
+  // caller can key its telemetry off "sent" vs "stubbed" without
+  // introspecting the syscall path. The 0 -> 1 flip was a WIRE-
+  // PRESERVING change: semantic_send's signature is unchanged; the
+  // body gained `mov rax, 115; syscall` in place of `xor rax, rax`,
+  // and the effect row widened from !{} to !{sysreg}.
   // ==========================================================================
-  pub let SEMANTIC_SEND_LIVE : u64 = 0
+  pub let SEMANTIC_SEND_LIVE : u64 = 1
 
   // ==========================================================================
   // semantic_send(schema, record_ptr, record_len) -> u64
   //
-  // STUB. Returns 0 (OK) at v1. Documented deferred wire: when
-  // paideia-os stands up sys_semantic_send (candidate sysno TBD; issue
-  // #18 landed no reservation because design/user/syscall-table.md is
-  // still under an active R90-XREPO refresh), this body becomes:
+  // LIVE. Issues sys_semantic_send at sysno 115 (paideia-os#2350,
+  // commit 71a15fb). Body:
   //
-  //     mov rdx, rsi;      // record_ptr into SYSCALL arg2 slot
-  //     mov r10, rcx;      // wait -- no; direct 3-arg SysV->SYSCALL
-  //                        // shuffle: rdi=schema stays, rsi=record_ptr
-  //                        // stays, rdx=record_len stays. Only rax needs
-  //                        // the sysno.
-  //     mov rax, <sysno>;
+  //     mov rax, 115;
   //     syscall;
   //     ret
   //
-  // The three SysV arg regs (rdi/rsi/rdx) map identically to the first
-  // three SYSCALL arg regs (rdi/rsi/rdx), so no register shuffle is
-  // needed at all -- the future body is literally `mov rax, SYSNO;
-  // syscall; ret`. See tui_canvas_client.pdx tcc_present (L169..179)
-  // for the 2-arg shape and tcc_resize (L260..272) for the shape with
-  // shuffle when SysV arity > 3.
+  // The three SysV arg regs (rdi=schema, rsi=record_ptr, rdx=record_len)
+  // map identically to the first three SYSCALL arg regs (rdi/rsi/rdx),
+  // so NO register shuffle is needed -- the body is a bare sysno-load
+  // plus syscall. Contrast tcc_resize (src/tui_canvas_client.pdx L260..
+  // 272) which does need a shuffle because its SysV arity exceeds 3
+  // and SYSCALL uses r10 in place of SysV's rcx for arg4.
   //
-  // Register plan: rdi=schema (unread at v1), rsi=record_ptr (unread),
-  // rdx=record_len (unread), rax=return. Pure leaf: no callee-save
-  // touched, no push/pop, no memory access, no syscall. Effect `!{}`
-  // (empty) matches the stub's actual behavior -- the future wiring
-  // will widen this to `!{sysreg}` in the same edit that adds the
-  // syscall instruction.
+  // Register plan: rdi=schema (passed through), rsi=record_ptr (passed
+  // through), rdx=record_len (passed through), rax=sysno on entry to
+  // syscall / return value after. Pure leaf: no callee-save touched,
+  // no push/pop, no memory access on our side (the syscall path itself
+  // reads the caller's record buffer -- that side effect is captured
+  // by !{sysreg}, not by our own !{mem}). Effect `!{sysreg}` reflects
+  // the syscall entry.
+  //
+  // Sysno 115 fits imm8 (< 128), so `mov rax, 115` emits the compact
+  // 5-byte `mov r32, imm32` form (imm8 is not a distinct mov encoding
+  // in x86_64; the assembler picks the shortest imm-fitting form and
+  // 115 is safely inside imm32-signed-positive).
   // ==========================================================================
-  pub let semantic_send : (u64, u64, u64) -> u64 !{} @{} =
+  pub let semantic_send : (u64, u64, u64) -> u64 !{sysreg} @{} =
     fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
-      effects: {},
+      effects: {sysreg},
       capabilities: {},
-      justification: "postui.M2-009 (postui#18): semantic_send is a STUB at v1 pending paideia-os sys_semantic_send. design/user/syscall-table.md high-water mark at this landing is sysno 517 (sys_cwd_resolve, R90-XREPO.010.M1-007) with no semantic-pipe primitive assigned. Returning 0 unconditionally so a widget draw path can already invoke this without a runtime guard -- when the syscall lands, this body gains `mov rax, <sysno>; syscall; ret` and the effect row widens from !{} to !{sysreg}; the three SysV arg regs (rdi=schema, rsi=record_ptr, rdx=record_len) already map identically to the first three SYSCALL arg registers so no shuffle is needed at that landing (unlike tcc_resize's 4-arg case at src/tui_canvas_client.pdx L260-272). Pure leaf: xor rax, rax; ret. No callee-save touched, no memory access, no syscall. Effect !{} matches the stub's actual behavior at v1. No `test` mnemonic; no immediate literal in the body (xor rax, rax needs no immediate). Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body).",
+      justification: "postui.M2-009 flipped by postui#42: semantic_send is LIVE and issues sys_semantic_send at sysno 115 (paideia-os#2350, commit 71a15fb landed the kernel path in R90-XREPO). Body: `mov rax, 115; syscall; ret`. The three SysV arg registers (rdi=schema, rsi=record_ptr, rdx=record_len) map identically to the first three SYSCALL arg registers so no register shuffle is needed (unlike tcc_resize's 4-arg case at src/tui_canvas_client.pdx L260-272 where SYSCALL's r10 replaces SysV's rcx for arg4). Sysno 115 fits imm32-signed-positive (< 0x7FFFFFFF), so `mov rax, 115` emits the compact 5-byte `mov r32, imm32` form (not the 10-byte movabs). Return value = whatever sys_semantic_send returns; rax already carries it after the syscall completes. Pure leaf: no callee-save touched, no push/pop, no memory access on our side (the syscall path reads the caller's record buffer, captured by !{sysreg} at this boundary rather than !{mem} which would advertise a store the syscall entry itself does not do). Effect widened from the M2-009 stub's !{} to !{sysreg} in the same edit that added the syscall instruction. No `test` mnemonic; no `and`; no `imul`; no `cmp reg, imm64`. Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body, no jumps).",
       block: {
-        xor rax, rax;
+        mov rax, 115;
+        syscall;
         ret;
       }
     }
