@@ -1,35 +1,27 @@
-# postui — status
+# postui — STATUS
 
-**Wave:** postui v1 (Ratatui-parity TUI library)
-**Current milestone:** M1 in progress — #1/#2/#3 landed on main, #4-#9 open
-**Version:** unreleased (pre-`0.1.0`)
+## v1.0.0 shipped 2026-09-07 (postui-v1.0.0)
 
-See `docs/design.md` for the full spec and `docs/design.md` §5 for the
-milestone/issue breakdown across this repo and its three reference-app
-satellites (`postui-top`, `postui-hex`, `postui-dmesg`).
+### Milestone rollup
+- M1 skeleton + Block: DONE (9/9 + 4 fixups)
+- M2 layout + primitives + widgets: DONE (10/10 + 6 fixups)
+- M3 Fixed64 + charts: DONE (7/7 + 3 fixups)
+- M4 TextInput/Tree/Calendar/Event: DONE (8/8)
+- M5 conformance + release: DONE (6/6)
 
-## Milestones
+### Deferred (tracked as follow-ups)
+- postui#41: tcc_resize/clear/debug_print frozen 2-arg ABI (M2/M5)
+- postui#42: sys_semantic_send stub -> live wire (blocked by paideia-os)
+- postui#43: Fixed64 32x32-split multiply for wider semantic range
+- postui#44: TERMINAL_KIND_TTY_LIVE flip (blocked by paideia-os#1986)
 
-| Milestone | Scope | Status |
-|---|---|---|
-| M1 | Skeleton + cell buffer + minimal Block widget | in progress (#1 scaffold, #2 primitives, #3 Cell/Buffer landed; #4-#9 open) |
-| M2 | Layout + Paragraph/List/Table/Tabs | open, not started |
-| M3 | Charts + canvas (Fixed64 fixed-point) | open, not started |
-| M4 | Tree/calendar/textinput/input pipeline | open, not started |
-| M5 | Semantic-pipe hookup + release | open, not started |
+### Consumer tools (waiting downstream)
+- postui-top (top-like process viewer)
+- postui-hex (hex viewer)
+- postui-dmesg (kernel log viewer)
 
-## Cross-repo dependencies
-
-- **paideia-os `R89 — KIND_TUI_CANVAS substrate`**: postui.M1-004/005
-  cannot land against a real kernel cap until R89.M1-001..003/005 land.
-  See `docs/design.md` §4.
-- **paideia-os `#1986` (`R66v2.POS-001`, `KIND_TTY` raw-mode + `TTY_OP_READ`)**:
-  postui's primary input path (§2.5); the `sys_read(0)` fallback unblocks
-  M1–M3 in the meantime.
-- **paideia-as `R89-XREPO.PAS-001`** (scalar f32/f64 codegen): tracked,
-  non-blocking. postui v1 ships on the Q32.32 `Fixed64` module instead
-  (`docs/design.md` §1.4).
-
-## License
-
-MIT — see LICENSE.
+### Design docs
+- docs/design.md (authoritative spec)
+- design/architecture.md (internal spec)
+- design/release-manifest.md (release policy)
+- doc/postui.pdxdoc (viewer source)
