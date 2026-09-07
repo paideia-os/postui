@@ -115,15 +115,20 @@
 //     STUB semantic_send declares `!{}` -- no memory access, no
 //     syscall, no side effect until its body is filled in.
 //   - semantic_binding_dispatch's `call rax` invokes the caller's
-//     callback function pointer. Entry rsp%16 == 8; `call` pushes an
-//     8-byte return address -> callee sees rsp%16 == 0 as SysV
-//     requires. No push/pop, no `sub rsp, N` needed. The callback's
-//     own effect set is the caller's responsibility (dispatch is
-//     effect-transparent -- same posture the shell's own
-//     completion.pdx dispatch primitives take).
+//     callback function pointer. Entry rsp%16 == 8 (SysV requires
+//     (rsp+8) % 16 == 0 at function entry); a `call` instruction
+//     itself requires rsp%16 == 0 immediately before it executes, so
+//     dispatch brackets the nested call with `sub rsp, 8` / `add rsp,
+//     8` -- the same idiom widget_kind.pdx's widget_draw uses around
+//     its `call block_draw` (entry rsp%16==8 -> 0 -> restored to 8
+//     before our own `ret`). The callback's own effect set is the
+//     caller's responsibility (dispatch is effect-transparent -- same
+//     posture the shell's own completion.pdx dispatch primitives
+//     take).
 //   - No callee-save touched in ANY body; every function is a leaf or
 //     a tail-call. rsp is unchanged across every entry point except
-//     the +8 that `call rax` transiently adds in dispatch.
+//     the transient sub/add rsp,8 bracket around `call rax` in
+//     dispatch (restored before its `ret`).
 
 module SemanticRegistry = structure {
 
@@ -305,10 +310,12 @@ module SemanticRegistry = structure {
   // Register plan: rdi=binding_ptr, rsi=incoming_schema, rdx=record_ptr,
   // rcx=record_len, rax=stored_schema then callback then return. Two
   // qword loads through rdi ([rdi+0], [rdi+8]) then a 2-mov arg shuffle
-  // (rdi <- rdx, rsi <- rcx) then `call rax`. Entry rsp%16 == 8; `call
-  // rax` pushes an 8-byte return address so the callee sees rsp%16 == 0
-  // as SysV requires. No push/pop, no `sub rsp, N` needed. No callee-
-  // save touched.
+  // (rdi <- rdx, rsi <- rcx) then `call rax`. Entry rsp%16 == 8 (SysV);
+  // a `call` requires rsp%16 == 0 immediately before it executes, so
+  // `sub rsp, 8` brings entry-time 8 down to 0 for the nested call,
+  // and `add rsp, 8` restores it afterward so our own `ret` pops the
+  // correct return address (same bracket widget_kind.pdx's widget_draw
+  // uses around `call block_draw`). No callee-save touched.
   //
   // Effect `!{mem}` covers the two binding-slot loads. The callback's
   // own effect set is the caller's responsibility -- dispatch is
@@ -322,7 +329,7 @@ module SemanticRegistry = structure {
     fn (binding_ptr: u64) (incoming_schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
       effects: {mem},
       capabilities: {},
-      justification: "postui.M2-009 (postui#18): semantic_binding_dispatch tail-calls the caller's callback iff the binding's stored schema matches. Phase 1 (schema match): load stored schema from [rdi+0] into rax; cmp rax, rsi; jne sr_bd_miss. Phase 2 (null-callback guard): load callback from [rdi+8] into rax; cmp rax, 0; je sr_bd_miss. Phase 3 (arg shuffle + tail call): mov rdi, rdx (record_ptr into SysV arg1); mov rsi, rcx (record_len into SysV arg2); call rax -- entry rsp%16 == 8, `call` pushes an 8-byte return address making callee-side rsp%16 == 0 which SysV requires. NO push/pop / NO sub rsp, N needed at this landing because the dispatcher has no callee-save writes and no local frame. Callback's return value stays in rax; ret returns to our caller with rax passed through verbatim. Phase 4 (miss arm sr_bd_miss): xor rax, rax; ret. The two `cmp reg, 0` are imm32-safe (0 is the smallest imm8). No `test` mnemonic. No `imul`, no `and`, no `cmp reg, imm64`. No callee-save touched -- rdi/rsi/rdx/rcx are all SysV caller-save (already-dead across our return); rax carries the return. Effect `!{mem}` covers the 2 qword loads through rdi; the callback's own effect set is the caller's responsibility (dispatch is effect-transparent -- same posture completion.pdx's dispatch primitives take when routing input through a caller-provided handler). Labels prefixed sr_bd_ per docs fingerprint discipline (sr_bd_miss for the schema-miss / null-callback arm; the tail-call arm is fall-through).",
+      justification: "postui.M2-009 (postui#18): semantic_binding_dispatch tail-calls the caller's callback iff the binding's stored schema matches. Phase 1 (schema match): load stored schema from [rdi+0] into rax; cmp rax, rsi; jne sr_bd_miss. Phase 2 (null-callback guard): load callback from [rdi+8] into rax; cmp rax, 0; je sr_bd_miss. Phase 3 (arg shuffle + tail call): mov rdi, rdx (record_ptr into SysV arg1); mov rsi, rcx (record_len into SysV arg2); sub rsp, 8 (SysV requires (rsp+8)%16==0 at function entry, i.e. entry rsp%16==8 here, and requires rsp%16==0 immediately before any `call` executes -- sub rsp,8 brings entry-time 8 down to the required 0 for the nested `call rax`, the same bracket widget_kind.pdx's widget_draw uses around `call block_draw`); call rax; add rsp, 8 (restores rsp to entry-time 8 so our own `ret` pops the correct return address). Callback's return value stays in rax across the add rsp,8; ret returns to our caller with rax passed through verbatim. Phase 4 (miss arm sr_bd_miss): xor rax, rax; ret. The two `cmp reg, 0` are imm32-safe (0 is the smallest imm8). No `test` mnemonic. No `imul`, no `and`, no `cmp reg, imm64`. No callee-save touched -- rdi/rsi/rdx/rcx are all SysV caller-save (already-dead across our return); rax carries the return. Effect `!{mem}` covers the 2 qword loads through rdi; the callback's own effect set is the caller's responsibility (dispatch is effect-transparent -- same posture completion.pdx's dispatch primitives take when routing input through a caller-provided handler). Labels prefixed sr_bd_ per docs fingerprint discipline (sr_bd_miss for the schema-miss / null-callback arm; the tail-call arm is fall-through).",
       block: {
         // ---- Phase 1: schema match ----------------------------------------
         mov rax, [rdi + 0];
@@ -337,7 +344,11 @@ module SemanticRegistry = structure {
         // ---- Phase 3: arg shuffle + tail call -----------------------------
         mov rdi, rdx;
         mov rsi, rcx;
+
+        // Align rsp for nested call (entry rsp%16==8 -> 0), call, restore.
+        sub rsp, 8;
         call rax;
+        add rsp, 8;
         ret;
 
       sr_bd_miss:
