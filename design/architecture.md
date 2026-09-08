@@ -418,17 +418,17 @@ tcc_query_rows(canvas_cap)                           -> u64   ! op 1
 tcc_query_cols(canvas_cap)                           -> u64   ! op 2
 tcc_query_id(canvas_cap)                             -> u64   ! op 3
 tcc_query_tty_id(canvas_cap)                         -> u64   ! op 4
-tcc_resize(canvas_cap, rows, cols)                   -> u64   ! op 5
-tcc_clear(canvas_cap, cell_hi, cell_lo)              -> u64   ! op 6
-tcc_debug_print(canvas_cap, msg_ptr, msg_len)        -> u64   ! op 7
+tcc_resize(canvas_cap)                               -> u64   ! op 5
+tcc_clear(canvas_cap)                                -> u64   ! op 6
+tcc_debug_print(canvas_cap)                          -> u64   ! op 7
 ```
 
 Each wrapper is a leaf function (no push/pop, no local frame, no
-nested call), 3-7 instructions. Effect row `!{sysreg} @{cap}` matches
-`syscall_shim.pdx`'s `sys_cap_invoke` exactly — the kernel-side
-transitive widening (e.g. `{mem,sysreg,PortIo} @{cap,paideia.port_io}`
-for the PRESENT path) belongs to `cap_handler_tui_canvas.pdx`, not
-this userspace wrapper.
+nested call), 4 instructions total. Effect row `!{sysreg} @{cap}`
+matches `syscall_shim.pdx`'s `sys_cap_invoke` exactly — the
+kernel-side transitive widening (e.g.
+`{mem,sysreg,PortIo} @{cap,paideia.port_io}` for the PRESENT path)
+belongs to `cap_handler_tui_canvas.pdx`, not this userspace wrapper.
 
 The wrappers return the kernel's `u64` verbatim — 0 for success on
 mutators, a u64 payload for QUERY ops, one of the `TCC_ERR_*` codes
@@ -439,23 +439,46 @@ postui's higher layers (Frame at M1-005) read `TCC_ERR_*` directly,
 matching the same "raw kernel u64 through" convention shell's
 `Syscall` applies to SC+ IDs.
 
-**Calling convention.** Arity-2 wrappers (`tcc_present` through
-`tcc_query_tty_id`) take SysV `rdi=canvas_cap`, load `rsi` with the
-op ordinal, `rax` with the SC+ ID (4), and issue `syscall`. Arity-4
-wrappers (`tcc_resize`, `tcc_clear`, `tcc_debug_print`) apply the
-standard Linux `rcx -> r10` shuffle in-order — `mov r10, rdx;
-mov rdx, rsi; mov rsi, <op>; mov rax, 4; syscall; ret` — moving
-SysV arg3 into the SYSCALL arg3 slot before overwriting rsi/rax.
-Same pattern shell's `syscall.pdx sys_wait4` uses.
+**Calling convention.** ALL EIGHT wrappers are arity-1: SysV
+`rdi=canvas_cap` passes through as SYSCALL `rdi=slot`; `rsi` is
+loaded with the op ordinal; `rax` is loaded with the SC+ ID (4);
+`syscall`; `ret`. No register shuffle. This matches the frozen
+`sys_cap_invoke` ABI (`dispatch.pdx` `dispatch_cap_invoke` at
+lines 1166-1170 forwards only `rdi=slot` and `rsi=op_arg` to
+`cap_invoke`; any additional SYSCALL args in `rdx`/`r10`/`r8`/`r9`
+are silently dropped before the handler is called).
 
-**Kernel-side landing note.** At the M1-004 landing tip,
+**postui#41 ADR — arity reduction.** The M1-004 landing declared
+`tcc_resize`/`tcc_clear`/`tcc_debug_print` as arity-3 wrappers and
+shuffled rows/cols/cell/msg into SYSCALL `rdx`/`r10`, claiming to
+be "wire-compatible" with a future kernel-side landing that would
+consume those slots. That claim was FALSE: the frozen
+`sys_cap_invoke` dispatcher never plumbs those registers into
+`cap_invoke`. Rather than break the SC+ freeze (option (c)), or
+adopt a bit-packed encoding that fixes only RESIZE (option (a)),
+the wrappers were reduced to arity-1 to match the frozen ABI
+exactly. Payload delivery for RESIZE (rows/cols), CLEAR (16-byte
+Cell) and DEBUG_PRINT (msg_ptr/msg_len) is DEFERRED to a follow-up
+landing that mints a per-canvas `KIND_MEMORY` scratch region at
+cap-mint time (option (b)): the client writes its payload to the
+scratch prefix, invokes the arity-1 trigger below, and the
+kernel-side real body reads the payload via the row's
+`memory_slot`. That is the same pattern PRESENT already uses (it
+reads the back/front cell buffers from `memory_slot`, not from a
+syscall arg), so extending it to the three payload-carrying ops is
+architecturally continuous.
+
+**Kernel-side landing note.** At the current tip,
 `cap_handler_tui_canvas.pdx` implements PRESENT / QUERY_ROWS /
 QUERY_COLS / QUERY_ID / QUERY_TTY_ID as real bodies (paideia-os
 R89.M1-002/003); RESIZE / CLEAR / DEBUG_PRINT dispatch through
-rights-checked stubs returning 0. The wire-compatible wrappers pass
-`rdx`/`r10` in their SYSCALL slots so the eventual R89.M1-004
-`canvas_damage.pdx` real bodies consume them without a client
-change.
+rights-checked stubs returning 0. Because these three arity-1
+triggers are semantically no-ops today, the wrapper reduction is
+behavior-preserving. When the KIND_MEMORY scratch-region
+infrastructure lands (see design/kernel/kind-tui-canvas.md §Ops
+rows 5/6/7 for the payload wire layout to freeze), the client-side
+change is to prepend a scratch-write before invoking each trigger;
+the wrapper signatures below stay put.
 
 **Mint deferred (caller-owned).** `KIND_TUI_CANVAS_MINT` is a
 `KIND_CAP_TABLE`-level op invoked via libpdx-cap's `cap_mint_write`

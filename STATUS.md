@@ -10,10 +10,16 @@
 - M5 conformance + release: DONE (6/6)
 
 ### Deferred (tracked as follow-ups)
-- postui#41: tcc_resize/clear/debug_print frozen 2-arg ABI (M2/M5)
 - postui#42: sys_semantic_send stub -> live wire (blocked by paideia-os)
 - postui#43: Fixed64 32x32-split multiply for wider semantic range
 - postui#44: TERMINAL_KIND_TTY_LIVE flip (blocked by paideia-os#1986)
+
+### Fixed
+- postui#41: tcc_resize/clear/debug_print reduced to arity-1 to match
+  the frozen 2-arg sys_cap_invoke ABI. Payload delivery (rows/cols,
+  16-byte Cell, msg_ptr+msg_len) deferred to a future landing that
+  mints a per-canvas KIND_MEMORY scratch region as a side-channel.
+  See design/architecture.md §2.7 (postui#41 ADR).
 
 ### Consumer tools (waiting downstream)
 - postui-top (top-like process viewer)

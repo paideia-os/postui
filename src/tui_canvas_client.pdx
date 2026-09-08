@@ -116,20 +116,19 @@ module TuiCanvasClient = structure {
   // rsi=op_arg -- and cap_handler_tui_canvas (R89.M1-002) currently
   // dispatches on op_arg treated as an 8-bit op ordinal directly (a full
   // u64 cmp against 0..7; any non-zero upper bits fall through to
-  // TUI_BAD_SLOT). PRESENT/QUERY_ROWS/QUERY_COLS/QUERY_ID/QUERY_TTY_ID
-  // are all NULLARY ops and land there today; RESIZE/CLEAR/DEBUG_PRINT
-  // are RIGHTS-CHECKED STUBS RETURNING 0 on the paideia-os side at this
-  // landing (R89.M1-002 line 154-168 / 170-182). Their real bodies land
-  // at paideia-os R89.M1-004 (canvas_damage.pdx per docs/design.md
-  // §5.1's cross-repo table -- see also design/kernel/kind-tui-canvas.md
-  // §Ops); that landing will extend the sys_cap_invoke handler to plumb
-  // additional syscall registers (rdx/r10/r8) through to the handler,
-  // and this file's arity-3 wrappers already pass those exact registers
-  // via the standard Linux SYSCALL shuffle (see syscall.pdx sys_wait4 for
-  // the rcx->r10 pattern), so no client change is required when the
-  // kernel-side landing arrives -- the wrappers are wire-compatible
-  // today (returning 0 stub-success on RESIZE/CLEAR/DEBUG_PRINT) and
-  // become real when the kernel-side handler decodes those arg slots.
+  // TUI_BAD_SLOT). ALL EIGHT wrappers below are NULLARY (arity-1,
+  // canvas_cap only) as of the postui#41 fix. PRESENT/QUERY_ROWS/
+  // QUERY_COLS/QUERY_ID/QUERY_TTY_ID land against real kernel bodies
+  // (R89.M1-002/003). RESIZE/CLEAR/DEBUG_PRINT invoke rights-checked
+  // kernel stubs that return 0 (R89.M1-002 lines 154-168 / 170-182)
+  // and are semantically no-ops at the current tip; their payload
+  // delivery (rows/cols for RESIZE, 16-byte cell for CLEAR, ptr+len
+  // for DEBUG_PRINT) is DEFERRED to a follow-up landing that mints a
+  // per-canvas KIND_MEMORY scratch region at cap-mint time and uses
+  // it as the side-channel between client and kernel handler, since
+  // the frozen sys_cap_invoke ABI cannot carry those bytes. See the
+  // FROZEN 2-ARG sys_cap_invoke ABI class comment immediately before
+  // tcc_resize below for the full ADR (postui#41).
   //
   // Mint is DEFERRED. KIND_TUI_CANVAS_MINT is a KIND_CAP_TABLE-level
   // mint op (paideia-os R89.M1-001 kind_tui_canvas_mint_body, invoked
@@ -244,26 +243,95 @@ module TuiCanvasClient = structure {
       }
     }
 
-  // tcc_resize(canvas_cap, rows, cols) -> u64
+  // ==========================================================================
+  // FROZEN 2-ARG sys_cap_invoke ABI -- postui#41 fix.
   //
-  // TUI_OP_RESIZE = 5. Rights: R_TUI_RESIZE (0x010). Re-derives
-  // rows/cols on a terminal resize event; re-maps the backing region
-  // (a fresh mint under the hood, old row revoked -- see design/kernel/
-  // kind-tui-canvas.md §Ops row 5). SysV arity 3 -> SYSCALL arity 4:
-  // rows lands in SYSCALL rdx, cols lands in SYSCALL r10 (the standard
-  // Linux rcx->r10 shuffle -- syscall.pdx sys_wait4 uses the identical
-  // pattern). Current paideia-os dispatch (R89.M1-002 cap_handler_tui_
-  // canvas.pdx tuih_op_resize) is a RIGHTS-CHECKED STUB returning 0
-  // without reading rdx/r10; R89.M1-004 (canvas_damage.pdx) will
-  // consume those registers -- this wrapper is wire-compatible with
-  // both landings, no client change required when the real body ships.
-  pub let tcc_resize : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
-    fn (canvas_cap: u64) (rows: u64) (cols: u64) -> unsafe {
+  // The kernel-side dispatcher for sys_cap_invoke (SC+ ID 4) is
+  // FROZEN at TWO arguments after the syscall entry: (slot, op_arg).
+  // See design/user/syscall-table.md row 4 and
+  // src/kernel/core/syscall/dispatch.pdx dispatch_cap_invoke
+  // (lines 1166-1170):
+  //
+  //     dispatch_cap_invoke:
+  //       mov rdi, rsi;      // slot   <- SYSCALL arg1
+  //       mov rsi, rdx;      // op_arg <- SYSCALL arg2
+  //       call cap_invoke;
+  //       ret;
+  //
+  // Extra SYSCALL args (rdx/r10/r8/r9) are NEVER read by the
+  // dispatcher and are SILENTLY DROPPED before cap_invoke is called.
+  // The prior "wire-compatible" claim on tcc_resize/tcc_clear/
+  // tcc_debug_print (M1-004 landing) was FALSE: their in-register
+  // shuffle placed rows/cols/cell/msg into slots the kernel does not
+  // read. The kernel-side R89.M1-002 stubs for these ops return 0
+  // without consulting those registers, so the falsehood was not a
+  // live bug (nothing broke because nothing was expected to work),
+  // but it made the wrappers dishonest and blocked any client-side
+  // reasoning about what actually reaches the kernel.
+  //
+  // ADR (postui#41): the three previously-arity-3 wrappers below are
+  // reduced to arity-1 (canvas_cap only), matching the frozen ABI
+  // exactly. Every wrapper below now emits the identical shape as
+  // tcc_present -- 4 instructions total, no register shuffle:
+  //
+  //     mov rsi, <op>;
+  //     mov rax, 4;
+  //     syscall;
+  //     ret;
+  //
+  // Payload delivery for RESIZE (rows/cols), CLEAR (16-byte cell),
+  // and DEBUG_PRINT (msg_ptr/msg_len) is DEFERRED to a future landing
+  // that mints a per-canvas KIND_MEMORY scratch region at cap-mint
+  // time (option (b) in the postui#41 issue body). The scratch region
+  // becomes the side-channel: the client writes its payload there
+  // before invoking a nullary trigger op, and the kernel-side handler
+  // reads it back via the row's memory_slot. That is the same pattern
+  // KIND_TUI_CANVAS already uses for its back/front cell buffers
+  // (canvas_present.pdx tui_present_body reads the row's memory_slot
+  // rather than any syscall arg), so extending it to RESIZE/CLEAR/
+  // DEBUG_PRINT payloads is architecturally continuous. Cross-repo
+  // work: KIND_TUI_CANVAS mint must reserve a scratch prefix in the
+  // memory region (see design/kernel/kind-tui-canvas.md §Ops rows
+  // 5/6/7 for the payload layout to freeze). Until that lands,
+  // tcc_resize/clear/debug_print invoke rights-checked kernel stubs
+  // that return 0 -- semantically no-ops -- and the arity-1 shape
+  // makes that honest.
+  //
+  // The alternate option (a) -- bit-packing rows+cols into op_arg
+  // for RESIZE -- was rejected because it would fix only RESIZE (a
+  // 16-byte cell and a ptr+len pair both exceed u64), and adopting
+  // heterogeneous encodings across the eight-op table (five nullary,
+  // one packed, two side-channel) is less legible than one uniform
+  // side-channel policy applied to every arity-3 op.
+  //
+  // Option (c) -- widen sys_cap_invoke to arity 4+ -- was rejected
+  // because it breaks the freeze on the SC+ ID 4 dispatcher and
+  // ripples through every KIND_* handler that has already been
+  // written against the (rights, target_ptr, op_arg) shape (see
+  // kind_tty.pdx cap_handler_tty and every existing cap_handler_*).
+  // ==========================================================================
+
+  // tcc_resize(canvas_cap) -> u64
+  //
+  // TUI_OP_RESIZE = 5. Rights: R_TUI_RESIZE (0x010). Signals a
+  // terminal resize event to the kernel; the real body re-derives
+  // rows/cols and re-maps the backing region (a fresh mint under the
+  // hood, old row revoked -- see design/kernel/kind-tui-canvas.md
+  // §Ops row 5).
+  //
+  // ARITY-1 per postui#41 (see FROZEN 2-ARG ABI block above): the
+  // frozen sys_cap_invoke dispatcher does not forward rdx/r10/r8, so
+  // rows and cols cannot be passed as syscall args. Payload delivery
+  // (the new rows/cols the client observed) is DEFERRED to the
+  // KIND_MEMORY scratch-region landing; today's kernel-side R89.M1-
+  // 002 body (cap_handler_tui_canvas.pdx tuih_op_resize lines 154-
+  // 160) is a rights-checked stub returning 0, so an arity-1 nullary
+  // trigger is semantically complete for the current tip.
+  pub let tcc_resize : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
       effects: {sysreg}, capabilities: {cap},
-      justification: "postui.M1-004 (postui#4): TUI_OP_RESIZE (5) wrapper. SysV rdi=canvas_cap, rsi=rows, rdx=cols. SYSCALL wants rdi=slot, rsi=op_arg=5, rdx=rows, r10=cols. Three-move shuffle (all safe, all register-to-register, order matters): (1) mov r10, rdx: cols to SYSCALL arg3 slot; (2) mov rdx, rsi: rows to SYSCALL arg2 slot; (3) mov rsi, 5: op ordinal into SYSCALL arg1. Then mov rax, 4; syscall; ret. rcx is left untouched (SYSCALL clobbers rcx on the CPU side; SysV caller-save so harmless). Register plan verified: after step (1) rdx still holds the original cols (we then overwrite it in step 2), rsi still holds rows (overwritten in step 3), rdi still holds cap. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_resize is a rights-checked stub returning 0 (paideia-os R89.M1-002 lines 154-160); R89.M1-004 canvas_damage.pdx will consume rdx/r10 for the real body. Leaf.",
+      justification: "postui#41 fix: TUI_OP_RESIZE (5) wrapper is now arity-1 (canvas_cap only). The frozen sys_cap_invoke ABI (SC+ ID 4) accepts exactly (slot, op_arg) -- dispatch_cap_invoke (src/kernel/core/syscall/dispatch.pdx:1166-1170) forwards only rdi=slot and rsi=op_arg into cap_invoke; any additional SYSCALL args (rdx/r10/r8/r9) are silently dropped. The prior 3-arg tcc_resize's register shuffle (mov r10, rdx; mov rdx, rsi; mov rsi, 5) placed rows/cols into slots the kernel never reads, giving the wrapper a false 'wire-compatible' claim. The arity-1 shape below matches tcc_present exactly: SysV rdi=canvas_cap passes through as SYSCALL rdi=slot; rsi is loaded with the op ordinal 5 (TCC_OP_RESIZE); rax is loaded with SC+ ID 4 (TCC_SYS_CAP_INVOKE). No shuffle. Leaf: syscall clobbers rcx/r11 (both SysV caller-save, harmless). Effect/capability set matches syscall_shim.pdx sys_cap_invoke exactly: !{sysreg} @{cap}. Payload delivery (the new rows/cols) is DEFERRED to a follow-up landing that mints a per-canvas KIND_MEMORY scratch region at cap-mint time; the client will write its payload there before invoking this nullary trigger, and cap_handler_tui_canvas's real body (R89.M1-004 canvas_damage.pdx) will read it via the row's memory_slot. Until then this wrapper returns whatever tuih_op_resize returns -- 0 today (rights-checked stub). No `test`; no `and reg,imm64`; no 2-op imul; no r11 touched.",
       block: {
-        mov r10, rdx;
-        mov rdx, rsi;
         mov rsi, 5;
         mov rax, 4;
         syscall;
@@ -271,25 +339,30 @@ module TuiCanvasClient = structure {
       }
     }
 
-  // tcc_clear(canvas_cap, cell_hi, cell_lo) -> u64
+  // tcc_clear(canvas_cap) -> u64
   //
   // TUI_OP_CLEAR = 6. Rights: R_TUI_RESIZE (shared with RESIZE per
   // design/kernel/kind-tui-canvas.md §Rights -- both are backing-store
-  // mutators). Fills both back and front regions with the given Cell,
-  // encoded as its two-u64 wire form (cell.pdx word0/word1: word0 is
-  // symbol|fg.rgb|bg.r, word1 is bg.gb|mods|reserved). cell_hi is
-  // word0 (cell[+0..+8)), cell_lo is word1 (cell[+8..+16)) -- naming
-  // follows the convention `_hi` = higher-addressed word, matching the
-  // wire's [+0..+16) byte layout. Same SysV->SYSCALL shuffle as
-  // tcc_resize; same stub-vs-real-body posture (rights-checked stub
-  // today, canvas_damage.pdx real body at R89.M1-004).
-  pub let tcc_clear : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
-    fn (canvas_cap: u64) (cell_hi: u64) (cell_lo: u64) -> unsafe {
+  // mutators). The real body fills back and front regions with a
+  // caller-supplied 16-byte Cell.
+  //
+  // ARITY-1 per postui#41 (see FROZEN 2-ARG ABI block above): the
+  // 16-byte cell (two u64 words in the cell.pdx wire format --
+  // symbol|fg.rgb|bg.r plus bg.gb|mods|reserved) cannot fit in the
+  // single u64 op_arg slot the frozen ABI provides, so the cell
+  // payload MUST come through the KIND_MEMORY scratch-region side-
+  // channel. Client will write the cell wire bytes to the scratch
+  // prefix before invoking this nullary trigger; kernel-side real
+  // body (R89.M1-004 canvas_damage.pdx) will read those bytes via
+  // the row's memory_slot. Today's kernel stub (cap_handler_tui_
+  // canvas.pdx tuih_op_clear lines 162-168) is rights-checked and
+  // returns 0 without touching either region, so an arity-1 wrapper
+  // is a semantically complete no-op for the current tip.
+  pub let tcc_clear : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
       effects: {sysreg}, capabilities: {cap},
-      justification: "postui.M1-004 (postui#4): TUI_OP_CLEAR (6) wrapper. SysV rdi=canvas_cap, rsi=cell_hi (cell wire word0), rdx=cell_lo (cell wire word1). SYSCALL wants rdi=slot, rsi=op_arg=6, rdx=cell_hi, r10=cell_lo. Same three-move shuffle as tcc_resize: mov r10, rdx; mov rdx, rsi; mov rsi, 6; mov rax, 4; syscall; ret. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_clear is a rights-checked stub returning 0 (paideia-os R89.M1-002 lines 162-168); R89.M1-004 canvas_damage.pdx will consume rdx/r10 for the real body that stamps every cell in both regions. Leaf.",
+      justification: "postui#41 fix: TUI_OP_CLEAR (6) wrapper is now arity-1 (canvas_cap only). Same rationale as tcc_resize: the frozen sys_cap_invoke ABI drops any SYSCALL args past rsi (op_arg), so the 16-byte Cell (cell_hi word0 + cell_lo word1 of the cell.pdx wire format) cannot travel in rdx/r10 as the prior 3-arg wrapper pretended. Bit-packing is not viable here either -- a Cell is 128 bits, exceeding u64 op_arg. Payload delivery for the cell wire form is DEFERRED to the KIND_MEMORY scratch-region landing (see class comment above); client will write 16 bytes to the scratch prefix, invoke this nullary trigger, kernel-side real body (canvas_damage.pdx, R89.M1-004) reads via memory_slot. Body identical shape to tcc_present/tcc_resize: SysV rdi=canvas_cap passes as SYSCALL rdi=slot; rsi=6 (TCC_OP_CLEAR); rax=4 (TCC_SYS_CAP_INVOKE); syscall; ret. Leaf, no shuffle, no r11 touched, no forbidden mnemonics.",
       block: {
-        mov r10, rdx;
-        mov rdx, rsi;
         mov rsi, 6;
         mov rax, 4;
         syscall;
@@ -297,22 +370,32 @@ module TuiCanvasClient = structure {
       }
     }
 
-  // tcc_debug_print(canvas_cap, msg_ptr, msg_len) -> u64
+  // tcc_debug_print(canvas_cap) -> u64
   //
-  // TUI_OP_DEBUG_PRINT = 7. Rights: R_TUI_OBSERVE (0x400). Debug hook,
-  // mirrors TTY_OP_DEBUG_PRINT (no user-observable side effect beyond
-  // the klog emission). Current kernel path emits klog_s1_x1 keyed on
-  // the canvas row_id only (msg_ptr/msg_len are NOT consulted at
-  // R89.M1-002 -- cap_handler_tui_canvas.pdx tuih_op_dbg lines 170-182);
-  // the extended body that echoes msg_ptr/msg_len into the klog record
-  // is future work. This wrapper is wire-compatible with both.
-  pub let tcc_debug_print : (u64, u64, u64) -> u64 !{sysreg} @{cap} =
-    fn (canvas_cap: u64) (msg_ptr: u64) (msg_len: u64) -> unsafe {
+  // TUI_OP_DEBUG_PRINT = 7. Rights: R_TUI_OBSERVE (0x400). Debug hook
+  // that mirrors TTY_OP_DEBUG_PRINT -- the kernel handler emits a
+  // klog line keyed on the canvas row_id (no user-observable side
+  // effect beyond that emission).
+  //
+  // ARITY-1 per postui#41 (see FROZEN 2-ARG ABI block above): the
+  // (msg_ptr, msg_len) pair is 16 bytes -- exceeds op_arg's u64 --
+  // and the frozen ABI cannot deliver it via extra SYSCALL args. The
+  // kernel R89.M1-002 body (cap_handler_tui_canvas.pdx tuih_op_dbg
+  // lines 170-182) emits klog_s1_x1(LEVEL_INFO, SUBSYS_CAP_,
+  // tuih_dbg_msg, tuih_k_slot, row_id) using a fixed message string
+  // -- msg_ptr/msg_len were never consulted at any prior landing, so
+  // reducing the wrapper to arity-1 is behavior-preserving for the
+  // current kernel. Payload delivery for a caller-supplied message
+  // is DEFERRED to the KIND_MEMORY scratch-region landing (see class
+  // comment above); client will write the message bytes plus a
+  // length prefix to the scratch prefix, invoke this nullary
+  // trigger, and a future canvas_damage.pdx body will echo those
+  // bytes into the klog record instead of the fixed tuih_dbg_msg.
+  pub let tcc_debug_print : (u64) -> u64 !{sysreg} @{cap} =
+    fn (canvas_cap: u64) -> unsafe {
       effects: {sysreg}, capabilities: {cap},
-      justification: "postui.M1-004 (postui#4): TUI_OP_DEBUG_PRINT (7) wrapper. SysV rdi=canvas_cap, rsi=msg_ptr, rdx=msg_len. SYSCALL wants rdi=slot, rsi=op_arg=7, rdx=msg_ptr, r10=msg_len. Same three-move shuffle as tcc_resize/tcc_clear: mov r10, rdx; mov rdx, rsi; mov rsi, 7; mov rax, 4; syscall; ret. Kernel-side today: cap_handler_tui_canvas.pdx tuih_op_dbg emits klog_s1_x1(LEVEL_INFO, SUBSYS_CAP_, tuih_dbg_msg, tuih_k_slot, row_id) and returns 0 -- msg_ptr/msg_len ride in rdx/r10 for future consumption but are not read today. Leaf.",
+      justification: "postui#41 fix: TUI_OP_DEBUG_PRINT (7) wrapper is now arity-1 (canvas_cap only). Same rationale as tcc_resize/tcc_clear: the frozen sys_cap_invoke ABI drops SYSCALL args past rsi (op_arg), so msg_ptr/msg_len cannot travel in rdx/r10 as the prior 3-arg wrapper pretended. The kernel R89.M1-002 body (tuih_op_dbg) already emits a fixed klog message keyed only on row_id -- msg_ptr/msg_len were never consulted at that landing, so reducing arity is behavior-preserving. Payload delivery for a caller-supplied message string is DEFERRED to the KIND_MEMORY scratch-region landing (see class comment above); the client will write the message bytes plus a length prefix to the scratch prefix and invoke this nullary trigger, and a future kernel body will echo those bytes into the klog record. Body identical shape to tcc_present/tcc_resize/tcc_clear: SysV rdi=canvas_cap passes as SYSCALL rdi=slot; rsi=7 (TCC_OP_DEBUG_PRINT); rax=4 (TCC_SYS_CAP_INVOKE); syscall; ret. Leaf, no shuffle, no r11 touched, no forbidden mnemonics.",
       block: {
-        mov r10, rdx;
-        mov rdx, rsi;
         mov rsi, 7;
         mov rax, 4;
         syscall;

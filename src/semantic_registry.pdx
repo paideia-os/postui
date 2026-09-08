@@ -216,9 +216,13 @@ module SemanticRegistry = structure {
   // The three SysV arg regs (rdi=schema, rsi=record_ptr, rdx=record_len)
   // map identically to the first three SYSCALL arg regs (rdi/rsi/rdx),
   // so NO register shuffle is needed -- the body is a bare sysno-load
-  // plus syscall. Contrast tcc_resize (src/tui_canvas_client.pdx L260..
-  // 272) which does need a shuffle because its SysV arity exceeds 3
-  // and SYSCALL uses r10 in place of SysV's rcx for arg4.
+  // plus syscall. sys_semantic_send is a real 3-arg syscall so all
+  // three args reach the kernel (see paideia-os#2350). Contrast
+  // sys_cap_invoke (SC+ ID 4), which is FROZEN at (slot, op_arg): any
+  // args past rsi are silently dropped by the dispatcher (dispatch.pdx
+  // dispatch_cap_invoke), which is why every tcc_* wrapper in
+  // tui_canvas_client.pdx is arity-1 (see postui#41 ADR in that file's
+  // FROZEN 2-ARG sys_cap_invoke ABI class comment).
   //
   // Register plan: rdi=schema (passed through), rsi=record_ptr (passed
   // through), rdx=record_len (passed through), rax=sysno on entry to
@@ -237,7 +241,7 @@ module SemanticRegistry = structure {
     fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
       effects: {sysreg},
       capabilities: {},
-      justification: "postui.M2-009 flipped by postui#42: semantic_send is LIVE and issues sys_semantic_send at sysno 115 (paideia-os#2350, commit 71a15fb landed the kernel path in R90-XREPO). Body: `mov rax, 115; syscall; ret`. The three SysV arg registers (rdi=schema, rsi=record_ptr, rdx=record_len) map identically to the first three SYSCALL arg registers so no register shuffle is needed (unlike tcc_resize's 4-arg case at src/tui_canvas_client.pdx L260-272 where SYSCALL's r10 replaces SysV's rcx for arg4). Sysno 115 fits imm32-signed-positive (< 0x7FFFFFFF), so `mov rax, 115` emits the compact 5-byte `mov r32, imm32` form (not the 10-byte movabs). Return value = whatever sys_semantic_send returns; rax already carries it after the syscall completes. Pure leaf: no callee-save touched, no push/pop, no memory access on our side (the syscall path reads the caller's record buffer, captured by !{sysreg} at this boundary rather than !{mem} which would advertise a store the syscall entry itself does not do). Effect widened from the M2-009 stub's !{} to !{sysreg} in the same edit that added the syscall instruction. No `test` mnemonic; no `and`; no `imul`; no `cmp reg, imm64`. Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body, no jumps).",
+      justification: "postui.M2-009 flipped by postui#42: semantic_send is LIVE and issues sys_semantic_send at sysno 115 (paideia-os#2350, commit 71a15fb landed the kernel path in R90-XREPO). Body: `mov rax, 115; syscall; ret`. The three SysV arg registers (rdi=schema, rsi=record_ptr, rdx=record_len) map identically to the first three SYSCALL arg registers so no register shuffle is needed. sys_semantic_send is a real 3-arg syscall so all three args reach the kernel; contrast the frozen 2-arg sys_cap_invoke (SC+ ID 4) whose dispatcher silently drops any args past rsi -- which is why every tcc_* wrapper in tui_canvas_client.pdx is arity-1 per the postui#41 ADR. Sysno 115 fits imm32-signed-positive (< 0x7FFFFFFF), so `mov rax, 115` emits the compact 5-byte `mov r32, imm32` form (not the 10-byte movabs). Return value = whatever sys_semantic_send returns; rax already carries it after the syscall completes. Pure leaf: no callee-save touched, no push/pop, no memory access on our side (the syscall path reads the caller's record buffer, captured by !{sysreg} at this boundary rather than !{mem} which would advertise a store the syscall entry itself does not do). Effect widened from the M2-009 stub's !{} to !{sysreg} in the same edit that added the syscall instruction. No `test` mnemonic; no `and`; no `imul`; no `cmp reg, imm64`. Reserved-label prefix sr_ per docs fingerprint discipline (none needed here -- straight-line body, no jumps).",
       block: {
         mov rax, 115;
         syscall;
